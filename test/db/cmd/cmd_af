@@ -360,6 +360,17 @@ sym.sum_double (int64_t arg1, int64_t arg2);
 EOF
 RUN
 
+NAME=entry0 arg order
+FILE=bins/elf/ls
+CMDS=<<EOF
+aa
+afcf entry0
+EOF
+EXPECT=<<EOF
+entry0 (int64_t arg1);
+EOF
+RUN
+
 NAME=duplicate af+
 FILE=-
 CMDS=<<EOF

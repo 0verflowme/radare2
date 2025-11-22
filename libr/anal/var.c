@@ -1759,14 +1759,10 @@ static bool is_default_argname(const char *name) {
 	return r_str_startswith (name, "arg") && IS_DIGIT (name[3]);
 }
 
-R_API void r_anal_function_vars_cache_init(RAnal *anal, RAnalFcnVarsCache *cache, RAnalFunction *fcn) {
-	cache->bvars = r_anal_var_list (anal, fcn, R_ANAL_VAR_KIND_BPV);
-	cache->rvars = r_anal_var_list (anal, fcn, R_ANAL_VAR_KIND_REG);
-	cache->svars = r_anal_var_list (anal, fcn, R_ANAL_VAR_KIND_SPV);
-	r_list_sort (cache->bvars, (RListComparator)var_comparator);
+static void assign_reg_argnums(RAnal *anal, RAnalFunction *fcn, RList *rvars) {
 	RListIter *it;
 	RAnalVar *var;
-	r_list_foreach (cache->rvars, it, var) {
+	r_list_foreach (rvars, it, var) {
 		if (!var->isarg) {
 			var->argnum = -1;
 			continue;
@@ -1780,18 +1776,27 @@ R_API void r_anal_function_vars_cache_init(RAnal *anal, RAnalFcnVarsCache *cache
 		var->argnum = cc_reg_index (anal, fcn->callconv, regname);
 		r_unref (ri);
 	}
-	r_list_sort (cache->rvars, (RListComparator)regvar_comparator);
+	r_list_sort (rvars, (RListComparator)regvar_comparator);
 	int dense = 0;
-	r_list_foreach (cache->rvars, it, var) {
-		if (var->argnum >= 0) {
-			var->argnum = dense++;
-			if (is_default_argname (var->name)) {
-				char *newname = r_str_newf ("arg%d", var->argnum + 1);
-				r_anal_var_rename (anal, var, newname);
-				free (newname);
-			}
+	r_list_foreach (rvars, it, var) {
+		if (var->argnum < 0) {
+			continue;
+		}
+		var->argnum = dense++;
+		if (is_default_argname (var->name)) {
+			char *newname = r_str_newf ("arg%d", var->argnum + 1);
+			r_anal_var_rename (anal, var, newname);
+			free (newname);
 		}
 	}
+}
+
+R_API void r_anal_function_vars_cache_init(RAnal *anal, RAnalFcnVarsCache *cache, RAnalFunction *fcn) {
+	cache->bvars = r_anal_var_list (anal, fcn, R_ANAL_VAR_KIND_BPV);
+	cache->rvars = r_anal_var_list (anal, fcn, R_ANAL_VAR_KIND_REG);
+	cache->svars = r_anal_var_list (anal, fcn, R_ANAL_VAR_KIND_SPV);
+	r_list_sort (cache->bvars, (RListComparator)var_comparator);
+	assign_reg_argnums (anal, fcn, cache->rvars);
 	r_list_sort (cache->rvars, (RListComparator)regvar_comparator);
 	r_list_sort (cache->svars, (RListComparator)var_comparator);
 }

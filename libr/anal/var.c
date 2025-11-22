@@ -1756,22 +1756,7 @@ R_API void r_anal_var_list_show(RAnal *anal, RAnalFunction *fcn, int kind, int m
 }
 
 static bool is_default_argname(const char *name) {
-	if (R_STR_ISEMPTY (name)) {
-		return false;
-	}
-	if (!r_str_startswith (name, "arg")) {
-		return false;
-	}
-	const char *p = name + 3;
-	if (!*p) {
-		return false;
-	}
-	for (; *p; p++) {
-		if (!IS_DIGIT (*p)) {
-			return false;
-		}
-	}
-	return true;
+	return r_str_startswith (name, "arg") && IS_DIGIT (name[3]);
 }
 
 R_API void r_anal_function_vars_cache_init(RAnal *anal, RAnalFcnVarsCache *cache, RAnalFunction *fcn) {

@@ -199,9 +199,7 @@ R_API double GH(get_glibc_version)(RCore *core, const char *libc_path) {
 }
 
 static const char* GH(get_libc_filename_from_maps)(RCore *core) {
-	if (!core || !core->dbg || !core->dbg->maps || !core->bin || !core->bin->file) {
-		return NULL;
-	}
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->maps && core->bin && core->bin->file, NULL);
 	RListIter *iter;
 	RDebugMap *map = NULL;
 
@@ -223,6 +221,7 @@ static const char* GH(get_libc_filename_from_maps)(RCore *core) {
 
 // TODO: more options to get libc filename
 static const char* GH(get_libc_filename)(RCore *core) {
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->maps, NULL);
 	const char *dbg_glibc_path = r_config_get (core->config, "dbg.glibc.path");
 	if (!R_STR_ISEMPTY (dbg_glibc_path)) {
 		return dbg_glibc_path;
@@ -231,9 +230,7 @@ static const char* GH(get_libc_filename)(RCore *core) {
 }
 
 static bool GH(resolve_glibc_version)(RCore *core) {
-	if (!core || !core->dbg || !core->dbg->maps) {
-		return false;
-	}
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->maps, false);
 
 	double version = 0;
 
@@ -655,9 +652,7 @@ static GHT GH (get_main_arena_offset_with_relocs) (RCore *core, const char *libc
 }
 
 static bool GH(resolve_main_arena)(RCore *core, GHT *m_arena) {
-	if (!core || !core->dbg || !core->dbg->maps) {
-		return false;
-	}
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->maps, false);
 
 	if (core->dbg->main_arena_resolved) {
 		GHT dbg_glibc_main_arena = r_config_get_i (core->config, "dbg.glibc.main_arena");
@@ -1299,9 +1294,7 @@ static void GH (tcache_print) (RCore *core, GH (RTcache)* tcache, bool demangle)
 }
 
 static void GH (print_tcache_instance)(RCore *core, GHT m_arena, MallocState *main_arena, bool demangle) {
-	if (!core || !core->dbg || !core->dbg->maps) {
-		return;
-	}
+	R_RETURN_IF_FAIL (core && core->dbg && core->dbg->maps);
 
 	const bool tcache = r_config_get_b (core->config, "dbg.glibc.tcache");
 	if (!tcache || m_arena == GHT_MAX) {

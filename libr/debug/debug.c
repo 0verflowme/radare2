@@ -435,6 +435,9 @@ R_API void r_debug_free(RDebug *dbg) {
 		r_debug_signal_fini (dbg);
 		r_debug_trace_free (dbg->trace);
 		r_list_free (dbg->snaps);
+		if (dbg->iob.io) {
+			r_io_debug_replay_bindings_reset (dbg->iob.io);
+		}
 		r_debug_session_free (dbg->session);
 		r_anal_op_free (dbg->cur_op);
 		dbg->trace = NULL;

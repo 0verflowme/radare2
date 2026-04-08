@@ -503,6 +503,10 @@ R_API bool r_io_shift(RIO *io, ut64 start, ut64 end, st64 move);
 R_API ut64 r_io_seek(RIO *io, ut64 offset, int whence);
 R_API void r_io_drain_overlay(RIO *io);
 R_API bool r_io_get_region_at(RIO *io, RIORegion *region, ut64 addr);
+R_API void r_io_debug_replay_bindings_reset(RIO *io);
+R_API bool r_io_debug_replay_binding_add_pty(RIO *io, int fd, int host_fd, const char *slave_name);
+R_API bool r_io_debug_replay_apply(RIO *io, int fd, const ut8 *buf, ut64 len);
+R_API bool r_io_debug_replay_info(RIO *io, int fd, bool *owned, bool *resettable, bool *writable);
 R_API void r_io_fini(RIO *io);
 R_API void r_io_free(RIO *io);
 #define r_io_bind_init(x) (x) = (const RIOBind){0}

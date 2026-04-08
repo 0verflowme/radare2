@@ -14,8 +14,11 @@
 #define MAGIC_EXIT 123
 
 #include <signal.h>
+#include <limits.h>
 #if R2__UNIX__ && !APPLE_SDK_IPHONEOS
+#include <fcntl.h>
 #include <sys/ptrace.h>
+#include <termios.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #endif
@@ -178,6 +181,41 @@ err_fork:
 	CloseHandle (pi.hProcess);
 	return -1;
 }
+
+R_API void r_io_debug_replay_bindings_reset(RIO *io) {
+	(void)io;
+}
+
+R_API bool r_io_debug_replay_binding_add_pty(RIO *io, int fd, int host_fd, const char *slave_name) {
+	(void)io;
+	(void)fd;
+	(void)host_fd;
+	(void)slave_name;
+	return false;
+}
+
+R_API bool r_io_debug_replay_apply(RIO *io, int fd, const ut8 *buf, ut64 len) {
+	(void)io;
+	(void)fd;
+	(void)buf;
+	(void)len;
+	return false;
+}
+
+R_API bool r_io_debug_replay_info(RIO *io, int fd, bool *owned, bool *resettable, bool *writable) {
+	(void)io;
+	(void)fd;
+	if (owned) {
+		*owned = false;
+	}
+	if (resettable) {
+		*resettable = false;
+	}
+	if (writable) {
+		*writable = false;
+	}
+	return false;
+}
 #else // windows
 
 #if (__APPLE__ && __POWERPC__) || !__APPLE__
@@ -233,7 +271,7 @@ static void handle_posix_error(int err) {
 }
 #endif
 
-static RRunProfile* _get_run_profile(RIO *io, int bits, char **argv) {
+static RRunProfile* _build_run_profile(RIO *io, int bits, char **argv) {
 	int i;
 	RRunProfile *rp = r_run_new ("");
 	if (!rp) {
@@ -274,11 +312,6 @@ static RRunProfile* _get_run_profile(RIO *io, int bits, char **argv) {
 		r_run_parseline (rp, "bits=64");
 	} else if (bits == 32) {
 		r_run_parseline (rp, "bits=32");
-	}
-	if (!r_run_config_env (rp)) {
-		R_LOG_ERROR ("Cannot configure the environment");
-		r_run_free (rp);
-		return NULL;
 	}
 	return rp;
 }
@@ -330,10 +363,16 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
 		posix_spawn_file_actions_destroy (&fileActions);
 		return -1;
 	}
-	RRunProfile *rp = _get_run_profile (io, bits, argv);
+	RRunProfile *rp = _build_run_profile (io, bits, argv);
 	if (!rp) {
 		r_str_argv_free (argv);
 		posix_spawn_file_actions_destroy (&fileActions);
+		return -1;
+	}
+	if (!r_run_config_env (rp)) {
+		r_str_argv_free (argv);
+		posix_spawn_file_actions_destroy (&fileActions);
+		r_run_free (rp);
 		return -1;
 	}
 	handle_posix_redirection (rp, &fileActions);
@@ -357,31 +396,256 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
 	posix_spawn_file_actions_destroy (&fileActions);
 	return p; // -1 ?
 }
+
+R_API void r_io_debug_replay_bindings_reset(RIO *io) {
+	(void)io;
+}
+
+R_API bool r_io_debug_replay_binding_add_pty(RIO *io, int fd, int host_fd, const char *slave_name) {
+	(void)io;
+	(void)fd;
+	(void)host_fd;
+	(void)slave_name;
+	return false;
+}
+
+R_API bool r_io_debug_replay_apply(RIO *io, int fd, const ut8 *buf, ut64 len) {
+	(void)io;
+	(void)fd;
+	(void)buf;
+	(void)len;
+	return false;
+}
+
+R_API bool r_io_debug_replay_info(RIO *io, int fd, bool *owned, bool *resettable, bool *writable) {
+	(void)io;
+	(void)fd;
+	if (owned) {
+		*owned = false;
+	}
+	if (resettable) {
+		*resettable = false;
+	}
+	if (writable) {
+		*writable = false;
+	}
+	return false;
+}
 #endif // __APPLE__ && !__POWERPC__
 
 #if (!(__APPLE__ && !__POWERPC__))
 typedef struct fork_child_data_t {
-	RIO *io;
-	int bits;
-	const char *cmd;
+	RRunProfile *rp;
 } fork_child_data;
+
+typedef struct {
+	int fd;
+	int host_fd;
+	char *slave_name;
+	bool owned;
+	bool resettable;
+	bool writable;
+} RIODebugReplayBinding;
+
+static HtUP *io_replay_binding_store;
+
+static void io_debug_replay_binding_free(RIODebugReplayBinding *binding) {
+	if (!binding) {
+		return;
+	}
+	free (binding->slave_name);
+#if R2__UNIX__ && !__wasi__
+	if (binding->host_fd >= 0) {
+		close (binding->host_fd);
+	}
+#endif
+	free (binding);
+}
+
+static void htup_io_replay_binding_free(HtUPKv *kv) {
+	io_debug_replay_binding_free ((RIODebugReplayBinding *)kv->value);
+}
+
+static void htup_io_replay_table_free(HtUPKv *kv) {
+	ht_up_free ((HtUP *)kv->value);
+}
+
+static HtUP *io_replay_roots(bool create) {
+	if (!io_replay_binding_store && create) {
+		io_replay_binding_store = ht_up_new (NULL, htup_io_replay_table_free, NULL);
+	}
+	return io_replay_binding_store;
+}
+
+static HtUP *io_replay_table_for(RIO *io, bool create) {
+	if (!io) {
+		return NULL;
+	}
+	HtUP *roots = io_replay_roots (create);
+	if (!roots) {
+		return NULL;
+	}
+	ut64 key = (ut64)(size_t)io;
+	HtUP *table = ht_up_find (roots, key, NULL);
+	if (!table && create) {
+		table = ht_up_new (NULL, htup_io_replay_binding_free, NULL);
+		if (!table) {
+			return NULL;
+		}
+		ht_up_insert (roots, key, table);
+	}
+	return table;
+}
+
+static RIODebugReplayBinding *io_debug_replay_binding_get(RIO *io, int fd) {
+	if (!io || fd < 0) {
+		return NULL;
+	}
+	HtUP *table = io_replay_table_for (io, false);
+	return table? ht_up_find (table, (ut64)(ut32)fd, NULL): NULL;
+}
+
+static bool io_debug_replay_write_all(const RIODebugReplayBinding *binding, const ut8 *bytes, ut64 remaining) {
+#if R2__UNIX__ && !__wasi__
+	if (!binding || !bytes) {
+		return false;
+	}
+	while (remaining > 0) {
+		size_t chunk = remaining > INT_MAX? INT_MAX: (size_t)remaining;
+		ssize_t written = write (binding->host_fd, bytes, chunk);
+		if (written < 0) {
+			r_sys_perror ("replay write");
+			return false;
+		}
+		bytes += written;
+		remaining -= written;
+	}
+	return true;
+#else
+	R_LOG_ERROR ("Replay PTY backend unsupported on this platform");
+	return false;
+#endif
+}
+
+static bool io_debug_replay_apply_pty(const RIODebugReplayBinding *binding, const ut8 *bytes, ut64 remaining) {
+#if R2__UNIX__ && !__wasi__
+	if (!binding || !bytes) {
+		return false;
+	}
+	int slave_fd = -1;
+	bool flushed = false;
+	bool restore_termios = false;
+	struct termios saved_termios;
+	if (R_STR_ISNOTEMPTY (binding->slave_name)) {
+		slave_fd = open (binding->slave_name, O_RDWR | O_NOCTTY);
+		if (slave_fd >= 0) {
+			if (tcgetattr (slave_fd, &saved_termios) == 0) {
+				struct termios raw_termios = saved_termios;
+				cfmakeraw (&raw_termios);
+				if (tcsetattr (slave_fd, TCSANOW, &raw_termios) == 0) {
+					restore_termios = true;
+				}
+			}
+			flushed = tcflush (slave_fd, TCIFLUSH) == 0;
+		}
+	}
+	if (!flushed) {
+		flushed = tcflush (binding->host_fd, TCIFLUSH) == 0;
+	}
+	bool ok = flushed && io_debug_replay_write_all (binding, bytes, remaining);
+	if (restore_termios && tcsetattr (slave_fd, TCSANOW, &saved_termios) != 0) {
+		R_LOG_WARN ("Failed to restore replay PTY termios");
+	}
+	if (slave_fd >= 0) {
+		close (slave_fd);
+	}
+	return ok;
+#else
+	R_LOG_ERROR ("Replay PTY backend unsupported on this platform");
+	return false;
+#endif
+}
+
+R_API void r_io_debug_replay_bindings_reset(RIO *io) {
+	R_RETURN_IF_FAIL (io);
+	HtUP *roots = io_replay_roots (false);
+	if (roots) {
+		ht_up_delete (roots, (ut64)(size_t)io);
+	}
+}
+
+R_API bool r_io_debug_replay_binding_add_pty(RIO *io, int fd, int host_fd, const char *slave_name) {
+	R_RETURN_VAL_IF_FAIL (io && fd >= 0 && host_fd >= 0, false);
+	HtUP *table = io_replay_table_for (io, true);
+	if (!table) {
+		return false;
+	}
+	ht_up_delete (table, (ut64)(ut32)fd);
+	RIODebugReplayBinding *binding = R_NEW0 (RIODebugReplayBinding);
+	binding->fd = fd;
+	binding->host_fd = host_fd;
+	binding->slave_name = R_STR_ISNOTEMPTY (slave_name)? strdup (slave_name): NULL;
+	binding->owned = true;
+	binding->resettable = true;
+	binding->writable = true;
+	ht_up_insert (table, (ut64)(ut32)fd, binding);
+	return true;
+}
+
+R_API bool r_io_debug_replay_apply(RIO *io, int fd, const ut8 *buf, ut64 len) {
+	R_RETURN_VAL_IF_FAIL (io && fd >= 0 && buf, false);
+	RIODebugReplayBinding *binding = io_debug_replay_binding_get (io, fd);
+	if (!binding || !binding->owned || !binding->writable || !binding->resettable) {
+		R_LOG_ERROR ("Replay fd %d is not bound to a resettable debugger-owned channel", fd);
+		return false;
+	}
+	return io_debug_replay_apply_pty (binding, buf, len);
+}
+
+R_API bool r_io_debug_replay_info(RIO *io, int fd, bool *owned, bool *resettable, bool *writable) {
+	R_RETURN_VAL_IF_FAIL (io && fd >= 0, false);
+	RIODebugReplayBinding *binding = io_debug_replay_binding_get (io, fd);
+	if (!binding) {
+		return false;
+	}
+	if (owned) {
+		*owned = binding->owned;
+	}
+	if (resettable) {
+		*resettable = binding->resettable;
+	}
+	if (writable) {
+		*writable = binding->writable;
+	}
+	return true;
+}
+
+static void bind_replayfds_to_debugger(RIO *io, RRunProfile *rp) {
+	R_RETURN_IF_FAIL (io && io->coreb.core && rp);
+	if (!rp->replay_fds || r_list_empty (rp->replay_fds)) {
+		return;
+	}
+	r_io_debug_replay_bindings_reset (io);
+	RRunReplayFd *rf;
+	RListIter *it;
+	r_list_foreach (rp->replay_fds, it, rf) {
+		if (rf->kind == R_RUN_REPLAY_KIND_PTY && rf->parent_fd >= 0) {
+			if (!r_io_debug_replay_binding_add_pty (io, rf->target_fd, rf->parent_fd, rf->slave_name)) {
+				close (rf->parent_fd);
+			}
+			rf->parent_fd = -1;
+		}
+	}
+}
 
 static void fork_child_callback(void *user) {
 	fork_child_data *data = user;
-	char **argv = r_str_argv (data->cmd, NULL);
-	if (!argv) {
-		exit (1);
-	}
 	r_sys_clearenv ();
-	RRunProfile *rp = _get_run_profile (data->io, data->bits, argv);
-	if (!rp) {
-		r_str_argv_free (argv);
+	if (!r_run_config_env (data->rp)) {
 		exit (1);
 	}
 	trace_me ();
-	r_run_start (rp);
-	r_run_free (rp);
-	r_str_argv_free (argv);
+	r_run_start (data->rp);
 	exit (1);
 }
 
@@ -391,16 +655,35 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
 	int ret, status, child_pid;
 	void *bed = NULL;
 	fork_child_data child_data;
-	child_data.io = io;
-	child_data.bits = bits;
-	child_data.cmd = cmd;
+	if (io && io->coreb.core) {
+		r_io_debug_replay_bindings_reset (io);
+	}
+	char *ncmd = io->args ? r_str_appendf (strdup (cmd), " %s", io->args) : strdup (cmd);
+	char **argv = r_str_argv (ncmd, NULL);
+	if (!argv) {
+		free (ncmd);
+		return -1;
+	}
+	RRunProfile *rp = _build_run_profile (io, bits, argv);
+	r_str_argv_free (argv);
+	free (ncmd);
+	if (!rp) {
+		return -1;
+	}
+	if (!r_run_prepare_replay (rp)) {
+		r_run_free (rp);
+		return -1;
+	}
+	child_data.rp = rp;
 	child_pid = r_io_ptrace_fork (io, fork_child_callback, &child_data);
 	if (child_pid == -1 || child_pid == 0) {
+		r_run_free (rp);
 		r_sys_perror ("fork_and_ptraceme");
 		return -1;
 	} do {
 		ret = waitpid (child_pid, &status, WNOHANG);
 		if (ret == -1) {
+			r_run_free (rp);
 			r_sys_perror ("waitpid");
 			return -1;
 		}
@@ -409,22 +692,23 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
 		r_cons_sleep_end (cons, bed);
 	} while (ret != child_pid && !r_cons_is_breaked (cons));
 	if (!WIFSTOPPED (status)) {
+		r_run_free (rp);
 		return -1;
 	}
 	if (WEXITSTATUS (status) == MAGIC_EXIT || r_cons_is_breaked (cons)) {
 		R_LOG_INFO ("Killing child process %d due to an error", (int)child_pid);
 		kill (child_pid, SIGSTOP);
+		r_run_free (rp);
 		return -1;
 	}
+	bind_replayfds_to_debugger (io, rp);
+	r_run_free (rp);
 	return child_pid;
 }
 #endif
 
 static int fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
-	char *_eff_cmd = io->args ? r_str_appendf (strdup (cmd), " %s", io->args) : strdup (cmd);
-	int r = platform_fork_and_ptraceme (io, bits, _eff_cmd);
-	free (_eff_cmd);
-	return r;
+	return platform_fork_and_ptraceme (io, bits, cmd);
 }
 #endif
 
@@ -566,6 +850,41 @@ RIOPlugin r_io_plugin_debug = {
 	.isdbg = true,
 };
 #else
+R_API void r_io_debug_replay_bindings_reset(RIO *io) {
+	(void)io;
+}
+
+R_API bool r_io_debug_replay_binding_add_pty(RIO *io, int fd, int host_fd, const char *slave_name) {
+	(void)io;
+	(void)fd;
+	(void)host_fd;
+	(void)slave_name;
+	return false;
+}
+
+R_API bool r_io_debug_replay_apply(RIO *io, int fd, const ut8 *buf, ut64 len) {
+	(void)io;
+	(void)fd;
+	(void)buf;
+	(void)len;
+	return false;
+}
+
+R_API bool r_io_debug_replay_info(RIO *io, int fd, bool *owned, bool *resettable, bool *writable) {
+	(void)io;
+	(void)fd;
+	if (owned) {
+		*owned = false;
+	}
+	if (resettable) {
+		*resettable = false;
+	}
+	if (writable) {
+		*writable = false;
+	}
+	return false;
+}
+
 RIOPlugin r_io_plugin_debug = {
 	.meta = {
 		.name = "debug",

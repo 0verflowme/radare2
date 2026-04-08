@@ -668,6 +668,7 @@ R_API void *r_io_ptrace_func(RIO *io, void *(*func)(void *), void *user) {
 
 R_API void r_io_fini(RIO* io) {
 	R_RETURN_IF_FAIL (io);
+	r_io_debug_replay_bindings_reset (io);
 	r_io_bank_fini (io);
 	r_io_map_fini (io);
 	r_io_desc_cache_fini_all (io);

@@ -1189,6 +1189,24 @@ static bool var_add_structure_fields_to_list(RAnal *a, RAnalVar *av, RList *list
 	return false;
 }
 
+// The register that contains this one at the given width, or NULL.
+//
+// Matched by arena, offset and size rather than by name, so a profile that
+// spells a register differently from the calling-convention tables still
+// resolves to the entry those tables can name.
+static const char *reg_parent_name(RReg *reg, RRegItem *item, int bits) {
+	R_RETURN_VAL_IF_FAIL (reg && item, NULL);
+	RListIter *iter;
+	RRegItem *candidate;
+	r_list_foreach (reg->regset[item->arena].regs, iter, candidate) {
+		if (candidate->size == bits && candidate->offset == item->offset
+				&& candidate->arena == item->arena) {
+			return candidate->name;
+		}
+	}
+	return NULL;
+}
+
 #if 0
 static const char *get_regname(RAnal *anal, RAnalValue *value) {
 	return value? value->reg: NULL;
@@ -1205,8 +1223,19 @@ static const char *get_regname(RAnal *anal, RAnalValue *value) {
 	if (value && value->reg) {
 		name = value->reg;
 		RRegItem *ri = r_reg_get (anal->reg, value->reg, -1);
-		if (ri && (ri->size == 32) && (anal->config->bits == 64)) {
-			name = r_reg_32_to_64 (anal->reg, value->reg);
+		// Any sub-register spill names its parent, not just a 32-bit one.
+		// An amd64 callee taking (uint32_t, int8_t) spills the second
+		// argument as sil, and matching only the 32-bit width dropped it
+		// from the recovered prototype while the first argument survived.
+		// Resolving from the item actually found also keeps the parent's
+		// spelling consistent with the child's, which r_reg_32_to_64 does
+		// not: it matches its input case-insensitively and then returns
+		// whichever name comes first in the profile.
+		if (ri && ri->size < anal->config->bits) {
+			const char *parent = reg_parent_name (anal->reg, ri, anal->config->bits);
+			if (parent) {
+				name = parent;
+			}
 		}
 	}
 #endif

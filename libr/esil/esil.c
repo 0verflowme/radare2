@@ -81,21 +81,21 @@ static HtPP *esil_ops_new(void) {
 	return ht_pp_new_opt (&opt);
 }
 
-// Average token width for sizing the stack arena (stacksize * 32 bytes).
-#define R_ESIL_STACK_ARENA_WIDTH 32
+// Average token width for sizing the string ring (stacksize * 32 bytes).
+#define R_ESIL_RING_WIDTH 32
 
 static bool esil_stack_alloc(REsil *esil, int stacksize) {
 	esil->stack = calloc (stacksize, sizeof (RStrs));
 	if (!esil->stack) {
 		return false;
 	}
-	esil->stack_buf_cap = (ut32)stacksize * R_ESIL_STACK_ARENA_WIDTH;
-	esil->stack_buf = malloc (esil->stack_buf_cap);
-	if (!esil->stack_buf) {
+	esil->ring_size = (ut32)stacksize * R_ESIL_RING_WIDTH;
+	esil->ring = malloc (esil->ring_size);
+	if (!esil->ring) {
 		R_FREE (esil->stack);
 		return false;
 	}
-	esil->stack_buf_len = 0;
+	esil->ring_head = 0;
 	return true;
 }
 
@@ -152,7 +152,7 @@ static bool simple_mem_switch(void *iob, ut32 idx) {
 
 static bool simple_mem_read(void *iob, ut64 addr, ut8 *buf, int len) {
 	RIOBind *bnd = iob;
-	return bnd->read_at? bnd->read_at (bnd->io, addr, buf, len): false;
+	return bnd->read_at? bnd->read_at (bnd->io, addr, buf, len) == len: false;
 }
 
 static bool simple_mem_write(void *iob, ut64 addr, const ut8 *buf, int len) {
@@ -253,7 +253,7 @@ ops_setup_fail:
 	ht_pp_free (esil->ops);
 	esil->ops = NULL;
 	free (esil->stack);
-	free (esil->stack_buf);
+	free (esil->ring);
 	return false;
 }
 
@@ -424,7 +424,7 @@ R_API void r_esil_fini(REsil *esil) {
 	esil->stats = NULL;
 	r_esil_stack_free (esil);
 	R_FREE (esil->stack);
-	R_FREE (esil->stack_buf);
+	R_FREE (esil->ring);
 	r_esil_trace_free (esil->trace);
 	esil->trace = NULL;
 	R_FREE (esil->cmd_intr);
@@ -775,42 +775,72 @@ static bool setup_esil_set_bits(void *user, int bits) {
 	return true;
 }
 
-// Push a slice. Arena-backed slices are stored by reference; external ones
-// are copied into the arena (fixed-size, never reallocs).
+// Return true when a ring allocation would overwrite a stacked string.
+static bool esil_ring_overlaps_stack(REsil *esil, const char *a, size_t n) {
+	const char *const b = a + n;
+	int i;
+	for (i = 0; i < esil->stackptr; i++) {
+		const RStrs s = esil->stack[i];
+		if (a < s.b + 1 && s.a < b) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Allocate from the fixed-size ring without overwriting a stacked string.
+static char *esil_ring_alloc(REsil *esil, size_t need) {
+	const ut32 size = esil->ring_size;
+	const ut32 head = esil->ring_head;
+	if (!need || need > size) {
+		R_LOG_DEBUG ("esil ring exhausted");
+		return NULL;
+	}
+	const ut32 start = need <= size - head? head: 0;
+	char *const dst = esil->ring + start;
+	if (esil_ring_overlaps_stack (esil, dst, need)) {
+		R_LOG_DEBUG ("esil ring would overwrite a stacked string");
+		return NULL;
+	}
+	esil->ring_head = (start + need) % size;
+	return dst;
+}
+
+// Push a slice, copying external strings into the fixed-size ring.
 R_API bool r_esil_push(REsil *esil, RStrs s) {
 	if (esil->stackptr >= esil->stacksize || s.a >= s.b) {
 		return false;
 	}
-	const char *const bufbeg = esil->stack_buf;
-	const char *const bufend = bufbeg + esil->stack_buf_len;
-	if (s.a >= bufbeg && s.b <= bufend) {
+	const char *const ring = esil->ring;
+	if (s.a >= ring && s.b < ring + esil->ring_size) {
 		esil->stack[esil->stackptr++] = s;
 		return true;
 	}
 	const size_t n = (size_t)(s.b - s.a);
-	if (esil->stack_buf_len + n + 1 > esil->stack_buf_cap) {
-		R_LOG_DEBUG ("esil stack arena exhausted");
+	char *const dst = esil_ring_alloc (esil, n + 1);
+	if (!dst) {
 		return false;
 	}
-	char *const dst = esil->stack_buf + esil->stack_buf_len;
 	memcpy (dst, s.a, n);
 	dst[n] = '\0';
 	esil->stack[esil->stackptr].a = dst;
 	esil->stack[esil->stackptr].b = dst + n;
 	esil->stackptr++;
-	esil->stack_buf_len += (ut32)(n + 1);
 	return true;
 }
 
 R_API bool r_esil_pushnum(REsil *esil, ut64 num) {
-	if (esil->stackptr >= esil->stacksize
-			|| esil->stack_buf_len + 20 > esil->stack_buf_cap) {
+	if (esil->stackptr >= esil->stacksize) {
 		return false;
 	}
-	char *const dst = esil->stack_buf + esil->stack_buf_len;
+	char *const dst = esil_ring_alloc (esil, 20);
+	if (!dst) {
+		return false;
+	}
 	const RStrs s = r_strs_u64hex (dst, 20, num);
 	esil->stack[esil->stackptr++] = s;
-	esil->stack_buf_len += (ut32)((s.b - s.a) + 1);
+	// Return the unused part of the formatting buffer to the ring.
+	esil->ring_head = (ut32)(s.b + 1 - esil->ring) % esil->ring_size;
 	return true;
 }
 
@@ -1142,7 +1172,7 @@ static bool runword(REsil *esil, RStrs w) {
 		}
 		return ret;
 	}
-	// not an op — push the slice into the stack arena
+	// Not an op: push its slice into the string ring.
 	if (esil->stackptr > esil->stacksize - 1) {
 		R_LOG_DEBUG ("ESIL stack is full");
 		esil->trap = 1;
@@ -1222,10 +1252,8 @@ R_API bool r_esil_parse(REsil *esil, const char *str) {
 	if (esil->cmd && esil->cmd_todo && r_str_startswith (str, "TODO")) {
 		esil->cmd (esil, esil->cmd_todo, esil->addr, 0);
 	}
-	// Fresh stack+arena per parse — slices come from the input directly
-	// and are copied into the arena on push to guarantee NUL-termination.
+	// Start each parse with an empty stack.
 	esil->stackptr = 0;
-	esil->stack_buf_len = 0;
 	const bool in_delay = esil->delay > 0;
 	const char *ostr = str;
 	int rc = 0;
@@ -1283,7 +1311,6 @@ R_API bool r_esil_runword(REsil *esil, RStrs word) {
 R_API void r_esil_stack_free(REsil *esil) {
 	R_RETURN_IF_FAIL (esil);
 	esil->stackptr = 0;
-	esil->stack_buf_len = 0;
 }
 
 R_API int r_esil_condition(REsil *esil, const char *str) {
@@ -1321,9 +1348,12 @@ static bool internal_esil_mem_read_no_null(REsil *esil, ut64 addr, ut8 *buf, int
 		return false;
 	}
 	if (iob->is_valid_offset (io, addr, false)) {
-		if (!iob->read_at (io, addr, buf, len) && esil->iotrap) {
-			esil->trap = R_ANAL_TRAP_READ_ERR;
-			esil->trap_code = addr;
+		if (iob->read_at (io, addr, buf, len) != len) {
+			if (esil->iotrap) {
+				esil->trap = R_ANAL_TRAP_READ_ERR;
+				esil->trap_code = addr;
+			}
+			return false;
 		}
 	} else {
 		memset (buf, io->Oxff, len);
@@ -1357,11 +1387,9 @@ static bool internal_esil_mem_read(REsil *esil, ut64 addr, ut8 *buf, int len) {
 			}
 		}
 	}
-	// TODO: Check if read_at fails
-	(void)esil->anal->iob.read_at (io, addr, buf, len);
+	const int nread = esil->anal->iob.read_at (io, addr, buf, len);
 	// check if request address is mapped , if don't fire trap and esil ioer callback
-	// now with siol, read_at return true/false can't be used to check error vs len
-	if (!esil->anal->iob.is_valid_offset (io, addr, false)) {
+	if (nread != len || !esil->anal->iob.is_valid_offset (io, addr, false)) {
 		if (esil->iotrap) {
 			esil->trap = R_ANAL_TRAP_READ_ERR;
 			esil->trap_code = addr;
@@ -1370,7 +1398,7 @@ static bool internal_esil_mem_read(REsil *esil, ut64 addr, ut8 *buf, int len) {
 			esil->cmd (esil, esil->cmd_ioer, esil->addr, 0);
 		}
 	}
-	return len;
+	return nread == len;
 }
 
 /* register callbacks using this anal module. */

@@ -106,8 +106,7 @@ static void jni_function_rename(RAnal *anal, RAnalFunction *fcn, const char *nam
 	if (anal->flb.f) {
 		RFlagItem *flag = r_flag_get_by_spaces (anal->flb.f, false,
 			fcn->addr, "functions", NULL);
-		if (flag && flag->space && !strcmp (flag->space->name, "functions")
-				&& !strcmp (flag->name, old_name)) {
+		if (flag && !strcmp (flag->name, old_name)) {
 			r_flag_rename (anal->flb.f, flag, name);
 		}
 	}
@@ -288,7 +287,7 @@ static char *jni_read_string(JniScanContext *ctx, ut64 addr, size_t maxlen) {
 	}
 	size_t available = R_MIN ((ut64)maxlen, end - addr);
 	char *str = R_NEWS (char, available + 1);
-	if (!ctx->anal->iob.read_at (ctx->anal->iob.io, addr, (ut8 *)str, available)) {
+	if (ctx->anal->iob.read_at (ctx->anal->iob.io, addr, (ut8 *)str, available) != available) {
 		free (str);
 		return NULL;
 	}
@@ -457,10 +456,12 @@ static void jni_scan_section(JniScanContext *ctx, const RBinSection *section) {
 		return;
 	}
 	ut8 *buf = R_NEWS (ut8, size);
-	if (!ctx->anal->iob.read_at (ctx->anal->iob.io, section_addr, buf, (int)size)) {
+	const int nread = ctx->anal->iob.read_at (ctx->anal->iob.io, section_addr, buf, (int)size);
+	if (nread < min_size) {
 		free (buf);
 		return;
 	}
+	size = nread;
 	size_t offset = (ctx->pointer_size - (section_addr % ctx->pointer_size))
 		% ctx->pointer_size;
 	while (offset <= size - min_size) {

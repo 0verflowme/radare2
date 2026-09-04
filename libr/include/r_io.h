@@ -320,8 +320,8 @@ typedef ut64(*RIODescSize)(RIODesc *desc);
 typedef RIODesc *(*RIOOpen)(RIO *io, const char *uri, int flags, int mode);
 typedef RIODesc *(*RIOOpenAt)(RIO *io, const  char *uri, int flags, int mode, ut64 at);
 typedef bool (*RIOClose)(RIO *io, int fd);
-typedef bool (*RIOReadAt)(RIO *io, ut64 addr, ut8 *buf, int len);
-typedef int (*RIONReadAt)(RIO *io, ut64 addr, ut8 *buf, int len);
+// Returns the number of bytes in the contiguous read prefix, or -1 on error.
+typedef int (*RIOReadAt)(RIO *io, ut64 addr, ut8 *buf, int len);
 typedef bool (*RIOWriteAt)(RIO *io, ut64 addr, const ut8 *buf, int len);
 typedef bool (*RIOOverlayWriteAt)(RIO *io, ut64 addr, const ut8 *buf, int len);
 typedef char *(*RIOSystem)(RIO *io, const char* cmd);
@@ -364,9 +364,7 @@ typedef struct r_io_bind_t {
 	RIOOpen open;
 	RIOOpenAt open_at;
 	RIOClose close;
-	// read_at reports success; nread_at reports the exact byte count.
 	RIOReadAt read_at;
-	RIONReadAt nread_at;
 	RIOWriteAt write_at;
 	RIOOverlayWriteAt overlay_write_at;
 	RIOSystem system;
@@ -592,6 +590,7 @@ R_API bool r_io_cache_writable(RIO *io);
 // apply patches in given buffer
 R_API bool r_io_cache_write_at(RIO *io, ut64 addr, const ut8 *buf, int len);
 R_API bool r_io_cache_read_at(RIO *io, ut64 addr, ut8 *buf, int len);
+R_IPI int r_io_cache_nread_at(RIO *io, ut64 addr, ut8 *buf, int len);
 // invalidate ranges and commit to io
 R_API int r_io_cache_invalidate(RIO *io, ut64 from, ut64 to, bool many);
 R_API void r_io_cache_commit(RIO *io, ut64 from, ut64 to, bool many);

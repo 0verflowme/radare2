@@ -239,6 +239,9 @@ typedef struct r_anal_dyn_cc_t {
 	bool arg_tail;
 	RAnalDynCCLoc arg_tail_loc;
 	RAnalDynCCSlice arg_ref;
+	RAnalDynCCHomes fpargs[R_ANAL_CC_MAXARG];
+	int fparg_count;
+	RAnalDynCCSlice fparg_ref;
 	RAnalDynCCHomes rets[R_ANAL_CC_MAXARG];
 	int ret_count;
 	RAnalDynCCSlice ret_ref;
@@ -469,6 +472,33 @@ static bool dyncc_parse_homed_list(const char *s, const char *end, RAnalDynCC *d
 	return true;
 }
 
+static bool dyncc_parse_fpargs(const char *s, const char *end, RAnalDynCC *d) {
+	if (s == end || !dyncc_slice_empty (&d->fparg_ref) || d->fparg_count) {
+		return false;
+	}
+	if (dyncc_parse_ref_only (s, end, &d->fparg_ref)) {
+		return true;
+	}
+	while (s < end) {
+		const char *next = memchr (s, ',', end - s);
+		if (!next) {
+			next = end;
+		}
+		RAnalDynCCHomes homes[R_ANAL_CC_MAXARG] = {0};
+		int count = 0;
+		if (next == s || !dyncc_parse_homes (s, next, homes, &count)
+				|| d->fparg_count > R_ANAL_CC_MAXARG - count) {
+			return false;
+		}
+		int i;
+		for (i = 0; i < count; i++) {
+			d->fpargs[d->fparg_count++] = homes[i];
+		}
+		s = next < end? next + 1: next;
+	}
+	return true;
+}
+
 static bool dyncc_role_tag(char tag) {
 	switch (tag) {
 	case 'T':
@@ -568,6 +598,10 @@ static bool dyncc_parse_attrs(const char *s, const char *end, RAnalDynCC *d) {
 				return false;
 			}
 			if (!dyncc_set_slice (s, next, tag == 'C'? &d->clobbers: &d->preserves, R_ANAL_DYNCC_REGSET_SIZE)) {
+				return false;
+			}
+		} else if (tag == 'F') {
+			if (!dyncc_parse_fpargs (s, next, d)) {
 				return false;
 			}
 		} else if (!dyncc_set_role (d, tag, s, next)) {
@@ -674,6 +708,21 @@ static const char *dyncc_arg_home(RAnal *anal, const RAnalDynCC *d, int n, int h
 	return NULL;
 }
 
+static const char *dyncc_fparg_home(RAnal *anal, const RAnalDynCC *d, int n, int home) {
+	if (n < 0 || home < 0) {
+		return NULL;
+	}
+	if (!dyncc_slice_empty (&d->fparg_ref)) {
+		const char *refcc = dyncc_intern (anal, d->fparg_ref.p, d->fparg_ref.len);
+		return refcc? dyncc_from_static_loc (anal, r_anal_cc_argloc (anal, refcc, R_ANAL_CC_MAXARG + n, home, -1)): NULL;
+	}
+	if (n >= d->fparg_count) {
+		return NULL;
+	}
+	const RAnalDynCCHomes *homes = &d->fpargs[n];
+	return home < homes->home_count? dyncc_loc_name (anal, &homes->homes[home]): NULL;
+}
+
 static const RAnalDynCCRole *dyncc_role(const RAnalDynCC *d, char tag) {
 	int slot = dyncc_role_tag (tag)? dyncc_find_role (d, tag): -1;
 	return slot >= 0? &d->roles[slot]: NULL;
@@ -717,7 +766,8 @@ static bool dyncc_ref_exists(RAnal *anal, const RAnalDynCCSlice *ref) {
 }
 
 static bool dyncc_refs_exist(RAnal *anal, const RAnalDynCC *d) {
-	if (!dyncc_ref_exists (anal, &d->arg_ref) || !dyncc_ref_exists (anal, &d->ret_ref)) {
+	if (!dyncc_ref_exists (anal, &d->arg_ref) || !dyncc_ref_exists (anal, &d->fparg_ref)
+			|| !dyncc_ref_exists (anal, &d->ret_ref)) {
 		return false;
 	}
 	int i;
@@ -750,6 +800,9 @@ static void cc_unset_slots(Sdb *db, const char *name) {
 	for (i = 0; i < R_ANAL_CC_MAXARG; i++) {
 		sdb_unset (db, r_strbuf_setf (&sb, "cc.%s.arg%d", name, i), 0);
 		sdb_unset (db, r_strbuf_setf (&sb, "cc.%s.ret%d", name, i), 0);
+	}
+	for (i = 0; i < R_ANAL_CC_MAXARG; i++) {
+		sdb_unset (db, r_strbuf_setf (&sb, "cc.%s.fparg%d", name, i), 0);
 	}
 	r_strbuf_fini (&sb);
 }
@@ -970,7 +1023,18 @@ R_API const char *r_anal_cc_argloc(RAnal *anal, const char *cc, int n, int home,
 	}
 	RAnalDynCC d;
 	if (dyncc_parse (cc, &d)) {
+		// the upper half of the fixed range addresses the fp register sequence
+		if (n >= R_ANAL_CC_MAXARG && n < R_ANAL_CC_MAXARG * 2) {
+			return dyncc_fparg_home (anal, &d, n - R_ANAL_CC_MAXARG, home);
+		}
 		return dyncc_arg_home (anal, &d, n, home, argc);
+	}
+	if (n >= R_ANAL_CC_MAXARG && n < R_ANAL_CC_MAXARG * 2) {
+		if (home > 0) {
+			return NULL;
+		}
+		const char *ret = sdb_const_getf (DB, NULL, "cc.%s.fparg%d", cc, n - R_ANAL_CC_MAXARG);
+		return ret? dyncc_from_static_loc (anal, ret): NULL;
 	}
 	if (home > 0) {
 		return NULL;
@@ -1230,7 +1294,7 @@ R_API bool r_anal_cc_argval(RAnal *anal, RReg *reg, const char *convention, int 
 		addr -= sz - slotsz; // a reverse layout homes a wide value's first slot at its highest address
 	}
 	ut8 buf[8] = { 0 };
-	if (!cc_slot_mapped (anal, addr, sz) || !anal->iob.read_at (anal->iob.io, addr, buf, sz)) {
+	if (!cc_slot_mapped (anal, addr, sz) || anal->iob.read_at (anal->iob.io, addr, buf, sz) != sz) {
 		return false;
 	}
 	*out = r_read_ble (buf, be, sz * 8);

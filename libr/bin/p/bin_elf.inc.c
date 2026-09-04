@@ -1009,7 +1009,7 @@ static RVecRBinReloc *relocs(RBinFile *bf) {
 static void aarch64_patch_insn(RIOBind *iob, ut64 at, ut32 mask, ut32 val) {
 	ut8 buf[4] = {0};
 	// without the original opcode bits a patch would fabricate an instruction
-	if (!iob->read_at (iob->io, at, buf, sizeof (buf))) {
+	if (iob->read_at (iob->io, at, buf, sizeof (buf)) != sizeof (buf)) {
 		return;
 	}
 	r_write_le32 (buf, (r_read_le32 (buf) & ~mask) | (val & mask));
@@ -1040,11 +1040,16 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 	ut64 A = rel->addend;
 	ut64 P = rel->rva;
 	ut8 buf[8] = {0};
-	if (rel->mode == DT_RELR) {
-		// relr has no explicit addend: the slot's own word is it
-		ut8 slot[sizeof (Elf_(Addr))] = {0};
-		iob->read_at (iob->io, rel->rva, slot, sizeof (slot));
-		A = r_read_ble (slot, bo->endian, 8 * sizeof (slot));
+	// rel/relr carry no explicit addend: the slot's own word is it
+	if (rel->mode == DT_RELR || e_machine == EM_386) {
+		ut8 slot[8] = {0};
+		const int ws = (e_machine == EM_386)? 4: (int)sizeof (Elf_(Addr));
+		if (iob->read_at (iob->io, rel->rva, slot, ws) != ws) {
+			return;
+		}
+		if (rel->mode == DT_RELR || rel->mode == DT_REL) {
+			A = r_read_ble (slot, bo->endian, 8 * ws);
+		}
 	}
 	switch (e_machine) {
 	case EM_S390:
@@ -1061,7 +1066,9 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 	{
 		ut32 insn = 0;
 		st64 addend = rel->addend;
-		iob->read_at (iob->io, rel->rva, buf, 4);
+		if (iob->read_at (iob->io, rel->rva, buf, 4) != 4) {
+			return;
+		}
 		insn = r_read_ble32 (buf, bo->endian);
 		if (rel->mode == DT_REL) {
 			switch (rel->type) {
@@ -1280,6 +1287,7 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 			word = 8;
 			V = B + A;
 			break;
+			break;
 		case R_AARCH64_GLOB_DAT:
 		case R_AARCH64_JUMP_SLOT:
 		case R_AARCH64_ABS64:
@@ -1367,13 +1375,17 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 			switch (low) {
 			case 14:
 				V &= (1 << 14) - 1;
-				iob->read_at (iob->io, rel->rva, buf, 4);
+				if (iob->read_at (iob->io, rel->rva, buf, 4) != 4) {
+					return;
+				}
 				r_write_ble32 (buf, (r_read_ble32 (buf, bo->endian) & ~((1<<16) - (1<<2))) | V << 2, bo->endian);
 				iob->overlay_write_at (iob->io, rel->rva, buf, 4);
 				break;
 			case 24:
 				V &= (1 << 24) - 1;
-				iob->read_at (iob->io, rel->rva, buf, 4);
+				if (iob->read_at (iob->io, rel->rva, buf, 4) != 4) {
+					return;
+				}
 				r_write_ble32 (buf, (r_read_ble32 (buf, bo->endian) & ~((1<<26) - (1<<2))) | V << 2, bo->endian);
 				iob->overlay_write_at (iob->io, rel->rva, buf, 4);
 				break;
@@ -1394,7 +1406,9 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 				break;
 			}
 		} else if (ds) {
-			iob->read_at (iob->io, rel->rva, buf, 2);
+			if (iob->read_at (iob->io, rel->rva, buf, 2) != 2) {
+				return;
+			}
 			ut16 cur = r_read_ble16 (buf, bo->endian);
 			r_write_ble16 (buf, (cur & 3) | (V & 0xfffc), bo->endian);
 			iob->overlay_write_at (iob->io, rel->rva, buf, 2);
@@ -1402,23 +1416,27 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 		break;
 	}
 	case EM_386:
- 		switch (rel->type) {
- 		case R_386_32:
- 		case R_386_PC32:
-			{
- 			r_io_read_at (iob->io, rel->rva, buf, 4);
- 			ut32 v = r_read_le32 (buf) + S + A;
- 			if (rel->type == R_386_PC32) {
- 				v -= P;
- 			}
- 			r_write_le32 (buf, v);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 4);
-			}
+		switch (rel->type) {
+		case R_386_32:
+			V = S + A;
 			break;
- 		default:
- 			break;
- 		}
- 		break;
+		case R_386_PC32:
+			V = S + A - P;
+			break;
+		case R_386_GLOB_DAT:
+		case R_386_JMP_SLOT:
+			V = S;
+			break;
+		case R_386_RELATIVE:
+			// wants the load bias, which is 0 in an unrebased view
+			V = A;
+			break;
+		default:
+			return;
+		}
+		r_write_ble32 (buf, V, bo->endian);
+		iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+		break;
 	case EM_X86_64: {
 		int word = 0;
 		switch (rel->type) {

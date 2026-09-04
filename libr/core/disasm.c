@@ -1800,7 +1800,7 @@ static void ds_show_xrefs(RDisasmState *ds) {
 					}
 				}
 				if (ds->asm_demangle) {
-					f = r_flag_get_by_spaces (core->flags, false, fun->addr, R_FLAGS_FS_SYMBOLS, NULL);
+					f = r_flag_get_by_spaces (core->flags, false, fun->addr, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 					if (f && f->demangled && f->realname) {
 						realname = strdup (f->realname);
 					}
@@ -1830,7 +1830,7 @@ static void ds_show_xrefs(RDisasmState *ds) {
 						RFlagItem *f_sym = f;
 						if (!r_str_startswith (f_sym->name, "sym.")) {
 							f_sym = r_flag_get_by_spaces (core->flags, false, f->addr,
-									R_FLAGS_FS_SYMBOLS, NULL);
+									R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 						}
 						if (f_sym && f_sym->demangled && f_sym->realname) {
 							f = f_sym;
@@ -4597,7 +4597,7 @@ static void ds_print_fcn_name(RDisasmState *ds) {
 	if (!f && ds->core->flags && (!ds->core->vmode || (!ds->subjmp && !ds->subnames))) {
 		const char *arch;
 		RFlagItem *flag = r_flag_get_by_spaces (ds->core->flags, false, ds->analop.jump,
-				R_FLAGS_FS_CLASSES, R_FLAGS_FS_SYMBOLS, NULL);
+				R_FLAGS_FS_CLASSES, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 		if (flag && flag->name
 				&& ds->opstr && !strstr (ds->opstr, flag->name)
 				&& (r_str_startswith (flag->name, "sym.")
@@ -4608,7 +4608,7 @@ static void ds_print_fcn_name(RDisasmState *ds) {
 			if (flag_sym->demangled && ds->core->vmode && ds->asm_demangle
 					&& (r_str_startswith (flag->name, "sym.")
 						|| (flag_sym = r_flag_get_by_spaces (ds->core->flags, false,
-							ds->analop.jump, R_FLAGS_FS_SYMBOLS, NULL)))) {
+							ds->analop.jump, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL)))) {
 				return;
 			}
 			ds_begin_comment (ds);
@@ -4643,7 +4643,7 @@ static void ds_print_fcn_name(RDisasmState *ds) {
 					&& ds->asm_demangle
 					&& (flag_sym = r_flag_get_by_spaces (ds->core->flags, false,
 						ds->analop.jump,
-						R_FLAGS_FS_SYMBOLS, NULL))
+						R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL))
 					&& flag_sym->demangled) {
 				return;
 			}
@@ -5195,6 +5195,12 @@ static bool flag_name_in_opstr(RFlagItem *f, const char *opstr) {
 	return f && opstr && (strstr (opstr, f->name) || (f->realname && strstr (opstr, f->realname)));
 }
 
+// a reloc here means the slot holds an address, not text
+static bool ds_is_ptr_slot(RDisasmState *ds, ut64 addr) {
+	return r_core_getreloc (ds->core, addr, 1)
+		&& !r_meta_get_in (ds->core->anal, addr, R_META_TYPE_STRING);
+}
+
 /* convert numeric value in opcode to ascii char or number */
 static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 	R_RETURN_IF_FAIL (ds);
@@ -5333,7 +5339,9 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 					r_io_read_at (ds->core->io, ds->analop.ptr,
 						      (ut8 *)str, sizeof (str) - 1);
 					str[sizeof (str) - 1] = 0;
-					if (!string_printed && str[0] && r_str_is_printable_incl_newlines (str)) {
+					if (!string_printed && str[0]
+						&& r_str_is_printable_incl_newlines (str)
+						&& !ds_is_ptr_slot (ds, ds->analop.ptr)) {
 						ds_print_str (ds, str, sizeof (str), ds->analop.ptr);
 						string_printed = true;
 					}
@@ -5447,7 +5455,7 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 				}
 			}
 			if (print_msg) {
-				if (!string_printed) {
+				if (!string_printed && !ds_is_ptr_slot (ds, refaddr)) {
 					ds_print_str (ds, msg, len, refaddr);
 					string_printed = true;
 				}
@@ -5490,7 +5498,7 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 					}
 				} else {
 					if (r_core_anal_address (core, refaddr) & R_ANAL_ADDR_TYPE_ASCII) {
-						if (!string_printed && print_msg) {
+						if (!string_printed && print_msg && !ds_is_ptr_slot (ds, refaddr)) {
 							ds_print_str (ds, msg, len, refaddr);
 							string_printed = true;
 						}
@@ -5501,7 +5509,7 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 			kind = r_anal_data_kind (core->anal, refaddr, (const ut8*)msg, len - 1);
 			if (kind) {
 				if (!strcmp (kind, "text")) {
-					if (!string_printed && print_msg) {
+					if (!string_printed && print_msg && !ds_is_ptr_slot (ds, refaddr)) {
 						ds_print_str (ds, msg, len, refaddr);
 						string_printed = true;
 					}
@@ -5558,7 +5566,7 @@ static void ds_print_demangled(RDisasmState *ds) {
 	case R_ANAL_OP_TYPE_JMP:
 	case R_ANAL_OP_TYPE_UJMP:
 	case R_ANAL_OP_TYPE_CALL:
-		f = r_flag_get_by_spaces (core->flags, false, ds->analop.jump, R_FLAGS_FS_SYMBOLS, NULL);
+		f = r_flag_get_by_spaces (core->flags, false, ds->analop.jump, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 		if (f && f->demangled && f->realname && ds->opstr && !strstr (ds->opstr, f->realname)) {
 			ds_begin_nl_comment (ds);
 			ds_comment (ds, true, "%s %s", ds->cmtoken, f->realname);

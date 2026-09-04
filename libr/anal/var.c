@@ -850,6 +850,14 @@ R_API bool r_anal_var_rename(RAnal *anal, RAnalVar *var, const char *new_name) {
 	if (!nn) {
 		return false;
 	}
+	RAnalVarAccess *acc;
+	R_VEC_FOREACH (&var->accesses, acc) {
+		ut64 addr = var->fcn->addr + acc->offset;
+		const char *vartype = r_meta_get_string (anal, R_META_TYPE_VARTYPE, addr);
+		if (vartype && !strcmp (vartype, var->name)) {
+			r_meta_set_string (anal, R_META_TYPE_VARTYPE, addr, new_name);
+		}
+	}
 	free (var->name);
 	var->name = nn;
 	r_anal_function_bump_dirty_epoch (var->fcn);
@@ -864,12 +872,15 @@ static int cc_reg_index(RAnal *anal, const char *callconv, const char *regname) 
 	if (!callconv || !regname) {
 		return -1;
 	}
-	const int arg_max = r_anal_cc_max_arg (anal, callconv);
 	int i;
-	for (i = 0; i < arg_max; i++) {
+	for (i = 0; i < R_ANAL_CC_MAXARG; i++) {
 		const char *reg_arg = r_anal_cc_argloc (anal, callconv, i, 0, 0);
 		if (reg_arg && r_anal_cc_location_uses (anal, reg_arg, regname)) {
 			return i;
+		}
+		reg_arg = r_anal_cc_argloc (anal, callconv, R_ANAL_CC_MAXARG + i, 0, 0);
+		if (reg_arg && r_anal_cc_location_uses (anal, reg_arg, regname)) {
+			return R_ANAL_CC_MAXARG + i;
 		}
 	}
 	return -1;
@@ -1231,7 +1242,11 @@ static const char *get_regname(RAnal *anal, RAnalValue *value) {
 		// spelling consistent with the child's, which r_reg_32_to_64 does
 		// not: it matches its input case-insensitively and then returns
 		// whichever name comes first in the profile.
-		if (ri && ri->size < anal->config->bits) {
+		//
+		// Only gprs have a wider twin. arm64 lays s0 and d0 at one offset in
+		// the fpu arena, so widening by offset there would rename a float
+		// argument into the double that overlaps it.
+		if (ri && ri->arena == R_REG_TYPE_GPR && ri->size < anal->config->bits) {
 			const char *parent = reg_parent_name (anal->reg, ri, anal->config->bits);
 			if (parent) {
 				name = parent;
@@ -1722,7 +1737,7 @@ static void extract_dyncc_reguse(RAnal *anal, RAnalFunction *fcn, RAnalOp *op, i
 		if (!loc) {
 			continue;
 		}
-		const int slot = R_ANAL_CC_MAXARG + 2 + dynslot;
+		const int slot = R_ANAL_CC_DYNSLOT_BASE + dynslot;
 		const bool is_arg = is_used_like_arg (loc, opsreg, opdreg, op, anal, op_dst_writeonly);
 		if (is_arg && reg_set[slot] != 2) {
 			const char *regname = reguse_regname_for_loc (anal, op, loc, opdreg);
@@ -1864,59 +1879,74 @@ R_API void r_anal_extract_rarg(RAnal *anal, RAnalOp *op, RAnalFunction *fcn, int
 		return;
 	}
 
-	if (scan_args) {
-		const int total = 0; // TODO: pass argn
-		for (i = 0; i < max_count; i++) {
-			const char *regname = r_anal_cc_argloc (anal, fcn->callconv, i, 0, total);
-			if (!regname) {
-				continue;
+	// only an fp/vector instruction can carry an fp argument, so the second
+	// sequence is not worth walking for the integer bulk of a function
+	const bool scan_fpargs = op->family == R_ANAL_OP_FAMILY_FPU
+		|| op->family == R_ANAL_OP_FAMILY_VEC
+		|| op->family == R_ANAL_OP_FAMILY_SIMD
+		|| op->family == R_ANAL_OP_FAMILY_UNKNOWN;
+	// The fixed register-state array lets both sequences use one bounded walk.
+	for (i = 0; i < R_ANAL_CC_MAXARG * 2; i++) {
+		const bool fp = i >= R_ANAL_CC_MAXARG;
+		const int n = fp? i - R_ANAL_CC_MAXARG: i;
+		const int slot = fp? R_ANAL_CC_FPSLOT_BASE + n: n;
+		const char *deftype = fp? "double": NULL;
+		if ((fp && !scan_fpargs) || (!fp && (!scan_args || n >= max_count))) {
+			continue;
+		}
+		const char *regname = r_anal_cc_argloc (anal, fcn->callconv,
+			fp? R_ANAL_CC_MAXARG + n: n, 0, 0); // TODO: pass argn
+		if (!regname) {
+			continue;
+		}
+		int delta = 0;
+		RAnalVar *var = NULL;
+		bool is_arg = is_used_like_arg (regname, opsreg, opdreg, op, anal, op_dst_writeonly);
+		if (is_arg && reg_set[slot] != 2) {
+			delta = cc_loc_delta (anal, regname);
+		}
+		if (is_arg && reg_set[slot] == 1) {
+			var = r_anal_function_get_var (fcn, R_ANAL_VAR_KIND_REG, delta);
+		} else if (is_arg && reg_set[slot] != 2) {
+			const char *vname = NULL;
+			char *type = NULL;
+			char *name = NULL;
+			// only the integer sequence indexes a prototype: the position of
+			// a float depends on an interleaving the code cannot see
+			if (!fp && (n < argc) && fname) {
+				type = r_type_func_args_type (TDB, fname, n);
+				vname = r_type_func_args_name (TDB, fname, n);
 			}
-			int delta = 0;
-			RAnalVar *var = NULL;
-			bool is_arg = is_used_like_arg (regname, opsreg, opdreg, op, anal, op_dst_writeonly);
-			if (is_arg && reg_set[i] != 2) {
-				delta = cc_loc_delta (anal, regname);
+			if (!vname) {
+				name = r_str_newf ("arg%d", fp? max_count + n + 1: n + 1);
+				vname = name;
 			}
-			if (is_arg && reg_set[i] == 1) {
-				var = r_anal_function_get_var (fcn, R_ANAL_VAR_KIND_REG, delta);
-			} else if (is_arg && reg_set[i] != 2) {
-				const char *vname = NULL;
-				char *type = NULL;
-				char *name = NULL;
-				if ((i < argc) && fname) {
-					type = r_type_func_args_type (TDB, fname, i);
-					vname = r_type_func_args_name (TDB, fname, i);
-				}
-				if (!vname) {
-					name = r_str_newf ("arg%d", i + 1);
-					vname = name;
-				}
-				var = r_anal_function_set_var (fcn, delta, R_ANAL_VAR_KIND_REG, type, size, true, vname);
-				if (var && var->argnum < 0) {
-					var->argnum = *count;
-				}
-				free (name);
-				free (type);
-				(*count)++;
-			} else {
-				if (is_reg_in_src (regname, anal, op) || (opdreg && r_anal_cc_location_uses (anal, regname, opdreg))) {
-					reg_set[i] = 2;
-				}
-				continue;
+			var = r_anal_function_set_var (fcn, delta, R_ANAL_VAR_KIND_REG,
+				type? type: deftype, size, true, vname);
+			if (var && var->argnum < 0) {
+				var->argnum = *count;
 			}
+			free (name);
+			free (type);
+			(*count)++;
+		} else {
 			if (is_reg_in_src (regname, anal, op) || (opdreg && r_anal_cc_location_uses (anal, regname, opdreg))) {
-				reg_set[i] = 1;
+				reg_set[slot] = 2;
 			}
-			if (var) {
-				r_anal_var_set_access (anal, var, var->regname, op->addr, R_PERM_R, 0);
-				r_meta_set_string (anal, R_META_TYPE_VARTYPE, op->addr, var->name);
-				is_arg = r_anal_var_is_default_argname (var->name);
-			}
-			if (is_arg) {
-				const char *hintreg = reguse_regname_for_loc (anal, op, regname, opdreg);
-				r_strf_var (usage, 32, "arg%d", i);
-				reguse_append_hint (anal, op->addr, hintreg, usage);
-			}
+			continue;
+		}
+		if (is_reg_in_src (regname, anal, op) || (opdreg && r_anal_cc_location_uses (anal, regname, opdreg))) {
+			reg_set[slot] = 1;
+		}
+		if (var) {
+			r_anal_var_set_access (anal, var, var->regname, op->addr, R_PERM_R, 0);
+			r_meta_set_string (anal, R_META_TYPE_VARTYPE, op->addr, var->name);
+			is_arg = r_anal_var_is_default_argname (var->name);
+		}
+		if (is_arg) {
+			const char *hintreg = reguse_regname_for_loc (anal, op, regname, opdreg);
+			r_strf_var (usage, 32, "arg%d", fp? R_ANAL_CC_MAXARG + n: n);
+			reguse_append_hint (anal, op->addr, hintreg, usage);
 		}
 	}
 
@@ -2038,77 +2068,6 @@ R_API void r_anal_extract_vars(RAnal *anal, RAnalFunction *fcn, RAnalOp *op) {
 	}
 }
 
-static void anal_var_ptr_append_kind(RVecAnalVarPtr *dst, RAnalFunction *fcn, int kind) {
-	RAnalVar **it;
-	R_VEC_FOREACH (&fcn->vars, it) {
-		RAnalVar *var = *it;
-		if (var->kind == kind) {
-			RVecAnalVarPtr_push_back (dst, &var);
-		}
-	}
-}
-
-R_API RVecAnalVarPtr *r_anal_function_vars(RAnal *anal, RAnalFunction *fcn) {
-	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
-	RVecAnalVarPtr *vec = RVecAnalVarPtr_new ();
-	RVecAnalVarPtr_reserve (vec, RVecAnalVarPtr_length (&fcn->vars));
-	anal_var_ptr_append_kind (vec, fcn, R_ANAL_VAR_KIND_REG);
-	anal_var_ptr_append_kind (vec, fcn, R_ANAL_VAR_KIND_BPV);
-	anal_var_ptr_append_kind (vec, fcn, R_ANAL_VAR_KIND_SPV);
-	return vec;
-}
-
-R_API RVecAnalVarPtr *r_anal_var_vec(RAnal *a, RAnalFunction *fcn, int kind) {
-	R_RETURN_VAL_IF_FAIL (a && fcn, NULL);
-	if (kind < 1) {
-		kind = R_ANAL_VAR_KIND_BPV; // by default show vars
-	}
-	RVecAnalVarPtr *vec = RVecAnalVarPtr_new ();
-	RVecAnalVarPtr_reserve (vec, RVecAnalVarPtr_length (&fcn->vars));
-	anal_var_ptr_append_kind (vec, fcn, kind);
-	return vec;
-}
-
-static void var_field_free(RAnalVarField *field) {
-	if (field) {
-		free (field->name);
-		free (field);
-	}
-}
-
-R_API RList *r_anal_function_get_var_fields(RAnalFunction *fcn, int kind) {
-	R_RETURN_VAL_IF_FAIL (fcn, NULL);
-	RList *list = r_list_newf ((RListFree)var_field_free);
-	if (kind < 1) {
-		kind = R_ANAL_VAR_KIND_BPV; // by default show vars
-	}
-	R_CRITICAL_ENTER (fcn->anal);
-	RAnalVar **it;
-	R_VEC_FOREACH (&fcn->vars, it) {
-		RAnalVar *var = *it;
-		if (!var) {
-			break;
-		}
-		if (var->kind != kind) {
-			continue;
-		}
-		if (var_add_structure_fields_to_list (fcn->anal, var, list)) {
-			// this var is a struct and var_add_structure_fields_to_list added all the fields
-			continue;
-		}
-		RAnalVarField *field = R_NEW0 (RAnalVarField);
-		field->name = strdup (var->name);
-		if (!field->name) {
-			var_field_free (field);
-			break;
-		}
-		field->delta = var->delta;
-		r_list_push (list, field);
-	}
-	R_CRITICAL_LEAVE (fcn->anal);
-	return list;
-}
-
 static int var_comparator(const RAnalVar *a, const RAnalVar *b) {
 	if (a && b) {
 		if (a->isarg && !b->isarg) {
@@ -2165,6 +2124,124 @@ static int var_ptr_comparator(RAnalVar * const *a, RAnalVar * const *b) {
 	return var_comparator (a? *a: NULL, b? *b: NULL);
 }
 
+R_IPI bool r_anal_var_is_default_argname(const char *name) {
+	if (!name || !r_str_startswith (name, "arg") || !name[3]) {
+		return false;
+	}
+	const char *ptr = name + 3;
+	for (; *ptr; ptr++) {
+		if (!isdigit ((ut8)*ptr)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void assign_reg_argnums(RAnal *anal, RAnalFunction *fcn, RVecAnalVarPtr *rvars) {
+	RAnalVar **it;
+	R_VEC_FOREACH (rvars, it) {
+		RAnalVar *var = *it;
+		if (!var->isarg) {
+			var->argnum = -1;
+			continue;
+		}
+		const char *regname = var->regname;
+		RRegItem *ri = NULL;
+		if (!regname) {
+			ri = r_reg_index_get (anal->reg, var->delta);
+			regname = ri? ri->name: NULL;
+		}
+		var->argnum = cc_reg_index (anal, fcn->callconv, regname);
+		r_unref (ri);
+	}
+	RVecAnalVarPtr_sort (rvars, var_ptr_comparator);
+	int dense = 0;
+	R_VEC_FOREACH (rvars, it) {
+		RAnalVar *var = *it;
+		if (var->argnum < 0) {
+			continue;
+		}
+		var->argnum = dense++;
+		if (r_anal_var_is_default_argname (var->name)) {
+			char *newname = r_str_newf ("arg%d", var->argnum + 1);
+			r_anal_var_rename (anal, var, newname);
+			free (newname);
+		}
+	}
+}
+
+static void anal_var_ptr_append_kind(RVecAnalVarPtr *dst, RAnalFunction *fcn, int kind) {
+	RAnalVar **it;
+	R_VEC_FOREACH (&fcn->vars, it) {
+		RAnalVar *var = *it;
+		if (var->kind == kind) {
+			RVecAnalVarPtr_push_back (dst, &var);
+		}
+	}
+}
+
+R_API RVecAnalVarPtr *r_anal_function_vars(RAnal *anal, RAnalFunction *fcn) {
+	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
+	RVecAnalVarPtr *vec = RVecAnalVarPtr_new ();
+	RVecAnalVarPtr_reserve (vec, RVecAnalVarPtr_length (&fcn->vars));
+	anal_var_ptr_append_kind (vec, fcn, R_ANAL_VAR_KIND_REG);
+	assign_reg_argnums (anal, fcn, vec);
+	anal_var_ptr_append_kind (vec, fcn, R_ANAL_VAR_KIND_BPV);
+	anal_var_ptr_append_kind (vec, fcn, R_ANAL_VAR_KIND_SPV);
+	return vec;
+}
+
+R_API RVecAnalVarPtr *r_anal_var_vec(RAnal *a, RAnalFunction *fcn, int kind) {
+	R_RETURN_VAL_IF_FAIL (a && fcn, NULL);
+	if (kind < 1) {
+		kind = R_ANAL_VAR_KIND_BPV; // by default show vars
+	}
+	RVecAnalVarPtr *vec = RVecAnalVarPtr_new ();
+	RVecAnalVarPtr_reserve (vec, RVecAnalVarPtr_length (&fcn->vars));
+	anal_var_ptr_append_kind (vec, fcn, kind);
+	return vec;
+}
+
+static void var_field_free(RAnalVarField *field) {
+	if (field) {
+		free (field->name);
+		free (field);
+	}
+}
+
+R_API RList *r_anal_function_get_var_fields(RAnalFunction *fcn, int kind) {
+	R_RETURN_VAL_IF_FAIL (fcn, NULL);
+	RList *list = r_list_newf ((RListFree)var_field_free);
+	if (kind < 1) {
+		kind = R_ANAL_VAR_KIND_BPV; // by default show vars
+	}
+	R_CRITICAL_ENTER (fcn->anal);
+	RAnalVar **it;
+	R_VEC_FOREACH (&fcn->vars, it) {
+		RAnalVar *var = *it;
+		if (!var) {
+			break;
+		}
+		if (var->kind != kind) {
+			continue;
+		}
+		if (var_add_structure_fields_to_list (fcn->anal, var, list)) {
+			// this var is a struct and var_add_structure_fields_to_list added all the fields
+			continue;
+		}
+		RAnalVarField *field = R_NEW0 (RAnalVarField);
+		field->name = strdup (var->name);
+		if (!field->name) {
+			var_field_free (field);
+			break;
+		}
+		field->delta = var->delta;
+		r_list_push (list, field);
+	}
+	R_CRITICAL_LEAVE (fcn->anal);
+	return list;
+}
+
 R_API void r_anal_var_list_show(RAnal *anal, RAnalFunction *fcn, int kind, int mode, PJ *pj) {
 	R_RETURN_IF_FAIL (anal && fcn);
 	if (!pj && mode == 'j') {
@@ -2183,6 +2260,9 @@ R_API void r_anal_var_list_show(RAnal *anal, RAnalFunction *fcn, int kind, int m
 	//s- at the end of the loop
 	if (mode == '*' && !RVecAnalVarPtr_empty (vec)) {
 		anal->cb_printf ("s 0x%" PFMT64x "\n", fcn->addr);
+	}
+	if (kind == R_ANAL_VAR_KIND_REG) {
+		assign_reg_argnums (anal, fcn, vec);
 	}
 	RVecAnalVarPtr_sort (vec, var_ptr_comparator);
 	RAnalVar **it;
@@ -2320,52 +2400,6 @@ R_API void r_anal_var_list_show(RAnal *anal, RAnalFunction *fcn, int kind, int m
 		pj_end (pj);
 	}
 	RVecAnalVarPtr_free (vec);
-}
-
-R_IPI bool r_anal_var_is_default_argname(const char *name) {
-	if (!name || !r_str_startswith (name, "arg") || !name[3]) {
-		return false;
-	}
-	const char *ptr = name + 3;
-	for (; *ptr; ptr++) {
-		if (!isdigit ((ut8)*ptr)) {
-			return false;
-		}
-	}
-	return true;
-}
-
-static void assign_reg_argnums(RAnal *anal, RAnalFunction *fcn, RVecAnalVarPtr *rvars) {
-	RAnalVar **it;
-	R_VEC_FOREACH (rvars, it) {
-		RAnalVar *var = *it;
-		if (!var->isarg) {
-			var->argnum = -1;
-			continue;
-		}
-		const char *regname = var->regname;
-		RRegItem *ri = NULL;
-		if (!regname) {
-			ri = r_reg_index_get (anal->reg, var->delta);
-			regname = ri? ri->name: NULL;
-		}
-		var->argnum = cc_reg_index (anal, fcn->callconv, regname);
-		r_unref (ri);
-	}
-	RVecAnalVarPtr_sort (rvars, var_ptr_comparator);
-	int dense = 0;
-	R_VEC_FOREACH (rvars, it) {
-		RAnalVar *var = *it;
-		if (var->argnum < 0) {
-			continue;
-		}
-		var->argnum = dense++;
-		if (r_anal_var_is_default_argname (var->name)) {
-			char *newname = r_str_newf ("arg%d", var->argnum + 1);
-			r_anal_var_rename (anal, var, newname);
-			free (newname);
-		}
-	}
 }
 
 R_API void r_anal_function_vars_cache_init(RAnal *anal, RAnalFcnVarsCache *cache, RAnalFunction *fcn) {

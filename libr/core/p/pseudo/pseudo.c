@@ -8,6 +8,13 @@
 R_VEC_TYPE (RVecPdcTrycatch, RBinTrycatch *);
 
 typedef struct {
+	ut64 addr;
+	bool enter; // the block gets a cache layer of its own
+	bool leave; // pops it once the subtree below is emulated
+} PdcEmuStep;
+R_VEC_TYPE (RVecPdcEmuStep, PdcEmuStep);
+
+typedef struct {
 	RCore *core;
 	RStrBuf *out;
 	RStrBuf *codestr;
@@ -23,6 +30,7 @@ typedef struct {
 	ut64 bb_jump; // edges of the block being rendered, owned by its region in structured mode
 	ut64 bb_fail;
 	HtUP *conds; // block addr => recovered condition, recovered once per block
+	HtUP *bbtext; // block addr => raw disasm text, emulated in CFG order
 	const char *r0;
 	ut64 last_addr; // anchor of the last printed line
 	char *transfer; // pending transfer the current block's own jump renders
@@ -947,16 +955,34 @@ static bool bb_ends_with_terminator(RCore *core, RAnalBlock *bb) {
 		|| t == R_ANAL_OP_TYPE_RET || t == R_ANAL_OP_TYPE_CRET;
 }
 
-static char *fetch_bb_pseudo(PDCState *state, RAnalBlock *bb) {
-	RCons *cons = r_core_get_cons (state->core);
+static void kvfree(HtUPKv *kv) {
+	free (kv->value);
+}
+
+// pD would shrink the blocksize to bb->size, which clips string arguments
+static char *render_bb_raw(RCore *core, RAnalBlock *bb, ut8 *buf) {
+	RCons *cons = r_core_get_cons (core);
+	const ut64 oaddr = core->addr;
+	const bool html = r_config_get_b (core->config, "scr.html");
+	r_config_set_b (core->config, "scr.html", false);
+	r_core_seek (core, bb->addr, true);
 	r_cons_push (cons);
-	bool html = r_config_get_b (state->core->config, "scr.html");
-	r_config_set_b (state->core->config, "scr.html", false);
-	char *code = r_core_cmd_strf (state->core, "pD %" PFMT64d " @ 0x%08" PFMT64x, bb->size, bb->addr);
+	r_core_print_disasm (core, bb->addr, buf, bb->size, bb->size, 0, NULL, true, false, NULL, NULL);
+	char *code = strdup (r_str_get (r_cons_get_buffer (cons, NULL)));
 	r_cons_pop (cons);
-	r_config_set_b (state->core->config, "scr.html", html);
-	if (R_STR_ISEMPTY (code)) {
-		free (code);
+	r_core_seek (core, oaddr, true);
+	r_config_set_b (core->config, "scr.html", html);
+	return code;
+}
+
+static const char *cached_bb_raw(PDCState *state, RAnalBlock *bb) {
+	return ht_up_find (state->bbtext, bb->addr, NULL);
+}
+
+static char *fetch_bb_pseudo(PDCState *state, RAnalBlock *bb) {
+	const char *raw = cached_bb_raw (state, bb);
+	char *code = R_STR_ISEMPTY (raw)? NULL: strdup (raw);
+	if (!code) {
 		return NULL;
 	}
 	code = r_str_replace (code, "\n\n", "\n", true);
@@ -970,6 +996,163 @@ static char *fetch_bb_pseudo(PDCState *state, RAnalBlock *bb) {
 	code[len - 1] = 0;
 	find_and_change (code, len);
 	return fold_resolved_refs (state->core, code);
+}
+
+// a block the walk still owes: unvisited and belonging to the function
+static RAnalBlock *pending_block(PDCState *state, RBitset *vis, ut64 addr) {
+	RAnalBlock *bb = r_anal_get_block_at (state->core->anal, addr);
+	if (!bb || r_bitset_test (vis, addr) || !r_list_contains (bb->fcns, state->fcn)) {
+		return NULL;
+	}
+	return bb;
+}
+
+static void emulate_block(PDCState *state, RAnalBlock *bb, HtUP *bytes, const ut8 *saved, int len) {
+	RReg *reg = state->core->anal->reg;
+	if (bb->parent_reg_arena) {
+		r_reg_arena_poke (reg, bb->parent_reg_arena, bb->parent_reg_arena_size);
+		R_FREE (bb->parent_reg_arena);
+	} else {
+		r_reg_arena_poke (reg, saved, len);
+	}
+	ut8 *buf = ht_up_find (bytes, bb->addr, NULL);
+	char *raw = buf? render_bb_raw (state->core, bb, buf): NULL;
+	if (raw) {
+		ht_up_insert (state->bbtext, bb->addr, raw);
+	}
+}
+
+static void push_step(RVecPdcEmuStep *steps, ut64 addr, bool enter, bool leave) {
+	PdcEmuStep step = { addr, enter, leave };
+	RVecPdcEmuStep_push_back (steps, &step);
+}
+
+// the target starts from the registers its predecessor just left behind
+static void push_successor(PDCState *state, RVecPdcEmuStep *steps, RBitset *vis, ut64 addr, bool enter) {
+	RAnal *anal = state->core->anal;
+	RAnalBlock *bb = pending_block (state, vis, addr);
+	if (!bb) {
+		return;
+	}
+	if (anal->last_disasm_reg && !bb->parent_reg_arena) {
+		bb->parent_reg_arena = r_reg_arena_dup (anal->reg, anal->last_disasm_reg);
+		bb->parent_reg_arena_size = anal->last_disasm_reg_size;
+	}
+	push_step (steps, addr, enter, false);
+}
+
+// pushed in reverse so the walk pops jump, fail, cases, default in order
+static void push_successors(PDCState *state, RVecPdcEmuStep *steps, RBitset *vis, RAnalBlock *bb) {
+	RAnalSwitchOp *sop = bb->switch_op;
+	// only the arms of a fork need keeping apart; a chain shares one layer
+	const bool fork = sop || (bb->fail != UT64_MAX && bb->jump != UT64_MAX && bb->jump != bb->fail);
+	if (sop) {
+		push_successor (state, steps, vis, sop->def_val, fork);
+		RListIter *iter;
+		RAnalCaseOp *co;
+		r_list_foreach_prev (sop->cases, iter, co) {
+			push_successor (state, steps, vis, co->jump, fork);
+		}
+	}
+	push_successor (state, steps, vis, bb->fail, fork);
+	push_successor (state, steps, vis, bb->jump, fork);
+}
+
+// each arm of a fork stores into a cache layer its siblings never see
+static void emulate_dfs(PDCState *state, RBitset *vis, HtUP *bytes, const ut8 *saved, int len) {
+	RIO *io = state->core->io;
+	RVecPdcEmuStep steps;
+	RVecPdcEmuStep_init (&steps);
+	push_step (&steps, state->fcn->addr, false, false);
+	PdcEmuStep *top;
+	while ((top = RVecPdcEmuStep_last (&steps))) {
+		const PdcEmuStep step = *top;
+		RVecPdcEmuStep_pop_back (&steps);
+		if (step.leave) {
+			r_io_cache_pop (io);
+			continue;
+		}
+		RAnalBlock *bb = pending_block (state, vis, step.addr);
+		if (!bb) {
+			continue;
+		}
+		r_bitset_set (vis, step.addr);
+		if (step.enter) {
+			r_io_cache_push (io);
+			push_step (&steps, step.addr, false, true);
+		}
+		emulate_block (state, bb, bytes, saved, len);
+		push_successors (state, &steps, vis, bb);
+	}
+	RVecPdcEmuStep_fini (&steps);
+}
+
+// emulate once in CFG order so the text does not depend on render order
+static void pdc_emulate_blocks(PDCState *state) {
+	RCore *core = state->core;
+	RReg *reg = core->anal->reg;
+	int len = 0;
+	ut8 *saved = r_reg_arena_peek (reg, &len);
+	RBitset *vis = r_bitset_new ();
+	HtUP *bytes = ht_up_new (NULL, kvfree, NULL);
+	RListIter *iter;
+	RAnalBlock *bb;
+	r_list_foreach (state->fcn->bbs, iter, bb) {
+		// a seed left behind by another command would outrank the walk
+		R_FREE (bb->parent_reg_arena);
+		// stores may hit code; disassemble the bytes as they were
+		ut8 *buf = malloc (bb->size);
+		if (buf) {
+			r_io_read_at (core->io, bb->addr, buf, bb->size);
+			ht_up_insert (bytes, bb->addr, buf);
+		}
+	}
+	emulate_dfs (state, vis, bytes, saved, len);
+	r_list_foreach (state->fcn->bbs, iter, bb) {
+		if (!r_bitset_test (vis, bb->addr)) {
+			r_bitset_set (vis, bb->addr);
+			emulate_block (state, bb, bytes, saved, len);
+		}
+		R_FREE (bb->parent_reg_arena);
+	}
+	ht_up_free (bytes);
+	r_bitset_free (vis);
+	r_reg_arena_poke (reg, saved, len);
+	free (saved);
+}
+
+// the raw render leads each line with the address column pdc strips
+static const char *line_after_addr(const char *line, ut64 * R_NULLABLE addr) {
+	if (*line != '0') {
+		return line;
+	}
+	if (addr) {
+		ut64 at = r_num_get (NULL, line);
+		if (at && at != UT64_MAX) {
+			*addr = at;
+		}
+	}
+	const char *s = strchr (line, ' ');
+	return s? r_str_trim_head_ro (s + 1): "";
+}
+
+static char *orphan_text(PDCState *state, RAnalBlock *bb) {
+	const char *raw = r_str_get (cached_bb_raw (state, bb));
+	if (state->show_addr || !*raw) {
+		return strdup (raw);
+	}
+	RStrBuf *sb = r_strbuf_new ("");
+	RList *lines = r_str_split_duplist (raw, "\n", false);
+	RListIter *iter;
+	const char *line;
+	r_list_foreach (lines, iter, line) {
+		r_strbuf_append (sb, line_after_addr (line, NULL));
+		if (iter->n) {
+			r_strbuf_append (sb, "\n");
+		}
+	}
+	r_list_free (lines);
+	return r_strbuf_drain (sb);
 }
 
 static bool is_known_loop_header(PDCState *state, ut64 addr) {
@@ -1069,14 +1252,7 @@ static void emit_code_lines(PDCState *state, char *code, ut64 start_addr, int in
 	ut64 jump_at = UT64_MAX;
 	ut64 mark_at = start_addr;
 	r_list_foreach (lines, iter, line) {
-		if (*line == '0') {
-			ut64 at = r_num_get (NULL, line);
-			if (at && at != UT64_MAX) {
-				addr = at;
-			}
-			const char *s = strchr (line, ' ');
-			line = s? r_str_trim_head_ro (s + 1): "";
-		}
+		line = line_after_addr (line, &addr);
 		if (addr != mark_at) {
 			emit_trycatch_marks (state, addr, indent);
 			mark_at = addr;
@@ -1415,10 +1591,6 @@ static char *extract_loop_cond(PDCState *state, RAnalBlock *test_bb, ut64 back_t
 	}
 	free (vexpr);
 	return result;
-}
-
-static void cond_kvfree(HtUPKv *kv) {
-	free (kv->value);
 }
 
 // recovery costs a pi command and a parse, and every caller wants the same one
@@ -2170,7 +2342,7 @@ static bool pdc_structured_body(PDCState *state, int indent) {
 		return false;
 	}
 	PdcRegion *root = plan->root;
-	state->conds = ht_up_new (NULL, cond_kvfree, NULL);
+	state->conds = ht_up_new (NULL, kvfree, NULL);
 	const bool reducible = plan->complete && regions_have_blocks (state, root);
 	if (reducible) {
 		// scoped to this walk: the later orphan switch pass renders blocks no region owns
@@ -2267,6 +2439,7 @@ R_IPI bool pdc_decompile(RCore *core, const char *input) {
 	r_config_hold (hc, "asm.functions", "asm.section", "asm.cmt.col", "asm.sub.names", NULL);
 	r_config_hold (hc, "scr.color", "emu.str", "asm.emu", "emu.write", NULL);
 	r_config_hold (hc, "io.cache", "asm.syntax", "asm.addr.relto", "asm.addr.base", NULL);
+	r_config_hold (hc, "emu.pre", "emu.bb", NULL);
 	r_config_set_i (core->config, "scr.color", 0);
 	r_config_set_b (core->config, "asm.stackptr", false);
 	r_config_set_b (core->config, "asm.pseudo", true);
@@ -2279,6 +2452,8 @@ R_IPI bool pdc_decompile(RCore *core, const char *input) {
 	r_config_set_b (core->config, "asm.emu", true);
 	r_config_set_b (core->config, "emu.str", true);
 	r_config_set_b (core->config, "emu.write", true);
+	r_config_set_b (core->config, "emu.pre", false);
+	r_config_set_b (core->config, "emu.bb", false);
 	r_config_set_b (core->config, "asm.lines.fcn", false);
 	r_config_set_b (core->config, "asm.comments", true);
 	r_config_set_b (core->config, "asm.functions", false);
@@ -2289,7 +2464,10 @@ R_IPI bool pdc_decompile(RCore *core, const char *input) {
 	r_config_set (core->config, "asm.syntax", "intel");
 	r_config_set (core->config, "asm.addr.relto", "");
 	r_config_set_i (core->config, "asm.addr.base", 16);
+	state.bbtext = ht_up_new (NULL, kvfree, NULL);
+	r_io_cache_push (core->io);
 	r_core_cmd0 (core, "aeim");
+	pdc_emulate_blocks (&state);
 
 	r_strf_buffer (64);
 	RAnalBlock *bb = r_list_first (state.fcn->bbs);
@@ -2592,7 +2770,6 @@ R_IPI bool pdc_decompile(RCore *core, const char *input) {
 		}
 	}
 	RListIter *iter;
-	bool use_html = r_config_get_b (core->config, "scr.html");
 	// hoist unconsumed switch dispatchers before orphan labels
 	r_list_foreach (state.fcn->bbs, iter, bb) {
 		if (!bb->switch_op) {
@@ -2623,13 +2800,7 @@ R_IPI bool pdc_decompile(RCore *core, const char *input) {
 			RAnalBlock *nbb = (RAnalBlock *) (nit->data);
 			nextbbaddr = nbb->addr;
 		}
-		if (use_html) {
-			r_config_set_b (core->config, "scr.html", false);
-		}
-		char *s = r_core_cmd_strf (state.core, "pdb@0x%08" PFMT64x "@e:asm.addr=%d", bb->addr, state.show_addr);
-		if (use_html) {
-			r_config_set_b (core->config, "scr.html", true);
-		}
+		char *s = orphan_text (&state, bb);
 		s = comments_to_c (s);
 		s = r_str_replace (s, "goto ", "// goto loc_", true);
 		s = cleancomments (s);
@@ -2726,6 +2897,8 @@ R_IPI bool pdc_decompile(RCore *core, const char *input) {
 	indent = 0;
 	print_line (&state, state.last_addr, indent, "}");
 	PRINTF ("\n");
+	r_io_cache_pop (core->io);
+	ht_up_free (state.bbtext);
 	r_config_hold_restore (hc);
 	r_config_hold_free (hc);
 	if (state.pj) {

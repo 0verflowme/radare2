@@ -425,6 +425,72 @@ EXPECT=<<EOF
 EOF
 RUN
 
+NAME=float compare is exact, not approximate
+FILE=-
+CMDS=<<EOF
+ae 1,I2D,1,I2D,F==
+ae 2,I2D,1,I2D,F==
+ae 0x3ff0000000000001,0x3ff0000000000000,F==
+ae 0x0000000000000001,0x0000000000000000,F==
+EOF
+EXPECT=<<EOF
+0x1
+0
+0
+0
+EOF
+RUN
+
+NAME=float compare of infinities and nan
+FILE=-
+CMDS=<<EOF
+ae 0x7ff0000000000000,0x7ff0000000000000,F==
+ae 0xfff0000000000000,0x7ff0000000000000,F==
+ae 0x7ff8000000000000,0x7ff8000000000000,F==
+ae 0x8000000000000000,0x0000000000000000,F==
+EOF
+EXPECT=<<EOF
+0x1
+0
+0
+0x1
+EOF
+RUN
+
+NAME=float not equal is exact too
+FILE=-
+CMDS=<<EOF
+ae 1,I2D,1,I2D,F!=
+ae 2,I2D,1,I2D,F!=
+ae 0x0000000000000001,0x0000000000000000,F!=
+EOF
+EXPECT=<<EOF
+0
+0x1
+0x1
+EOF
+RUN
+
+NAME=float not equal for nan and infinities
+FILE=-
+CMDS=<<EOF
+ae 0x7ff8000000000000,0x3ff0000000000000,F!=
+ae 0x3ff0000000000000,0x7ff8000000000000,F!=
+ae 0x7ff8000000000000,0x7ff8000000000000,F!=
+ae 0x7ff8000000000000,0x3ff0000000000000,F==,!
+ae 0x7ff0000000000000,0x7ff0000000000000,F!=
+ae 0xfff0000000000000,0x7ff0000000000000,F!=
+EOF
+EXPECT=<<EOF
+0x1
+0x1
+0x1
+0x1
+0
+0x1
+EOF
+RUN
+
 NAME=inc/dec
 FILE=-
 CMDS=<<EOF
@@ -677,5 +743,43 @@ CMDS=<<EOF
 EOF
 EXPECT=<<EOF
 1,1,1
+EOF
+RUN
+
+NAME=esil ring wraps after popped words
+FILE=-
+ARGS=-e esil.stack.depth=3
+CMDS=<<EOF
+aei
+'ae 0x1122334455667788,POP,0x1122334455667788,POP,0x1122334455667788,POP,0x1122334455667788,POP,0x1122334455667788,POP,0x1122334455667788,POP,7
+EOF
+EXPECT=<<EOF
+7
+EOF
+RUN
+
+NAME=esil loop runs to the goto limit through ring wraps
+FILE=-
+ARGS=-a x86 -b 64 -e esil.stack.depth=3 -e esil.gotolimit=4096
+CMDS=<<EOF
+aei
+ae 5,rax,=,0,rbx,=
+ae 1,rax,-,rax,=,1,rbx,+,rbx,=,rax,?{,0,GOTO,}
+ar rbx
+EOF
+EXPECT=<<EOF
+0x00000005
+EOF
+RUN
+
+NAME=esil ring wraps under a value that stays live
+FILE=-
+ARGS=-e esil.stack.depth=3
+CMDS=<<EOF
+aei
+'ae 3,2,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+,DUP,+
+EOF
+EXPECT=<<EOF
+0x50000000000
 EOF
 RUN

@@ -1691,7 +1691,7 @@ static bool function_image_data_symbols_collect(RAnal *anal,
 static bool function_image_snapshot_collect(RAnal *anal, const RAnalFunction *fcn, const RAnalFunctionSnapshotLimits *limits, RAnalFunctionImageSnapshot *image, const char **reason) {
 	const char *refusal = "the function image is not coherent";
 	R_RETURN_VAL_IF_FAIL (anal && fcn && limits && image, false);
-	if (fcn->anal != anal || !anal->iob.nread_at || !fcn->bbs) {
+	if (fcn->anal != anal || !anal->iob.read_at || !fcn->bbs) {
 		IMAGE_REFUSE ("the function does not belong to this analysis or has no blocks");
 	}
 	const int listed_blocks = r_list_length (fcn->bbs);
@@ -1755,7 +1755,7 @@ static bool function_image_snapshot_collect(RAnal *anal, const RAnalFunction *fc
 			IMAGE_REFUSE ("out of memory allocating block bytes");
 		}
 		const int block_size = (int)block->size;
-		if (anal->iob.nread_at (anal->iob.io, block->addr, block->bytes, block_size) != block_size) {
+		if (anal->iob.read_at (anal->iob.io, block->addr, block->bytes, block_size) != block_size) {
 			IMAGE_REFUSE ("the block bytes could not be read from io");
 		}
 		if (!snapshot_block_sequential_jump_normalize (anal, block)) {

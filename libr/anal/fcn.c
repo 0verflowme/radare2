@@ -2863,16 +2863,96 @@ static int function_arg_var_cmp(const RAnalVar *a, const RAnalVar *b) {
 	return 0;
 }
 
-static int arg_var_ptr_cmp(RAnalVar * const *a, RAnalVar * const *b) {
-	return function_arg_var_cmp (a? *a: NULL, b? *b: NULL);
+// Where the calling convention would place this register argument, without
+// writing the answer back. r_anal_function_vars assigns argnum as it builds its
+// vector, and renames any variable still holding a default name, so a signature
+// read cannot go through it.
+static int function_arg_cc_index(RAnal *anal, RAnalFunction *fcn, const RAnalVar *var) {
+	if (!var || !var->isarg || var->kind != R_ANAL_VAR_KIND_REG
+			|| R_STR_ISEMPTY (fcn->callconv)) {
+		return -1;
+	}
+	RRegItem *reg = var->regname
+		? r_reg_get (anal->reg, var->regname, -1)
+		: r_reg_index_get (anal->reg, var->delta);
+	if (!reg) {
+		return -1;
+	}
+	int found = -1;
+	const int maximum = r_anal_cc_max_arg (anal, fcn->callconv);
+	int index;
+	for (index = 0; index < maximum && found < 0; index++) {
+		const char *location = r_anal_cc_argloc (anal, fcn->callconv, index, 0, 0);
+		if (location && r_anal_cc_location_uses (anal, location, reg->name)) {
+			found = index;
+		}
+	}
+	r_unref (reg);
+	return found;
+}
+
+typedef struct {
+	RAnalVar *var;
+	int order;
+} FunctionArgOrder;
+
+static int function_arg_order_cmp(const void *a, const void *b) {
+	const FunctionArgOrder *x = a;
+	const FunctionArgOrder *y = b;
+	if (x->order != y->order) {
+		return x->order < y->order? -1: 1;
+	}
+	return function_arg_var_cmp (x->var, y->var);
 }
 
 static bool function_signature_fallback_to_vars(RAnal *anal, RAnalFunction *fcn, RAnalFunctionSignature *signature) {
 	bool ok = true;
 
 	R_RETURN_VAL_IF_FAIL (anal && fcn && signature && signature->params, false);
-	RVecAnalVarPtr *vars = r_anal_function_vars (anal, fcn);
-	RVecAnalVarPtr_sort (vars, arg_var_ptr_cmp);
+	RVecAnalVarPtr *vars = RVecAnalVarPtr_new ();
+	if (!vars) {
+		return false;
+	}
+	RVecAnalVarPtr *kinds[] = {
+		r_anal_var_vec (anal, fcn, R_ANAL_VAR_KIND_REG),
+		r_anal_var_vec (anal, fcn, R_ANAL_VAR_KIND_BPV),
+		r_anal_var_vec (anal, fcn, R_ANAL_VAR_KIND_SPV),
+	};
+	size_t k;
+	for (k = 0; k < R_ARRAY_SIZE (kinds); k++) {
+		if (kinds[k]) {
+			RAnalVar **entry;
+			R_VEC_FOREACH (kinds[k], entry) {
+				RVecAnalVarPtr_push_back (vars, entry);
+			}
+			RVecAnalVarPtr_free (kinds[k]);
+		}
+	}
+	const size_t count = RVecAnalVarPtr_length (vars);
+	FunctionArgOrder *order = count? R_NEWS0 (FunctionArgOrder, count): NULL;
+	if (count && !order) {
+		RVecAnalVarPtr_free (vars);
+		return false;
+	}
+	size_t i = 0;
+	RAnalVar **entry;
+	R_VEC_FOREACH (vars, entry) {
+		const int cc_index = function_arg_cc_index (anal, fcn, *entry);
+		order[i].var = *entry;
+		// A register argument sorts by its convention slot; everything else
+		// keeps the ordering the comparator already gave it.
+		order[i].order = cc_index < 0? INT_MAX: cc_index;
+		i++;
+	}
+	if (order) {
+		qsort (order, count, sizeof (*order), function_arg_order_cmp);
+		RVecAnalVarPtr_fini (vars);
+		RVecAnalVarPtr_init (vars);
+		for (i = 0; i < count; i++) {
+			RVecAnalVarPtr_push_back (vars, &order[i].var);
+		}
+	}
+	free (order);
 	RAnalVar **it;
 	R_VEC_FOREACH (vars, it) {
 		RAnalVar *var = *it;

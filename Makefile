@@ -308,6 +308,7 @@ symstall-www: $(WWW_UI_INDEXES)
 install-pkgconfig pkgconfig-install:
 	@${INSTALL_DIR} "${DESTDIR}${LIBDIR}/pkgconfig"
 	for FILE in $(shell cd pkgcfg ; ls *.pc) ; do \
+		rm -f "${DESTDIR}${LIBDIR}/pkgconfig/$$FILE" ; \
 		cp -f "$(PWD)/pkgcfg/$$FILE" "${DESTDIR}${LIBDIR}/pkgconfig/$$FILE" ; done
 
 install-pkgconfig-symlink pkgconfig-symstall symstall-pkgconfig:

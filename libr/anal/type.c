@@ -277,14 +277,9 @@ static RAnalBaseType *get_enum_type(RAnal *anal, const char *sname) {
 	if (!base_type) {
 		return NULL;
 	}
-	// The width the declaration recorded, else the width C gives an enum. A
-	// loaded enum carried no width at all, so a consumer sizing a slot or a
-	// parameter by its type found none.
-	{
-		r_strf_buffer (KSZ);
-		const ut64 recorded = sdb_num_getf (anal->sdb_types, NULL, "type.%s.size", sname);
-		base_type->size = recorded? recorded: 32;
-	}
+	// the width the declaration recorded, else the width C gives an enum
+	const ut64 recorded = sdb_num_getf (anal->sdb_types, NULL, "type.%s.size", sname);
+	base_type->size = recorded? recorded: 32;
 
 	char *members = get_type_data (anal->sdb_types, "enum", sname);
 	if (!members) {
@@ -1132,9 +1127,7 @@ static void save_enum(const RAnal *anal, const RAnalBaseType *type) {
 	*/
 	char *sname = r_str_sanitize_sdb_key (type->name);
 	sdb_set (anal->sdb_types, sname, "enum", 0);
-	// An enum has the width its declaration gave it. DWARF records that width
-	// and the parser carries it here, and without saving it the only answer
-	// to "how wide is this enum" was the language default.
+	// an enum has the width its declaration gave it, and DWARF records that width
 	if (type->size) {
 		r_strf_buffer (KSZ);
 		char *bits = r_str_newf ("%" PFMT64u, (ut64)type->size);

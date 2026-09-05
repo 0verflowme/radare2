@@ -2028,9 +2028,20 @@ R_API void r_anal_function_resolve_var_overlaps(RAnal *anal, RAnalFunction *fcn)
 					continue;
 				}
 				// An argument is what the interface says it is, so it stays.
+				// A variable that carries a declared name -- from DWARF or the
+				// user -- outranks a placeholder recovery named by its offset:
+				// the placeholder is an access that landed inside a declared
+				// object, not a second object at those bytes.
+				const bool a_placeholder = r_str_startswith (a->name, VARPREFIX)
+					|| r_str_startswith (a->name, ARGPREFIX);
+				const bool b_placeholder = r_str_startswith (b->name, VARPREFIX)
+					|| r_str_startswith (b->name, ARGPREFIX);
 				RAnalVar *keep = a;
 				RAnalVar *drop = b;
-				if (b->isarg != a->isarg) {
+				if (a_placeholder != b_placeholder) {
+					keep = a_placeholder? b: a;
+					drop = a_placeholder? a: b;
+				} else if (b->isarg != a->isarg) {
 					keep = a->isarg? a: b;
 					drop = a->isarg? b: a;
 				} else if (RVecAnalVarAccess_length (&b->accesses)

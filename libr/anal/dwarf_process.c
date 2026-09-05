@@ -4208,6 +4208,14 @@ R_API void r_anal_dwarf_integrate_functions(RAnal *anal, RFlag *flags, Sdb *dwar
 			sdb_aforeach_next (var_name);
 		}
 		free (vars);
+		// A declared aggregate can cover bytes that recovery had already
+		// named as placeholders for the accesses it saw inside them. Now
+		// that the declarations are in, fold those placeholders into the
+		// objects they landed in; two variables on one byte cannot both be
+		// right, and a consumer refuses the layout that says so.
+		if (fcn) {
+			r_anal_function_resolve_var_overlaps (anal, fcn);
+		}
 	}
 	ls_free (sdb_list);
 beach:

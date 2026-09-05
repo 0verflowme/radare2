@@ -2698,8 +2698,19 @@ static bool dwarf_sdb_no_key_matches(void *user, const char *key, const char *va
 
 static bool dwarf_sdb_unset_like_checked(Sdb *sdb, const char *pattern) {
 	R_RETURN_VAL_IF_FAIL (sdb && pattern, false);
-	return sdb_unset_like (sdb, pattern)
-		&& sdb_foreach (sdb, dwarf_sdb_no_key_matches, (void *)pattern);
+	// sdb_unset_like returns how many keys it removed, and removing none is
+	// the ordinary result of a first import: there is nothing there yet. That
+	// count was being read as a truth value, so every DWARF function save
+	// reported failure, which cleared the whole-generation exactness flag and
+	// discarded every function type link in the binary. No function then had
+	// an address-linked signature, so consumers that ask for one fell back to
+	// recovering an interface from the instructions and lost every declared
+	// parameter and return type. What this has to establish is the
+	// postcondition -- no key matches the pattern afterwards -- which is
+	// exactly what the scan below checks, and it holds whether or not
+	// anything needed removing.
+	sdb_unset_like (sdb, pattern);
+	return sdb_foreach (sdb, dwarf_sdb_no_key_matches, (void *)pattern);
 }
 
 typedef struct dwarf_exact_function_link_t {

@@ -277,6 +277,14 @@ static RAnalBaseType *get_enum_type(RAnal *anal, const char *sname) {
 	if (!base_type) {
 		return NULL;
 	}
+	// The width the declaration recorded, else the width C gives an enum. A
+	// loaded enum carried no width at all, so a consumer sizing a slot or a
+	// parameter by its type found none.
+	{
+		r_strf_buffer (KSZ);
+		const ut64 recorded = sdb_num_getf (anal->sdb_types, NULL, "type.%s.size", sname);
+		base_type->size = recorded? recorded: 32;
+	}
 
 	char *members = get_type_data (anal->sdb_types, "enum", sname);
 	if (!members) {

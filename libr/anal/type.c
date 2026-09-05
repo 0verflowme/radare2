@@ -438,8 +438,14 @@ static RAnalBaseType *get_atomic_type(RAnal *anal, const char *sname) {
 R_API RAnalBaseType *r_anal_get_base_type(RAnal *anal, const char *name) {
 	R_RETURN_VAL_IF_FAIL (anal && name, NULL);
 
-	char *sname = r_str_sanitize_sdb_key (name);
+	// a base type is saved under its C spelling; composites and typedefs still under the sanitized one
+	char *sname = strdup (name);
 	const char *type = sdb_const_get (anal->sdb_types, sname, NULL);
+	if (!type) {
+		free (sname);
+		sname = r_str_sanitize_sdb_key (name);
+		type = sdb_const_get (anal->sdb_types, sname, NULL);
+	}
 	if (!type) {
 		free (sname);
 		return NULL;

@@ -276,9 +276,7 @@ install: install-doc install-man install-panels install-www install-pkgconfig
 	cp -f doc/hud "${DESTDIR}${DATADIR}/radare2/${VERSION}/hud/main"
 	mkdir -p "${DESTDIR}${DATADIR}/radare2/${VERSION}/"
 	$(SHELL) ./configure-plugins --rm-static $(DESTDIR)$(LIBDIR)/radare2/last/
-	# Removed first, the way clang-format-radare2 and r2-indent are a few lines
-	# up. `make symstall` points this name at the built binary in the source
-	# tree, so installing over it asks install(1) to copy a file onto itself.
+	# symstall leaves a symlink here; install(1) refuses to copy a file onto itself
 	rm -f "${DESTDIR}${BINDIR}/r2sdb${BUILD_EXT_EXE}"
 	${INSTALL_PROGRAM} "subprojects/sdb/sdb${BUILD_EXT_EXE}" "${DESTDIR}${BINDIR}/r2sdb${BUILD_EXT_EXE}"
 

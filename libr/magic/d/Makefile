@@ -6,10 +6,7 @@ all: $(F_SDB)
 
 install: ${F_SDB}
 	mkdir -p "$(MAGICDIR)"
-	# The readlink guard covers MAGICDIR itself being a symlink, not the files
-	# inside it. `make symstall` symlinks each file into this source tree, so
-	# after one the cp below copies a file onto itself, which BSD cp reports as
-	# an error and which then aborts the whole install.
+	# symstall leaves symlinks here; cp refuses to copy a file onto itself
 	for a in default/* ; do readlink "$(MAGICDIR)";  if [ $$? != 0 ]; then rm -f "${MAGICDIR}/$$(basename $$a)" ; cp -f $$a "${MAGICDIR}" ; fi ; done
 
 CWD=$(shell pwd)

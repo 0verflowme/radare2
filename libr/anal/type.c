@@ -1152,6 +1152,20 @@ static void save_enum(const RAnal *anal, const RAnalBaseType *type) {
 	free (sname);
 }
 
+/* The key under which a base type is saved is the spelling every other
+ * record refers to it by: a typedef stores its target verbatim, and so does
+ * every variable and member typed with it. Rewriting the spaces in that
+ * spelling, as the identifier sanitizer does, filed `long unsigned int`
+ * under a key nothing ever looked up, so each of its typedefs resolved to a
+ * type without a size. A base type name is a C spelling and can carry
+ * spaces; only what sdb itself cannot carry in a key is refused. */
+static char *atomic_type_key(const char *name) {
+	if (R_STR_ISEMPTY (name) || strpbrk (name, "=,\n")) {
+		return NULL;
+	}
+	return strdup (name);
+}
+
 static void save_atomic_type(const RAnal *anal, const RAnalBaseType *type) {
 	r_strf_buffer (KSZ);
 	R_RETURN_IF_FAIL (anal && type && type->name);
@@ -1163,7 +1177,10 @@ static void save_atomic_type(const RAnal *anal, const RAnalBaseType *type) {
 		type.char=c
 		type.char.size=8
 	*/
-	char *sname = r_str_sanitize_sdb_key (type->name);
+	char *sname = atomic_type_key (type->name);
+	if (!sname) {
+		return;
+	}
 	sdb_set (anal->sdb_types, sname, "type", 0);
 #if 0
 	sdb_num_set (anal->sdb_types, r_strf ("type.%s.size", sname), type->size, 0);

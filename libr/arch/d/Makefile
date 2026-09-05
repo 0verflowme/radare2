@@ -11,7 +11,12 @@ clean:
 
 install:
 	mkdir -p "${OPDIR}"
-	cp -f *.r2 "${OPDIR}"
+	# Remove the destination first. `make symstall` leaves each of these as a
+	# symlink into this very directory, so a later `make install` asks cp to
+	# copy a file onto itself; BSD cp calls that an error, install exits
+	# non-zero, and everything after it in the install -- including the
+	# libraries -- is silently skipped.
+	for f in *.r2 ; do rm -f "${OPDIR}/$$f" ; cp -f "$$f" "${OPDIR}" ; done
 
 # that sed is a workaround for mingw's pwd
 CWD=$(shell pwd)

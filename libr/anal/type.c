@@ -1124,6 +1124,14 @@ static void save_enum(const RAnal *anal, const RAnalBaseType *type) {
 	*/
 	char *sname = r_str_sanitize_sdb_key (type->name);
 	sdb_set (anal->sdb_types, sname, "enum", 0);
+	// An enum has the width its declaration gave it. DWARF records that width
+	// and the parser carries it here, and without saving it the only answer
+	// to "how wide is this enum" was the language default.
+	if (type->size) {
+		r_strf_buffer (KSZ);
+		char *bits = r_str_newf ("%" PFMT64u, (ut64)type->size);
+		sdb_set_owned (anal->sdb_types, r_strf ("type.%s.size", sname), bits, 0);
+	}
 
 	RStrBuf *arglist = r_strbuf_new ("");
 	int i = 0;

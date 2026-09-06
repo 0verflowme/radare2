@@ -265,6 +265,7 @@ long
 long long
 short
 size_t
+ssize_t
 uid_t
 uint16_t
 uint32_t
@@ -484,6 +485,7 @@ long
 long long
 short
 size_t
+ssize_t
 uid_t
 uint16_t
 uint32_t
@@ -519,6 +521,7 @@ long
 long long
 short
 size_t
+ssize_t
 uid_t
 uint16_t
 uint32_t
@@ -4047,5 +4050,32 @@ EOF
 EXPECT=<<EOF
             0x00000000      90             nop
             0x00000001      90             nop
+EOF
+RUN
+
+NAME=posix and glibc prototypes
+FILE=-
+CMDS=<<EOF
+e asm.arch=x86
+e asm.bits=64
+e asm.os=linux
+tf lseek~func.lseek.ret=
+tf stat~func.stat.arg.1
+tf fdopen~ret
+tf lseek64~ret
+tf errno_location~ret
+tf ctype_b_loc~ret
+tf fprintf_chk~func.fprintf_chk.arg.3
+tf longjmp_chk~noreturn
+EOF
+EXPECT=<<EOF
+func.lseek.ret=off_t
+func.stat.arg.1=void *,buf
+func.fdopen.ret=file*
+func.lseek64.ret=off64_t
+func.errno_location.ret=int *
+func.ctype_b_loc.ret=const unsigned short **
+func.fprintf_chk.arg.3=,...
+func.longjmp_chk.noreturn=true
 EOF
 RUN

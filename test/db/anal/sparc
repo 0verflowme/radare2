@@ -117,7 +117,7 @@ EXPECT=<<EOF
 |      :|   0x000a0de0      b0268011       sub i2, l1, i0
 |      :|   0x000a0de4      81cfe008       rett i7+8
 |      :|   0x000a0de8      01000000       nop
-|      :`-> 0x000a0dec      40012c9f       call sym.imp.__errno_location
+|      :`-> 0x000a0dec      40012c9f       call sym.imp.__errno_location ; int *errno_location(void)
 |      :    0x000a0df0      01000000       nop
 |      :    0x000a0df4      c2020000       ld [o0], g1
 |      :    0x000a0df8      80a06004       cmp g1, 4

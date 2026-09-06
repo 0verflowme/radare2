@@ -314,6 +314,81 @@ static bool test_dwarf_function_parsing_rust(void) {
 	mu_end;
 }
 
+static RBinDwarfAttrValue *test_find_attr(RBinDwarfDie *die, ut64 attr_name) {
+	if (!die || !die->attr_values) {
+		return NULL;
+	}
+	RBinDwarfAttrValue *value;
+	R_VEC_FOREACH (die->attr_values, value) {
+		if (value->attr_name == attr_name) {
+			return value;
+		}
+	}
+	return NULL;
+}
+
+static RBinDwarfDie *test_find_die_at(RBinDwarfCompUnit *unit, ut64 offset) {
+	if (!unit || !unit->dies) {
+		return NULL;
+	}
+	RBinDwarfDie *die;
+	R_VEC_FOREACH (unit->dies, die) {
+		if (die->offset == offset) {
+			return die;
+		}
+	}
+	return NULL;
+}
+
+static bool test_dwarf5_typedef_of_void_is_saved(void) {
+	// DWARF spells `void` by omission: `typedef void BZFILE;` is a
+	// DW_TAG_typedef with a name and no DW_AT_type. It is a complete type
+	// and has to reach the type database as a typedef of void, not vanish.
+	r_str_ncpy (anal->config->arch, "x86", sizeof (anal->config->arch));
+	anal->config->bits = 64;
+	RBinFileOptions opt = {
+		.baseaddr = 0x400000,
+	};
+	mu_assert_true (r_bin_open (bin, "bins/elf/dwarf5_line_cl", &opt),
+		"dwarf5_line_cl binary could not be opened");
+	RBinFile *bf = r_bin_cur (bin);
+	mu_assert_notnull (bf, "Couldn't get current bin file");
+	RVecDwarfAbbrevDecl *abbrevs = r_bin_dwarf_parse_abbrev (bf, MODE);
+	mu_assert_notnull (abbrevs, "Couldn't parse DWARF5 abbreviations");
+	RBinDwarfDebugInfo *info = r_bin_dwarf_parse_info (bf, abbrevs, MODE);
+	mu_assert_notnull (info, "Couldn't parse DWARF5 debug info");
+	RBinDwarfCompUnit *unit = RVecDwarfCompUnit_at (info->comp_units, 0);
+	RBinDwarfDie *typedef_die = test_find_die_at (unit, 0xd3);
+	mu_assert_notnull (typedef_die, "Missing typedef candidate DIE");
+	typedef_die->tag = DW_TAG_typedef;
+	// A typedef of void: named, and with no type of its own.
+	RBinDwarfAttrValue *typedef_type = test_find_attr (typedef_die, DW_AT_type);
+	if (typedef_type) {
+		typedef_type->attr_name = DW_AT_linkage_name;
+	}
+	RBinDwarfAttrValue typedef_name = {
+		.attr_name = DW_AT_name,
+		.kind = DW_AT_KIND_STRING,
+		.string.content = "Handle",
+	};
+	RVecDwarfAttrValue_push_back (typedef_die->attr_values, &typedef_name);
+
+	RAnalDwarfContext ctx = {
+		.info = info,
+		.loc = NULL,
+	};
+	r_anal_dwarf_process_info (anal, &ctx);
+
+	const char *value = NULL;
+	Sdb *sdb = anal->sdb_types;
+	check_kv ("Handle", "typedef");
+	check_kv ("typedef.Handle", "void");
+
+	r_bin_dwarf_free_debug_info (info);
+	RVecDwarfAbbrevDecl_free (abbrevs);
+	mu_end;
+}
+
 #define run_test_with_setup(test_func) \
 	do { \
 		if (!setup ()) { \
@@ -329,6 +404,7 @@ int all_tests(void) {
 	run_test_with_setup (test_dwarf_function_parsing_cpp);
 	run_test_with_setup (test_dwarf_function_parsing_rust);
 	run_test_with_setup (test_dwarf_function_parsing_go);
+	run_test_with_setup (test_dwarf5_typedef_of_void_is_saved);
 	return tests_passed != tests_run;
 }
 

@@ -1851,7 +1851,12 @@ R_API void r_anal_extract_rarg(RAnal *anal, RAnalOp *op, RAnalFunction *fcn, int
 R_API void r_anal_extract_vars(RAnal *anal, RAnalFunction *fcn, RAnalOp *op) {
 	R_RETURN_IF_FAIL (anal && fcn && op);
 
-	const char *bpreg = r_reg_alias_getname (anal->reg, R_REG_ALIAS_BP);
+	// A function that never sets up a frame uses the base pointer as an
+	// ordinary register, and an access through it is a field of whatever
+	// it holds, not a stack variable. `r_core_anal_fcn` deletes the
+	// variables this would create once the frame check has run, but every
+	// later extraction (`afva`, type propagation) recreated them.
+	const char *bpreg = fcn->bp_frame? r_reg_alias_getname (anal->reg, R_REG_ALIAS_BP): NULL;
 	if (bpreg) {
 		extract_arg (anal, fcn, op, bpreg, "+", R_ANAL_VAR_KIND_BPV);
 		extract_arg (anal, fcn, op, bpreg, "-", R_ANAL_VAR_KIND_BPV);

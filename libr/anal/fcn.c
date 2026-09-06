@@ -2565,27 +2565,23 @@ static const char *function_signature_lookup_name(RAnal *anal, RAnalFunction *fc
 
 static char *function_signature_try_type_name(Sdb *types, const char *candidate) {
 	R_RETURN_VAL_IF_FAIL (types && candidate && *candidate, NULL);
+	// The prototype namespace decides; the kind key shares its name with
+	// struct tags, and `struct stat` overwrites `stat=func`.
 	char *name = r_type_func_key (types, candidate);
 	if (name) {
-		const char *kind = sdb_const_get (types, name, 0);
-		if (kind && !strcmp (kind, "func")) {
+		if (r_type_func_exist (types, name)) {
 			return name;
 		}
 		free (name);
 	}
 	name = r_type_func_guess (types, candidate);
 	if (name) {
-		const char *kind = sdb_const_get (types, name, 0);
-		if (kind && !strcmp (kind, "func")) {
+		if (r_type_func_exist (types, name)) {
 			return name;
 		}
 		free (name);
 	}
-	const char *kind = sdb_const_get (types, candidate, 0);
-	if (kind && !strcmp (kind, "func")) {
-		return strdup (candidate);
-	}
-	return NULL;
+	return r_type_func_exist (types, candidate)? strdup (candidate): NULL;
 }
 
 R_IPI const char *r_anal_function_type_link_at(RAnal *anal, ut64 addr) {

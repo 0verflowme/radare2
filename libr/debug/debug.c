@@ -378,7 +378,7 @@ R_API RDebug *r_debug_new(int hard) {
 	}
 	// R_SYS_ARCH
 	dbg->arch = strdup (R_SYS_ARCH);
-	dbg->bits = R_SYS_BITS;
+	dbg->bits = R_SYS_BITS_CHECK (R_SYS_BITS, 64)? 64: 32;
 	r_debug_options_init (&dbg->options);
 	dbg->forked_pid = -1;
 	dbg->main_pid = -1;
@@ -567,10 +567,16 @@ R_API bool r_debug_execute(RDebug *dbg, const ut8 *buf, int len, R_OUT ut64 *ret
 	}
 
 	/* Store bytes at PC */
-	dbg->iob.read_at (dbg->iob.io, reg_pc, pc_backup, len);
+	if (dbg->iob.read_at (dbg->iob.io, reg_pc, pc_backup, len) != len) {
+		free (pc_backup);
+		return false;
+	}
 	if (restore && !ignore_stack) {
 		/* Store bytes at stack */
-		dbg->iob.read_at (dbg->iob.io, reg_sp, stack_backup, sizeof (stack_backup));
+		if (dbg->iob.read_at (dbg->iob.io, reg_sp, stack_backup, sizeof (stack_backup)) != sizeof (stack_backup)) {
+			free (pc_backup);
+			return false;
+		}
 	}
 #if USEBP
 	ut64 bp_addr = reg_pc + len;
@@ -880,18 +886,23 @@ R_API bool r_debug_step_soft(RDebug *dbg) {
 	if (!dbg->iob.read_at) {
 		return false;
 	}
-	if (!dbg->iob.read_at (dbg->iob.io, pc, buf, sizeof (buf))) {
+	const int nread = dbg->iob.read_at (dbg->iob.io, pc, buf, sizeof (buf));
+	if (nread < 1) {
 		return false;
 	}
-	if (!r_anal_op (dbg->anal, &op, pc, buf, sizeof (buf), R_ARCH_OP_MASK_BASIC)) {
+	if (!r_anal_op (dbg->anal, &op, pc, buf, nread, R_ARCH_OP_MASK_BASIC)) {
 		return false;
 	}
 	if (op.type == R_ANAL_OP_TYPE_ILL) {
+		r_anal_op_fini (&op);
 		return false;
 	}
 	switch (op.type) {
 	case R_ANAL_OP_TYPE_RET:
-		dbg->iob.read_at (dbg->iob.io, sp, (ut8 *)&sp_top, 8);
+		if (dbg->iob.read_at (dbg->iob.io, sp, (ut8 *)&sp_top, 8) != 8) {
+			r_anal_op_fini (&op);
+			return false;
+		}
 		next[0] = R_SYS_BITS_CHECK (dbg->bits, 64) ? sp_top.r64 : sp_top.r32[0];
 		br = 1;
 		break;
@@ -915,7 +926,7 @@ R_API bool r_debug_step_soft(RDebug *dbg) {
 	case R_ANAL_OP_TYPE_IRCALL:
 	case R_ANAL_OP_TYPE_IRJMP:
 		r = r_debug_reg_get (dbg,op.reg);
-		if (!dbg->iob.read_at (dbg->iob.io, r, (ut8*)&memval, 8)) {
+		if (dbg->iob.read_at (dbg->iob.io, r, (ut8*)&memval, 8) != 8) {
 			next[0] = op.addr + op.size;
 		} else {
 			next[0] = R_SYS_BITS_CHECK (dbg->bits, 64) ? memval.r64 : memval.r32[0];
@@ -929,7 +940,7 @@ R_API bool r_debug_step_soft(RDebug *dbg) {
 		} else {
 			r = 0;
 		}
-		if (!dbg->iob.read_at (dbg->iob.io, r*op.scale + op.disp, (ut8*)&memval, 8)) {
+		if (dbg->iob.read_at (dbg->iob.io, r*op.scale + op.disp, (ut8*)&memval, 8) != 8) {
 			next[0] = op.addr + op.size;
 		} else {
 			next[0] = R_SYS_BITS_CHECK (dbg->bits, 64) ? memval.r64: memval.r32[0];
@@ -942,6 +953,7 @@ R_API bool r_debug_step_soft(RDebug *dbg) {
 		br = 1;
 		break;
 	}
+	r_anal_op_fini (&op);
 
 	for (i = 0; i < br; i++) {
 		RBreakpointItem *bpi = r_bp_add_sw (dbg->bp, next[i], dbg->options.bpsize, R_BP_PROT_EXEC);
@@ -1124,17 +1136,24 @@ R_API int r_debug_step_over(RDebug *dbg, int steps) {
 
 	// Initial refill
 	buf_pc = r_debug_reg_get (dbg, "PC");
-	dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+	int buf_size = dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+	if (buf_size < 1) {
+		return steps_taken;
+	}
 
 	for (; steps_taken < steps; steps_taken++) {
 		pc = r_debug_reg_get (dbg, "PC");
 		// Try to keep the buffer full
-		if (pc - buf_pc > sizeof (buf)) {
+		if (pc - buf_pc >= buf_size) {
 			buf_pc = pc;
-			dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+			buf_size = dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+			if (buf_size < 1) {
+				return steps_taken;
+			}
 		}
+		const int delta = pc - buf_pc;
 		// Analyze the opcode
-		if (!r_anal_op (dbg->anal, &op, pc, buf + (pc - buf_pc), sizeof (buf) - (pc - buf_pc), R_ARCH_OP_MASK_BASIC)) {
+		if (!r_anal_op (dbg->anal, &op, pc, buf + delta, buf_size - delta, R_ARCH_OP_MASK_BASIC)) {
 			R_LOG_ERROR ("debug-step-over: Decode error at %"PFMT64x, pc);
 			return steps_taken;
 		}
@@ -1144,13 +1163,16 @@ R_API int r_debug_step_over(RDebug *dbg, int steps) {
 			// Use op.fail here instead of pc+op.size to enforce anal backends to fill in this field
 			ins_size = op.fail;
 		}
+		const bool overable = isStepOverable (op.type);
+		const bool rep = op.prefix & (R_ANAL_OP_PREFIX_REP | R_ANAL_OP_PREFIX_REPNE | R_ANAL_OP_PREFIX_LOCK);
+		r_anal_op_fini (&op);
 		// Skip over all the subroutine calls
-		if (isStepOverable (op.type)) {
+		if (overable) {
 			if (!r_debug_continue_until (dbg, ins_size)) {
 				R_LOG_ERROR ("Could not step over call @ 0x%"PFMT64x, pc);
 				return steps_taken;
 			}
-		} else if ((op.prefix & (R_ANAL_OP_PREFIX_REP | R_ANAL_OP_PREFIX_REPNE | R_ANAL_OP_PREFIX_LOCK))) {
+		} else if (rep) {
 			//R_LOG_ERROR ("REP: skip to next instruction");
 			if (!r_debug_continue_until (dbg, ins_size)) {
 				R_LOG_ERROR ("step over failed over rep");
@@ -1375,11 +1397,16 @@ repeat:
 			ut8 buf[64];
 			RAnalOp op = {0};
 			ut64 pc = r_debug_reg_get (dbg, "PC");
-			dbg->iob.read_at (dbg->iob.io, pc, buf, sizeof (buf));
-			r_anal_op (dbg->anal, &op, pc, buf, sizeof (buf), R_ARCH_OP_MASK_BASIC);
-			if (op.size > 0) {
+			const int nread = dbg->iob.read_at (dbg->iob.io, pc, buf, sizeof (buf));
+			if (nread < 1) {
+				return false;
+			}
+			r_anal_op (dbg->anal, &op, pc, buf, nread, R_ARCH_OP_MASK_BASIC);
+			const int opsize = op.size;
+			r_anal_op_fini (&op);
+			if (opsize > 0) {
 				const char *signame = r_signal_tostring (dbg->reason.signum);
-				r_debug_reg_set (dbg, "PC", pc+op.size);
+				r_debug_reg_set (dbg, "PC", pc + opsize);
 				R_LOG_INFO ("Skip signal %d handler %s",
 					dbg->reason.signum, signame);
 				goto repeat;
@@ -1447,7 +1474,10 @@ R_API bool r_debug_continue_until_optype(RDebug *dbg, int type, bool over) {
 
 	// Initial refill
 	ut64 buf_pc = r_debug_reg_get (dbg, "PC");
-	dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+	int buf_size = dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+	if (buf_size < 1) {
+		return false;
+	}
 
 	// step first, we don't want to check current optype
 	for (;;) {
@@ -1457,16 +1487,22 @@ R_API bool r_debug_continue_until_optype(RDebug *dbg, int type, bool over) {
 
 		ut64 pc = r_debug_reg_get (dbg, "PC");
 		// Try to keep the buffer full
-		if (pc - buf_pc > sizeof (buf)) {
+		if (pc - buf_pc >= buf_size) {
 			buf_pc = pc;
-			dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+			buf_size = dbg->iob.read_at (dbg->iob.io, buf_pc, buf, sizeof (buf));
+			if (buf_size < 1) {
+				return false;
+			}
 		}
+		const int delta = pc - buf_pc;
 		// Analyze the opcode
-		if (!r_anal_op (dbg->anal, &op, pc, buf + (pc - buf_pc), sizeof (buf) - (pc - buf_pc), R_ARCH_OP_MASK_BASIC)) {
+		if (!r_anal_op (dbg->anal, &op, pc, buf + delta, buf_size - delta, R_ARCH_OP_MASK_BASIC)) {
 			R_LOG_ERROR ("Decode error at %"PFMT64x, pc);
 			return false;
 		}
-		if (op.type == type) {
+		const int optype = op.type;
+		r_anal_op_fini (&op);
+		if (optype == type) {
 			switch (type) {
 			case R_ANAL_OP_TYPE_CALL:
 			case R_ANAL_OP_TYPE_UCALL:

@@ -466,11 +466,25 @@ R_API bool r_anal_block_successor_addrs_foreach(RAnalBlock *block, RAnalAddrCb c
 
 	CB_ADDR (block->jump);
 	CB_ADDR (block->fail);
-	if (block->switch_op && block->switch_op->cases) {
+	if (block->switch_op) {
 		RListIter *iter;
 		RAnalCaseOp *caseop;
-		r_list_foreach (block->switch_op->cases, iter, caseop) {
-			CB_ADDR (caseop->jump);
+		// callers building CFGs miss an edge without the default; 0 means unset
+		// (jmptbl.c maps the UT64_MAX "none" to 0), so it is not a target
+		ut64 def = block->switch_op->def_val;
+		if (def == block->jump || def == block->fail) {
+			def = 0;
+		}
+		if (block->switch_op->cases) {
+			r_list_foreach (block->switch_op->cases, iter, caseop) {
+				if (caseop->jump == def) {
+					def = 0;
+				}
+				CB_ADDR (caseop->jump);
+			}
+		}
+		if (def) {
+			CB_ADDR (def);
 		}
 	}
 
@@ -855,7 +869,7 @@ R_API bool r_anal_block_was_modified(RAnalBlock *block) {
 	if (!buf) {
 		return false;
 	}
-	if (!block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size)) {
+	if (block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size) != block->size) {
 		free (buf);
 		return false;
 	}
@@ -874,7 +888,7 @@ R_API void r_anal_block_update_hash(RAnalBlock *block) {
 	}
 	ut8 *buf = malloc (block->size);
 	if (buf) {
-		if (!block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size)) {
+		if (block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size) != block->size) {
 			free (buf);
 			return;
 		}

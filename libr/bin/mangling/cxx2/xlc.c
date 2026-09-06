@@ -123,7 +123,7 @@ static int ibmxl_source_len(IBMXLParser *p) {
 	const char *bestp = NULL;
 	int best = -1;
 	int n = 0;
-	if (!isdigit ((unsigned char)ibmxl_peek (p))) {
+	if (!isdigit ((unsigned char)ibmxl_peek (p)) || ibmxl_peek (p) == '0') {
 		return -1;
 	}
 	while (isdigit ((unsigned char)ibmxl_peek (p))) {
@@ -343,6 +343,11 @@ static char *ibmxl_name(IBMXLParser *p) {
 		res = r_str_ndup (p->cur, n);
 		p->cur += n;
 		if (!res) {
+			p->fail = true;
+			goto out;
+		}
+		if (isdigit ((unsigned char)*res)) {
+			R_FREE (res);
 			p->fail = true;
 			goto out;
 		}

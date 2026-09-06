@@ -117,6 +117,42 @@ static bool bind_fits(ut64 count, ut64 addr, ut64 segment_end_addr, ut64 stride)
 	return count <= (remaining / stride);
 }
 
+static bool bind_fits_section(struct MACH0_(obj_t) * mo, int seg_idx, ut64 addr, ut64 count, ut64 stride) {
+	if (!mo->sects || mo->nsects < 1 || seg_idx < 0 || seg_idx >= mo->nsegs) {
+		return true;
+	}
+	struct MACH0_(segment_command) *seg = &mo->segs[seg_idx];
+	size_t i;
+	for (i = 0; i < mo->nsects; i++) {
+		struct MACH0_(section) *sect = &mo->sects[i];
+		if (strncmp (sect->segname, seg->segname, sizeof (sect->segname))) {
+			continue;
+		}
+		ut64 section_end = 0;
+		if (!UT64_ADD (&section_end, sect->addr, sect->size)) {
+			return false;
+		}
+		if (addr >= sect->addr && addr < section_end) {
+			return bind_fits (count, addr, section_end, stride);
+		}
+	}
+	return seg->nsects < 1;
+}
+
+static bool bind_repeat_span(struct MACH0_(obj_t) * mo, int seg_idx, ut64 addr, ut64 end_addr, ut64 count, ut64 skip, size_t wordsize, bool check_sections, R_OUT ut64 *span) {
+	ut64 stride = 0;
+	if (!UT64_ADD (&stride, skip, wordsize)) {
+		return false;
+	}
+	if (check_sections && !bind_fits_section (mo, seg_idx, addr, count, stride)) {
+		return false;
+	}
+	if (!bind_fits (count, addr, end_addr, stride)) {
+		return false;
+	}
+	return UT64_MUL (span, count, stride);
+}
+
 static bool segment_filebacked_size(struct MACH0_(obj_t) * mo, int seg_idx, R_OUT ut64 *size) {
 	R_RETURN_VAL_IF_FAIL (mo && size, false);
 	if (seg_idx < 0 || seg_idx >= mo->nsegs) {
@@ -1962,14 +1998,13 @@ static bool parse_threaded_rebase(struct MACH0_(obj_t) * mo) {
 			count = read_uleb128 (&p, end);
 			skip = read_uleb128 (&p, end);
 			{
-				ut64 stride = 0;
 				ut64 span = 0;
-				if (!UT64_ADD (&stride, skip, wordsize) || !bind_fits (count, seg_off, segment_size, stride)) {
+				if (!bind_repeat_span (mo, seg_idx, seg_off, segment_size, count, skip, wordsize, false, &span)) {
 					R_LOG_ERROR ("Malformed bind opcode stream");
 					R_FREE (opcodes);
 					return false;
 				}
-				if (!UT64_MUL (&span, count, stride) || !safe_advance (&seg_off, span)) {
+				if (!safe_advance (&seg_off, span)) {
 					R_FREE (opcodes);
 					return false;
 				}
@@ -2527,6 +2562,7 @@ void *MACH0_(mach0_free)(struct MACH0_(obj_t) * mo) {
 	if (mo->libs_loaded) {
 		RVecMach0Lib_fini (&mo->libs_cache);
 	}
+	RVecRBinTrycatch_fini (&mo->trycatch);
 	free (mo->func_start);
 	free (mo->signature);
 	free (mo->signature_der);
@@ -2569,6 +2605,7 @@ struct MACH0_(obj_t) * MACH0_(new_buf)(RBinFile *bf, RBuffer *buf, struct MACH0_
 	mo->b = r_ref (buf);
 	mo->main_addr = UT64_MAX;
 	RVecRBinReloc_init (&mo->reloc_fixups);
+	RVecRBinTrycatch_init (&mo->trycatch);
 	mo->kv = sdb_new (NULL, "bin.mach0", 0);
 	mo->imports_by_name = ht_pp_new0 ();
 	// probably unnecessary indirection if we pass bf or bo to the apis instead of mo
@@ -2779,35 +2816,6 @@ RVecSegment *MACH0_(get_segments_vec)(RBinFile *bf, struct MACH0_(obj_t) * mo) {
 	}
 
 	return mo->segments_vec;
-}
-
-RList *MACH0_(get_segments)(RBinFile *bf, struct MACH0_(obj_t) * macho) {
-	RList *list = r_list_newf ((RListFree)r_bin_section_free);
-	if (!list) {
-		return NULL;
-	}
-
-	// R2_590 slow, should return vec directly
-	RVecSegment *segments = MACH0_(get_segments_vec) (bf, macho);
-	const int limit = macho->limit;
-	int count = 0;
-	RBinSection *s;
-	R_VEC_FOREACH (segments, s) {
-		if (limit > 0 && !s->is_segment && count >= limit) {
-			break;
-		}
-		RBinSection *s_copy = r_bin_section_clone (s);
-		if (!s_copy) {
-			r_list_free (list);
-			return NULL;
-		}
-		r_list_append (list, s_copy);
-		if (!s->is_segment) {
-			count++;
-		}
-	}
-
-	return list;
 }
 
 const RVecSection *MACH0_(load_sections)(struct MACH0_(obj_t) * mo) {
@@ -3453,7 +3461,7 @@ static void parse_symbols(RBinFile *bf, struct MACH0_(obj_t) * mo, HtPP *symcach
 				memset (sym, 0, sizeof (RBinSymbol));
 				sym->vaddr = vaddr;
 				sym->paddr = addr_to_offset (mo, sym->vaddr) + obj->boffset;
-				sym->size = 0; /* TODO: Is it anywhere? */
+				sym->attr.size = 0; /* TODO: Is it anywhere? */
 				sym->bits = nl->n_desc & N_ARM_THUMB_DEF? 16: bits;
 				sym->is_imported = false;
 				sym->type = nl->n_type & N_EXT? "EXT": "LOCAL";
@@ -3475,6 +3483,9 @@ static void parse_symbols(RBinFile *bf, struct MACH0_(obj_t) * mo, HtPP *symcach
 	}
 
 	to = R_MIN ((ut32)mo->nsymtab, ds->iundefsym + ds->nundefsym);
+	if (to > ds->iundefsym) {
+		r_bin_file_add_language (bf, R_BIN_LANG_C);
+	}
 	for (i = ds->iundefsym; i < to; i++) {
 		struct symbol_t symbol;
 		if (j > symbols_count) {
@@ -3494,7 +3505,7 @@ static void parse_symbols(RBinFile *bf, struct MACH0_(obj_t) * mo, HtPP *symcach
 			j++;
 			RBinSymbol *sym = RVecRBinSymbol_emplace_back (mo->symbols_vec);
 			memset (sym, 0, sizeof (RBinSymbol));
-			sym->lang = R_BIN_LANG_C;
+			sym->attr.lang = R_BIN_LANG_C;
 			sym->vaddr = symbol.addr;
 			sym->paddr = symbol.offset + obj->boffset;
 			if (symbol.name) {
@@ -3603,7 +3614,7 @@ static bool parse_function_start_symbols(RBinFile *bf, struct MACH0_(obj_t) * mo
 		memset (sym, 0, sizeof (RBinSymbol));
 		sym->vaddr = mo->baddr + address;
 		sym->paddr = address + obj->boffset;
-		sym->size = 0;
+		sym->attr.size = 0;
 		char *n = r_str_newf ("func.%08" PFMT64x, sym->vaddr);
 		sym->name = r_bin_name_new (n);
 		free (n);
@@ -3640,35 +3651,14 @@ static bool parse_function_start_symbols(RBinFile *bf, struct MACH0_(obj_t) * mo
 	return is_stripped;
 }
 
-#if 0
-// R2_612
-static inline bool is_debug_segment(const RBinSection *s, const void *user) {
-	return strstr (s->name, "DWARF.__debug_line") != NULL;
+static int is_debug_segment(const RBinSection *s, const void *user) {
+	return (s->name && strstr (s->name, ".__debug_line"))? 0: 1;
 }
 
-static inline bool is_debug_build(RBinFile *bf, struct MACH0_(obj_t) *mo) {
-	return RVecSegment_find (mo->segments_vec, NULL, is_debug_segment) != NULL;
+static bool is_debug_build(RBinFile *bf, struct MACH0_(obj_t) *mo) {
+	RVecSegment *segments = MACH0_(get_segments_vec) (bf, mo);
+	return segments && RVecSegment_find (segments, NULL, is_debug_segment) != NULL;
 }
-#else
-static bool is_debug_build(RBinFile *bf, struct MACH0_(obj_t) * mo) {
-	RList *sections = MACH0_(get_segments) (bf, mo);
-	if (!sections) {
-		return false;
-	}
-
-	bool res = false;
-	RListIter *iter;
-	RBinSection *section;
-	r_list_foreach (sections, iter, section) {
-		if (strstr (section->name, ".__debug_line")) {
-			res = true;
-			break;
-		}
-	}
-	r_list_free (sections);
-	return res;
-}
-#endif
 
 const bool MACH0_(load_symbols)(struct MACH0_(obj_t) * mo) {
 	R_RETURN_VAL_IF_FAIL (mo, false);
@@ -4114,6 +4104,20 @@ static bool stop_bind_parsing(RBindOpState *state) {
 	return true;
 }
 
+static bool threaded_bind_fits(RVecRelocRef *threaded_binds, RBindOpState *state, ut64 count) {
+	if (!threaded_binds) {
+		return true;
+	}
+	if (state->sym_ord < 0) {
+		return false;
+	}
+	ut64 n_threaded_binds = RVecRelocRef_length (threaded_binds);
+	if ((ut64)state->sym_ord > n_threaded_binds) {
+		return false;
+	}
+	return count <= n_threaded_binds - state->sym_ord;
+}
+
 static void insert_bind_reloc(struct MACH0_(obj_t) * mo, RVecRelocRef *threaded_binds, RBindOpState *state, ut8 op, ut8 rel_type) {
 	if (state->sym_ord < 0 && !state->sym_name) {
 		return;
@@ -4170,6 +4174,7 @@ static void apply_threaded_bind(struct MACH0_(obj_t) * mo, RVecRelocRef *threade
 		ut64 paddr = state->addr - cur_seg->vmaddr + cur_seg->fileoff;
 		mo->rebasing_buffer = true;
 		if (r_buf_read_at (mo->b, paddr, tmp, 8) != 8) {
+			mo->rebasing_buffer = false;
 			break;
 		}
 		mo->rebasing_buffer = false;
@@ -4284,8 +4289,12 @@ static bool parse_bind_op_do_bind(struct MACH0_(obj_t) * mo, RVecRelocRef **thre
 		{
 			ut64 count = read_uleb128 (p, end);
 			ut64 skip = read_uleb128 (p, end);
-			ut64 increment;
-			if (!UT64_ADD (&increment, skip, wordsize) || !bind_fits (count, state->addr, state->segment_end_addr, increment)) {
+			ut64 span = 0;
+			if (!*threaded_binds && state->seg_idx < 0) {
+				R_LOG_DEBUG ("Malformed ULEB TIMES bind opcode");
+				return stop_bind_parsing (state);
+			}
+			if (!threaded_bind_fits (*threaded_binds, state, count) || (!*threaded_binds && !bind_repeat_span (mo, state->seg_idx, state->addr, state->segment_end_addr, count, skip, wordsize, true, &span))) {
 				R_LOG_DEBUG ("Count exceeds segment bounds");
 				return stop_bind_parsing (state);
 			}

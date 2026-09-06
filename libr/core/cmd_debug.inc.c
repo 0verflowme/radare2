@@ -16,6 +16,15 @@
 #if HAVE_JEMALLOC
 #include "r_heap_jemalloc.h"
 #include "dmh_jemalloc.inc.c"
+
+static RCoreHelpMessage help_msg_dmh_jemalloc = {
+	"Usage:", "dmh", " # Memory map heap",
+	"dmha", "[arena_t]", "show all arenas created, or print arena_t structure for given arena",
+	"dmhb", "[arena_t]", "show all bins created for given arena",
+	"dmhc", "*|[arena_t]", "show all chunks created in all arenas, or show all chunks created for a given arena_t instance",
+	"dmh?", "", "Show map heap help",
+	NULL
+};
 #endif
 
 void cmd_anal_reg (RCore *core, const char *str);
@@ -828,6 +837,10 @@ static RCoreHelpMessage help_msg_dts = {
 };
 
 static void cmd_dtsc(RCore *core, const char *input) {
+	if (input[3] == '?') {
+		r_cons_cmd_help_match (core->cons, help_msg_dts, "dtsc", 0, true);
+		return;
+	}
 	if (!core->dbg->session) {
 		R_LOG_ERROR ("No session started");
 		return;
@@ -844,12 +857,12 @@ static void cmd_dtsc(RCore *core, const char *input) {
 }
 
 static void cmd_dtsd(RCore *core, const char *input) {
-	if (!core->dbg->session) {
-		R_LOG_ERROR ("No session started");
-		return;
-	}
 	if (input[3] == '?') {
 		r_cons_cmd_help_match (core->cons, help_msg_dts, "dtsd", 0, true);
+		return;
+	}
+	if (!core->dbg->session) {
+		R_LOG_ERROR ("No session started");
 		return;
 	}
 	const char *arg = r_str_trim_head_ro (input + 3);
@@ -866,6 +879,10 @@ static void cmd_dtsd(RCore *core, const char *input) {
 }
 
 static void cmd_dtsr(RCore *core, const char *input) {
+	if (input[3] == '?') {
+		r_cons_cmd_help_match (core->cons, help_msg_dts, "dtsr", 0, true);
+		return;
+	}
 	if (!core->dbg->session) {
 		R_LOG_ERROR ("No session started");
 		return;
@@ -882,15 +899,15 @@ static void cmd_dtsr(RCore *core, const char *input) {
 }
 
 static void cmd_dtsw(RCore *core, const char *input) {
-	if (!core->dbg->session) {
-		R_LOG_ERROR ("No session started");
-		return;
-	}
 	int mode = 0;
 	char sub = input[3];
 	const char *arg = r_str_trim_head_ro (sub? input + 4: input + 3);
 	if (sub == '?' || (sub == ' ' && *arg == '?')) {
 		r_cons_cmd_help (core->cons, help_msg_dtsw);
+		return;
+	}
+	if (!core->dbg->session) {
+		R_LOG_ERROR ("No session started");
 		return;
 	}
 	if (!sub || sub == ' ') {
@@ -1475,7 +1492,7 @@ static bool step_until_optype(RCore *core, const char *_optypes) {
 				res = false;
 				goto cleanup_after_push;
 			}
-			if (!core->dbg->iob.read_at (core->dbg->iob.io, pc, buf, sizeof (buf))) {
+			if (core->dbg->iob.read_at (core->dbg->iob.io, pc, buf, sizeof (buf)) != sizeof (buf)) {
 				R_LOG_ERROR ("cannot read");
 				res = false;
 				goto cleanup_after_push;
@@ -1506,6 +1523,7 @@ static bool step_until_optype(RCore *core, const char *_optypes) {
 		// To improve this, the function r_anal_optype_string_to_int should be implemented
 		// I also don't check if the opcode type exists.
 		const char *optype_str = r_anal_optype_tostring (op.type);
+		r_anal_op_fini (&op);
 		r_list_foreach (optypes_list, iter, optype) {
 			if (!strcmp (optype_str, optype)) {
 				goto cleanup_after_push;
@@ -1773,7 +1791,7 @@ static void cmd_debug_pid(RCore *core, const char *input) {
 }
 
 static void cmd_debug_backtrace(RCore *core, const char *input) {
-	RAnalOp analop;
+	RAnalOp analop = {0};
 	ut64 addr, len = r_num_math (core->num, input);
 	if (!len) {
 		r_bp_traptrace_list (core->dbg->bp);
@@ -1800,8 +1818,10 @@ static void cmd_debug_backtrace(RCore *core, const char *input) {
 			/* XXX Bottleneck..we need to reuse the bytes read by traptrace */
 			// XXX Do asm.arch should define the max size of opcode?
 			r_io_read_at (core->io, addr, buf, 32); // XXX longer opcodes?
+			r_anal_op_fini (&analop);
 			r_anal_op (core->anal, &analop, addr, buf, sizeof (buf), R_ARCH_OP_MASK_BASIC);
 		} while (r_bp_traptrace_at (core->dbg->bp, addr, analop.size));
+		r_anal_op_fini (&analop);
 		r_bp_traptrace_enable (core->dbg->bp, false);
 	}
 }
@@ -1963,8 +1983,29 @@ beach:
 
 #if __linux__ && __GNU_LIBRARY__ && __GLIBC__ && __GLIBC_MINOR__
 
-static int dmh_glibc_32(RCore *core, const char *input);
-static int dmh_glibc_64(RCore *core, const char *input);
+static char *dmh_glibc_32(RCore *core, RAGraph *graph, const char *input);
+static char *dmh_glibc_64(RCore *core, RAGraph *graph, const char *input);
+
+static RCoreHelpMessage help_msg_dmh_glibc = {
+	"Usage:", " dmh", " # Memory map heap",
+	"dmh", " @[malloc_state]", "List heap chunks of a particular arena",
+	"dmh", "", "List the chunks inside the heap segment",
+	"dmh*", "", "Display heap details as radare2 commands",
+	"dmha", "", "List all malloc_state instances in application",
+	"dmhb", " @[malloc_state]", "Display all parsed Double linked list of main_arena's or a particular arena bins instance",
+	"dmhb", " [bin_num|bin_num:malloc_state]", "Display parsed double linked list of bins instance from a particular arena",
+	"dmhbg", " [bin_num]", "Display double linked list graph of main_arena's bin [Under developemnt]",
+	"dmhc", " @[chunk_addr]", "Display malloc_chunk struct for a given malloc chunk",
+	"dmhf", " @[malloc_state]", "Display all parsed fastbins of main_arena's or a particular arena fastbinY instance",
+	"dmhf", " [fastbin_num(:malloc_state)]", "Display single linked list in fastbinY instance from a particular arena",
+	"dmhg", " [malloc_state]", "Display heap graph of a particular arena",
+	"dmhg", "", "Display heap graph of heap segment",
+	"dmhi", " @[malloc_state]", "Display heap_info structure/structures for a given arena",
+	"dmhj", "", "List the chunks inside the heap segment in JSON format",
+	"dmhm", "[*j]", "List all malloc_state instance of a particular arena (@ malloc_state#addr)",
+	"dmht", "", "Display all parsed thread cache bins of all arena's tcache instance",
+	NULL
+};
 #endif // __linux__ && __GNU_LIBRARY__ && __GLIBC__ && __GLIBC_MINOR__
 #if R2__WINDOWS__
 static int dmh_windows(RCore *core, const char *input);
@@ -2022,6 +2063,20 @@ static RDebugMap *get_closest_map(RCore *core, ut64 addr) {
 #define R_LOG_ORIGIN "cmd.debug"
 #endif
 
+#if __linux__ && __GNU_LIBRARY__ && __GLIBC__ && __GLIBC_MINOR__
+static RAGraph *dmh_graph_new(RCons *cons) {
+	int h;
+	int w = r_cons_get_size (cons, &h);
+	if (w < 1 || h < 1) {
+		w = 80;
+		h = 24;
+	}
+	int flags = r_cons_canvas_flags (cons);
+	RConsCanvas *canvas = r_cons_canvas_new (cons, w, h, flags);
+	return canvas? r_agraph_new (canvas): NULL;
+}
+#endif
+
 static bool cmd_dmh(RCore *core, const char *input) {
 	const char *m = r_config_get (core->config, "dbg.malloc");
 	if (!m || R_STR_ISEMPTY (input)) {
@@ -2029,19 +2084,36 @@ static bool cmd_dmh(RCore *core, const char *input) {
 	}
 	if (!strcmp ("glibc", m)) {
 #if __linux__ && __GNU_LIBRARY__ && __GLIBC__ && __GLIBC_MINOR__
-		if (core->rasm->config->bits == 64) {
-			return dmh_glibc_64 (core, input + 1);
+		if (input[1] == '?') {
+			r_cons_cmd_help (core->cons, help_msg_dmh_glibc);
+			return true;
 		}
-		return dmh_glibc_32 (core, input + 1);
+		bool graph_mode = input[1] == 'g' || (input[1] == 'b' && input[2] == 'g');
+		RAGraph *graph = graph_mode? dmh_graph_new (core->cons): NULL;
+		char *output = core->rasm->config->bits == 64
+			? dmh_glibc_64 (core, graph, input + 1)
+			: dmh_glibc_32 (core, graph, input + 1);
+		if (output) {
+			r_cons_print (core->cons, output);
+		}
+		free (output);
+		r_agraph_free (graph);
+		return true;
 #else
 		R_LOG_WARN ("glibc is not supported for this platform");
 #endif
 #if HAVE_JEMALLOC
 	} else if (!strcmp ("jemalloc", m)) {
-		if (core->rasm->config->bits == 64) {
-			dmh_jemalloc_64 (core, input + 1);
+		if (input[1] == '?') {
+			r_cons_cmd_help (core->cons, help_msg_dmh_jemalloc);
 		} else {
-			dmh_jemalloc_32 (core, input + 1);
+			char *output = core->rasm->config->bits == 64
+				? dmh_jemalloc_64 (core, input + 1)
+				: dmh_jemalloc_32 (core, input + 1);
+			if (output) {
+				r_cons_print (core->cons, output);
+			}
+			free (output);
 		}
 #endif
 	} else {
@@ -2131,11 +2203,12 @@ static int __r_debug_snap_diff(RCore *core, int idx) {
 		if (count == idx) {
 			ut8 *b = malloc (snap->size);
 			if (R_LIKELY (b)) {
-				dbg->iob.read_at (dbg->iob.io, snap->addr, b , snap->size);
-				r_print_hexdiff (core->print,
+				if (dbg->iob.read_at (dbg->iob.io, snap->addr, b, snap->size) == snap->size) {
+					r_print_hexdiff (core->print,
 						snap->addr, snap->data,
 						snap->addr, b,
 						snap->size, col);
+				}
 				free (b);
 			} else {
 				R_LOG_ERROR ("Cannot allocate snapshot");
@@ -4885,6 +4958,7 @@ static void do_debug_trace_calls(RCore *core, ut64 from, ut64 to, ut64 final_add
 #endif
 			break;
 		}
+		r_anal_op_fini (&aop);
 	}
 }
 
@@ -5123,7 +5197,9 @@ static void r_core_debug_kill(RCore *core, const char *input) {
 static bool is_x86_call(RDebug *dbg, ut64 addr) {
 	ut8 buf[3];
 	ut8 *op = buf;
-	(void)dbg->iob.read_at (dbg->iob.io, addr, buf, R_ARRAY_SIZE (buf));
+	if (dbg->iob.read_at (dbg->iob.io, addr, buf, R_ARRAY_SIZE (buf)) != R_ARRAY_SIZE (buf)) {
+		return false;
+	}
 	switch (buf[0]) {  /* Segment override prefixes */
 	case 0x65:
 	case 0x64:
@@ -5146,7 +5222,9 @@ static bool is_x86_call(RDebug *dbg, ut64 addr) {
 
 static bool is_x86_ret(RDebug *dbg, ut64 addr) {
 	ut8 buf[1];
-	(void)dbg->iob.read_at (dbg->iob.io, addr, buf, R_ARRAY_SIZE (buf));
+	if (dbg->iob.read_at (dbg->iob.io, addr, buf, R_ARRAY_SIZE (buf)) != R_ARRAY_SIZE (buf)) {
+		return false;
+	}
 	switch (buf[0]) {
 	case 0xc3:
 	case 0xcb:
@@ -5252,8 +5330,11 @@ static bool cmd_dcu(RCore *core, const char *input) {
 					ut32 ret_addr;
 					RDebugFrame *frame = R_NEW0 (RDebugFrame);
 					cur_sp = r_debug_reg_get (core->dbg, "SP");
-					(void)core->dbg->iob.read_at (core->dbg->iob.io, cur_sp,
-							(ut8 *)&ret_addr, sizeof (ret_addr));
+					if (core->dbg->iob.read_at (core->dbg->iob.io, cur_sp,
+							(ut8 *)&ret_addr, sizeof (ret_addr)) != sizeof (ret_addr)) {
+						free (frame);
+						break;
+					}
 					frame->addr = ret_addr;
 					frame->size = old_sp - cur_sp;
 					frame->sp = cur_sp;
@@ -5735,9 +5816,12 @@ static int cmd_debug_step(RCore *core, const char *input) {
 			addr = r_debug_reg_get (core->dbg, "PC");
 			r_io_read_at (core->io, addr, buf, sizeof (buf));
 			r_anal_op (core->anal, &aop, addr, buf, sizeof (buf), R_ARCH_OP_MASK_BASIC);
-			if (aop.type == R_ANAL_OP_TYPE_CALL) {
+			const bool call = aop.type == R_ANAL_OP_TYPE_CALL;
+			const ut64 jump = aop.jump;
+			r_anal_op_fini (&aop);
+			if (call) {
 				RBinObject *o = r_bin_cur_object (core->bin);
-				RBinSection *s = r_bin_get_section_at (o, aop.jump, true);
+				RBinSection *s = r_bin_get_section_at (o, jump, true);
 				if (!s) {
 					r_debug_step_over (core->dbg, times);
 					continue;
@@ -5764,6 +5848,7 @@ static int cmd_debug_step(RCore *core, const char *input) {
 				}
 #endif
 				addr += aop.size;
+				r_anal_op_fini (&aop);
 			}
 			r_debug_reg_set (core->dbg, "PC", addr);
 			r_reg_setv (core->anal->reg, "PC", addr);
@@ -5961,8 +6046,8 @@ static int cmd_debug_desc(RCore *core, const char *input) {
 				}
 				if (!filename) {
 					char pathbuf[1024] = {0};
-					core->dbg->iob.read_at (core->dbg->iob.io, addr, (ut8*)pathbuf, sizeof (pathbuf) - 1);
-					if (*pathbuf) {
+					const int nread = core->dbg->iob.read_at (core->dbg->iob.io, addr, (ut8 *)pathbuf, sizeof (pathbuf) - 1);
+					if (nread > 0 && *pathbuf) {
 						filename = strdup (pathbuf);
 					}
 				}
@@ -6538,7 +6623,9 @@ static int cmd_debug(void *data, const char *input) {
 				cmd_dtsc (core, input);
 				break;
 			case 't': // "dtst"
-				if (core->dbg->session) {
+				if (input[3] == '?') {
+					r_cons_cmd_help_match (core->cons, help_msg_dts, "dtst", 0, true);
+				} else if (core->dbg->session) {
 					const char *sname = r_str_trim_head_ro (input + 3);
 					if (R_STR_ISNOTEMPTY (sname)) {
 						r_debug_session_save (core->dbg->session, sname);
@@ -6550,6 +6637,10 @@ static int cmd_debug(void *data, const char *input) {
 				}
 				break;
 			case 'f': // "dtsf"
+				if (input[3] == '?') {
+					r_cons_cmd_help_match (core->cons, help_msg_dts, "dtsf", 0, true);
+					break;
+				}
 				if (core->dbg->session) {
 					debug_replay_reset (core);
 					r_debug_session_free (core->dbg->session);

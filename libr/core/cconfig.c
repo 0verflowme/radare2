@@ -1764,19 +1764,8 @@ static bool cb_cmdpdc(void *user, void *data) {
 			}
 		}
 		RConfigNode *r2dec = r_config_node_get (core->config, "r2dec.asm");
-		if (r2dec) {
+		if (r2dec || r_anal_decompiler_provider (core->anal)) {
 			r_cons_printf (core->cons, "pdd\n");
-		}
-		/* Check for r2sleigh analysis plugin with decompiler support */
-		{
-			RListIter *it;
-			RAnalPlugin *ap;
-			r_list_foreach (core->anal->libstore->plugins, it, ap) {
-				if (!strcmp (ap->meta.name, "sla")) {
-					r_cons_println (core->cons, "a:sla.dec");
-					break;
-				}
-			}
 		}
 		return false;
 	}
@@ -2714,12 +2703,6 @@ static bool cb_iova(void *user, void *data) {
 		if (core->io->desc) {
 			r_core_block_read (core);
 		}
-#if 0
-		/* reload symbol information */
-		if (r_list_length (r_bin_get_sections (core->bin)) > 0) {
-			r_core_cmd0 (core, ".ia*");
-		}
-#endif
 	}
 	return true;
 }
@@ -3949,6 +3932,12 @@ static bool cb_config_log_quiet(void *coreptr, void *nodeptr) {
 	return true;
 }
 
+static bool cb_config_log_hints(void *coreptr, void *nodeptr) {
+	RConfigNode *node = (RConfigNode *)nodeptr;
+	r_log_set_hints (r_str_is_true (node->value));
+	return true;
+}
+
 static bool cb_dbg_verbose(void *user, void *data) {
 	RCore *core = (RCore *)user;
 	RConfigNode *node = (RConfigNode *)data;
@@ -4004,6 +3993,7 @@ R_API int r_core_config_init(RCore *core) {
 	int i;
 	char *p, *tmpdir;
 	RConfigNode *n;
+	const int sysbits = R_SYS_BITS_CHECK (R_SYS_BITS, 64)? 64: 32;
 	RConfig *cfg = core->config = r_config_new (core);
 	if (!cfg) {
 		return 0;
@@ -4102,6 +4092,7 @@ R_API int r_core_config_init(RCore *core) {
 	SETCB ("anal.ignbithints", "false", &cb_anal_ignbithints, "ignore the ahb hints (only obey asm.bits)");
 	SETI ("anal.symsort", 0, "sort symbols before 'aaa'nalysis (-1: backward, 0: no sort, 1: forward");
 	SETB ("anal.imports", "true", "run af@@@i in aa for better noreturn propagation");
+	SETB ("anal.plt", "true", "name plt stubs of locally defined functions as sym.plt.* during aa");
 	SETB ("anal.calls", "false", "make basic af analysis walk into calls");
 	SETB ("anal.autoname", "false", "speculatively set a name for the functions, may result in some false positives");
 	SETB ("anal.hasnext", "false", "continue analysis after each function");
@@ -4141,7 +4132,7 @@ R_API int r_core_config_init(RCore *core) {
 	SETDESC (n, "select the instruction decoder to use");
 	update_archdecoder_options (core, n);
 	r_config_set_getter (cfg, "arch.decoder", (RConfigCallback)cb_archdecoder_getter);
-	SETICB ("arch.bits", R_SYS_BITS, &cb_archbits, "word size in bits at arch decoder");
+	SETICB ("arch.bits", sysbits, &cb_archbits, "word size in bits at arch decoder");
 	r_config_set_getter (cfg, "arch.bits", (RConfigCallback)cb_archbits_getter);
 	SETCB ("arch.platform", "", &cb_arch_platform, "define arch platform to use");
 	n = NODECB ("arch.endian", R_SYS_ENDIAN? "big": "little", &cb_archendian);
@@ -4164,7 +4155,7 @@ R_API int r_core_config_init(RCore *core) {
 	SETCB ("anal.jmp.pair", "false", &cb_anal_jmppair, "treat inverse jcc pairs as obfuscation (x86 only)");
 
 	SETCB ("anal.refstr", "false", &cb_anal_searchstringrefs, "search string references in data references");
-	SETCB ("anal.trycatch", "false", &cb_anal_trycatch, "honor try.X.Y.{from,to,catch} flags");
+	SETCB ("anal.trycatch", "true", &cb_anal_trycatch, "analyze exception handlers described by try.X.Y.{from,to,catch} flags");
 	SETCB ("anal.bb.maxsize", "64K", &cb_anal_bb_max_size, "maximum basic block size");
 	SETCB ("anal.pushret", "false", &cb_anal_pushret, "analyze push+ret as jmp");
 	SETCB ("types.plugin", "", &cb_anal_types_parser, "use the new c parser instead of tcc");
@@ -4211,7 +4202,7 @@ R_API int r_core_config_init(RCore *core) {
 	SETICB ("esil.maxbacksteps", 256, &cb_esilmaxbacksteps, "esil back step capacity");
 	SETB ("esil.stepover.force", "false", "force PC to the return address when ESIL step-over stops before returning");
 	SETS ("esil.fillstack", "", "initialize ESIL stack with (random, debruijn, sequence, zeros, ...)");
-	SETICB ("esil.gotolimit", core->anal->esil_goto_limit, &cb_gotolimit, "maximum number of gotos per ESIL expression");
+	SETICB ("esil.gotolimit", core->anal->esil_goto_limit, &cb_gotolimit, "maximum number of gotos and nested definitions per ESIL expression");
 	SETICB ("esil.stack.depth", 256, &cb_esilstackdepth, "number of elements that can be pushed on the esilstack");
 	SETI ("esil.stack.size", 0xf0000, "set stack size in ESIL VM");
 	SETI ("esil.stack.addr", 0x100000, "set stack address in ESIL VM");
@@ -4380,7 +4371,7 @@ R_API int r_core_config_init(RCore *core) {
 	SETOPTIONS (n, "att", "intel", "masm", "jz", "regnum", NULL);
 	SETI ("asm.nbytes", 6, "number of bytes for each opcode at disassembly");
 	SETB ("asm.bytes.space", "false", "separate hexadecimal bytes with a whitespace");
-	SETICB ("asm.bits", R_SYS_BITS, &cb_asmbits, "word size in bits at assembler");
+	SETICB ("asm.bits", sysbits, &cb_asmbits, "word size in bits at assembler");
 	n = r_config_node_get (cfg, "asm.bits");
 	update_asmbits_options (core, n);
 	SETB ("asm.functions", "true", "show functions in disassembly");
@@ -4516,9 +4507,9 @@ R_API int r_core_config_init(RCore *core) {
 	SETCB ("cfg.regnums", "false", &cb_cfg_regnums, "Query register values before flags in RNum calls (EXPERIMENTAL)");
 
 	/* log */
-	SETICB ("log.level", R_LOG_LEVEL_DEFAULT, cb_config_log_level, "Target log level/severity (0:FATAL 1:ERROR 2:INFO 3:WARN 4:TODO 5:DEBUG)");
+	SETICB ("log.level", R_LOG_LEVEL_DEFAULT, cb_config_log_level, "Target log level/severity (0:FATAL 1:ERROR 2:INFO 3:WARN 4:HINT 5:TODO 6:DEBUG)");
 	n = r_config_node_get (cfg, "log.level");
-	SETOPTIONS (n, "0", "1", "2", "3", "4", "5", NULL);
+	SETOPTIONS (n, "0", "1", "2", "3", "4", "5", "6", "7", NULL);
 	SETCB ("log.ts", "false", cb_config_log_ts, "Show timestamp in log messages");
 
 	SETICB ("log.traplevel", 0, cb_config_log_traplevel, "Log level for trapping R2 when hit");
@@ -4527,6 +4518,7 @@ R_API int r_core_config_init(RCore *core) {
 	SETCB ("log.source", "false", cb_log_source, "Show source [file:line] in the log message");
 	SETCB ("log.color", "true", cb_config_log_colors, "Should the log output use colors");
 	SETCB ("log.quiet", "false", cb_config_log_quiet, "Be quiet, dont log anything to console");
+	SETCB ("log.hints", "true", cb_config_log_hints, "Show best-practice hint messages (R_LOG_HINT)");
 	SETCB ("log.cons", "false", cb_config_log_cons, "Log messages using rcons (handy for monochannel r2pipe)");
 
 	// zign
@@ -4636,7 +4628,6 @@ R_API int r_core_config_init(RCore *core) {
 	RConfigNode *cmdpdc = NODECB ("cmd.pdc", "", &cb_cmdpdc);
 	SETDESC (cmdpdc, "select pseudo-decompiler command to run after pdc");
 	update_cmdpdc_options (core, cmdpdc);
-	SETB ("pdc.structured", "false", "emit structured if/else instead of goto in pdc (experimental)");
 	SETCB ("cmd.log", "", &cb_cmdlog, "every time a new T log is added run this command");
 	SETS ("cmd.prompt", "", "prompt commands");
 	SETCB ("cmd.repeat", "false", &cb_cmdrepeat, "empty command an alias for '..' (repeat last command)");

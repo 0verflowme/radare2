@@ -1,0 +1,345 @@
+NAME=x86_64 shared lib: aa names the plt stub of a locally defined function
+FILE=bins/elf/pltrel/add.so
+CMDS=<<EOF
+aa
+fs symbols
+f~plt.
+EOF
+EXPECT=<<EOF
+0x00001050 10 sym.plt.add2
+EOF
+RUN
+
+NAME=x86_64 shared lib: call through a local plt stub names its target
+FILE=bins/elf/pltrel/add.so
+CMDS=<<EOF
+aa
+pd 1 @ 0x1135
+EOF
+EXPECT=<<EOF
+|           0x00001135      e816ffffff     call sym.plt.add2
+EOF
+RUN
+
+NAME=x86_64 shared lib: the stub function takes the flag name
+FILE=bins/elf/pltrel/add.so
+CMDS=<<EOF
+aa
+s 0x1050
+afn
+EOF
+EXPECT=<<EOF
+sym.plt.add2
+EOF
+RUN
+
+NAME=x86_64 shared lib: a locally defined stub target is not an import
+FILE=bins/elf/pltrel/add.so
+CMDS=<<EOF
+aa
+ii~add2
+EOF
+EXPECT=<<EOF
+EOF
+RUN
+
+NAME=glibc ld.so: interposable locals get their plt stubs named
+FILE=bins/elf/ld-2.31.so
+CMDS=<<EOF
+e anal.vars=false
+aa
+fs symbols
+f~plt.
+EOF
+EXPECT=<<EOF
+0x00002080 11 sym.plt.free
+0x00002090 11 sym.plt._dl_catch_exception
+0x000020a0 11 sym.plt.malloc
+0x000020b0 11 sym.plt._dl_signal_exception
+0x000020c0 11 sym.plt.calloc
+0x000020d0 11 sym.plt.realloc
+0x000020e0 11 sym.plt._dl_signal_error
+0x000020f0 11 sym.plt._dl_catch_error
+EOF
+RUN
+
+NAME=aarch64: adrp+ldr stubs of local functions get named
+FILE=bins/elf/librsjni_androix.so
+CMDS=<<EOF
+aa
+fs symbols
+f~plt.
+EOF
+EXPECT=<<EOF
+0x0000b7f0 16 sym.plt._Z11loadSymbolsPvR13dispatchTablei
+0x0000b830 16 sym.plt._Z14loadIOSuppSymsPvR8ioSuppDT
+EOF
+RUN
+
+NAME=x86_64 caller forwarding its args through a local plt stub inherits them
+FILE=bins/elf/pltrel/add.so
+ARGS=-e io.cache=true
+CMDS=<<EOF
+wx e832ffffffc3 @ 0x1119
+aa
+afs @ 0x1119
+EOF
+EXPECT=<<EOF
+void sym.add (int64_t arg1, int64_t arg2);
+EOF
+RUN
+
+NAME=plt stub args survive a non default base address
+FILE=bins/elf/pltrel/add.so
+ARGS=-B 0x400000 -e io.cache=true
+CMDS=<<EOF
+wx e832ffffffc3 @ 0x401119
+aa
+fs symbols
+f~plt.
+afs @ 0x401119
+EOF
+EXPECT=<<EOF
+0x00401050 10 sym.plt.add2
+void sym.add (int64_t arg1, int64_t arg2);
+EOF
+RUN
+
+NAME=a typedef prototype propagates through a local plt stub by name
+FILE=bins/elf/pltrel/add.so
+ARGS=-e io.cache=true
+CMDS=<<EOF
+"td int add2(int a, int b);"
+wx e832ffffffc3 @ 0x1119
+aa
+afs @ 0x1119
+EOF
+EXPECT=<<EOF
+void sym.add (int a, int b);
+EOF
+RUN
+
+NAME=x86_64 caller that sets up its own arg registers is unaffected by stubs
+FILE=bins/elf/pltrel/add.so
+CMDS=<<EOF
+aa
+afs @ sym.add
+EOF
+EXPECT=<<EOF
+void sym.add (int64_t arg1, int64_t arg2);
+EOF
+RUN
+
+NAME=anal.plt=false disables local plt stub naming
+FILE=bins/elf/pltrel/add.so
+ARGS=-e anal.plt=false
+CMDS=<<EOF
+aa
+fs symbols
+f~plt.~?
+EOF
+EXPECT=<<EOF
+0
+EOF
+RUN
+
+NAME=imports-only executable grows no local plt stubs
+FILE=bins/elf/crackme0x05
+CMDS=<<EOF
+aa
+fs symbols
+f~plt.~?
+EOF
+EXPECT=<<EOF
+0
+EOF
+RUN
+
+NAME=ppc64 ELFv1 text stubs come flagged from the bin layer
+FILE=bins/elf/ppc64v1-libz.so
+CMDS=<<EOF
+aa
+fs symbols
+f~plt.~?
+EOF
+EXPECT=<<EOF
+50
+EOF
+RUN
+
+NAME=glibc libc.so: local jump-slot and plt.got stubs both get named
+FILE=bins/elf/libc-2.31.so
+CMDS=<<EOF2
+e anal.vars=false
+aa
+fs symbols
+f~plt.
+EOF2
+EXPECT=<<EOF2
+0x00025310 11 sym.plt.malloc
+0x00025330 11 sym.plt.free
+0x00025370 11 sym.plt.realloc
+0x00025400 11 sym.plt.memalign
+0x00025550 11 sym.plt.calloc
+EOF2
+RUN
+
+NAME=ppc64 ELFv1 caller inherits args through a plt call stub
+FILE=bins/elf/ppc64v1-libz.so
+CMDS=<<EOF2
+aa
+afs @ sym.crc32
+afs @ sym.compress
+afs @ sym.gzgetc_
+afs @ sym.crc32_z
+EOF2
+EXPECT=<<EOF2
+void sym.crc32 (int64_t arg1, int64_t arg2, int64_t arg3);
+void sym.compress (int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4);
+void sym.gzgetc_ (int64_t arg1);
+void sym.crc32_z (int64_t arg1, int64_t arg2, int64_t arg3);
+EOF2
+RUN
+
+NAME=ppc64 ELFv1 forwarded args keep the register of the callee arg they inherit
+FILE=bins/elf/ppc64v1-libz.so
+CMDS=<<EOF2
+aa
+afva @ sym.crc32
+afvr @ sym.crc32
+EOF2
+EXPECT=<<EOF2
+arg int64_t arg1 @ r3
+arg int64_t arg2 @ r4
+arg int64_t arg3 @ r5
+EOF2
+RUN
+
+NAME=x86_64 tail jump through a local plt stub inherits the target args
+FILE=bins/elf/pltrel/add2.so
+CMDS=<<EOF
+aa
+afvr @ sym.add
+EOF
+EXPECT=<<EOF
+arg int64_t arg1 @ rdi
+EOF
+RUN
+
+NAME=ppc64 ELFv1 import stub takes the prototype of the import it branches to
+FILE=bins/elf/ppc64v1-libz.so
+CMDS=<<EOF2
+aa
+afvr @ sym.plt.memcpy
+EOF2
+EXPECT=<<EOF2
+arg void * s1 @ r3
+arg const void * s2 @ r4
+arg size_t n @ r5
+EOF2
+RUN
+
+NAME=ppc64 ELFv1 stub args survive a non default base address
+FILE=bins/elf/ppc64v1-libz.so
+ARGS=-B 0x400000
+CMDS=<<EOF2
+aa
+afs @ sym.crc32
+afs @ sym.compress
+EOF2
+EXPECT=<<EOF2
+void sym.crc32 (int64_t arg1, int64_t arg2, int64_t arg3);
+void sym.compress (int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4);
+EOF2
+RUN
+
+NAME=ppc64 ELFv1 call through a text stub names its target
+FILE=bins/elf/ppc64v1-libz.so
+CMDS=<<EOF2
+aa
+pd 1 @ 0x52dc
+EOF2
+EXPECT=<<EOF2
+|           0x000052dc      4bffe7e5       bl sym.plt.crc32_z
+EOF2
+RUN
+
+# the scan flags 12 bytes here, up to the call; the 17 below is what the later
+# function analysis resizes the flag to
+NAME=x86_64 lazy retpoline: stubs calling the shared thunk get named
+FILE=bins/elf/pltrel/x86_64-retpoline.so
+CMDS=<<EOF
+aa
+fs symbols
+f~plt.
+EOF
+EXPECT=<<EOF
+0x000014b0 17 sym.plt.add2
+0x000014d0 17 sym.plt.mul2
+0x000014f0 17 sym.plt.sub2
+EOF
+RUN
+
+NAME=x86_64 lazy retpoline: a call through the stub reads its target name
+FILE=bins/elf/pltrel/x86_64-retpoline.so
+CMDS=<<EOF
+aa
+pd 1 @ 0x144b
+EOF
+EXPECT=<<EOF
+|           0x0000144b      e860000000     call sym.plt.add2
+EOF
+RUN
+
+NAME=x86_64 retpoline with -z now: stubs jumping to the shared thunk get named
+FILE=bins/elf/pltrel/x86_64-retpoline-now.so
+CMDS=<<EOF
+aa
+fs symbols
+f~plt.
+EOF
+EXPECT=<<EOF
+0x00001460 12 sym.plt.add2
+0x00001470 12 sym.plt.mul2
+0x00001480 12 sym.plt.sub2
+EOF
+RUN
+
+NAME=x86_64 retpoline with -z now: a call through the stub reads its target name
+FILE=bins/elf/pltrel/x86_64-retpoline-now.so
+CMDS=<<EOF
+aa
+pd 1 @ 0x140b
+EOF
+EXPECT=<<EOF
+|           0x0000140b      e850000000     call sym.plt.add2
+EOF
+RUN
+
+# 75 e7 is a jne to the same thunk the call at 0x14b7 reaches, then nop padding
+NAME=x86_64 retpoline: a conditional branch to the thunk does not name a stub
+FILE=bins/elf/pltrel/x86_64-retpoline.so
+ARGS=-e io.cache=true
+CMDS=<<EOF
+wx 75e7909090 @ 0x14b7
+aa
+fs symbols
+f~plt.
+EOF
+EXPECT=<<EOF
+0x000014d0 17 sym.plt.mul2
+0x000014f0 17 sym.plt.sub2
+EOF
+RUN
+
+NAME=x86_64 plt stubs keep their names with bin.relocs.apply
+FILE=bins/elf/pltrel/add.so
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+aaa
+afl~sym.plt.
+EOF
+EXPECT=<<EOF
+0x00001050    1     10 sym.plt.add2
+EOF
+RUN

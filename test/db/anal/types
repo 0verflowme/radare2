@@ -26,7 +26,7 @@ var int64_t var_10h @ sp+0x10
 |           0x100003f78      08b13e91       add x8, x8, 0xfac
 |           0x100003f7c      e80700f9       str x8, [ptr]
 |           0x100003f80      e10740f9       ldr x1, [ptr]              ; const char *ptr
-|           0x100003f84      20008052       mov w0, 1
+|           0x100003f84      20008052       mov w0, 1                  ; int fd
 |           0x100003f88      420180d2       mov x2, 0xa                ; size_t nbytes
 |           0x100003f8c      05000094       bl sym.imp.write           ; ssize_t write(int fd, const char *ptr, size_t nbytes)
 |           0x100003f90      00008052       mov w0, 0
@@ -98,6 +98,75 @@ struct Outer {
 struct Inner {
   char pad2[16];
   char *field_16;
+};
+EOF
+RUN
+
+NAME=arm64 field propagation follows a const interface wrapper
+FILE=malloc://64
+ARGS=-a arm -b 64 -e types.fields=true
+CMDS=<<EOF
+wa ldr x2, [x0]
+wa ldr x0, [x2, 0x10] @ 4
+wa bl 0x20 @ 8
+wa ret @ 0xc
+wa ret @ 0x20
+af @ 0x20
+afn helper @ 0x20
+af @ 0
+afn caller @ 0
+"td struct Table { char pad[16]; int slot; };"
+"td struct Wrapper { const struct Table *functions; };"
+"td typedef struct Wrapper Env;"
+afs int helper(char *s) @ 0x20
+afvt arg1 "Env *" @ 0
+aei
+aeim
+aaft
+aaft
+tsc Wrapper
+tsc Table
+EOF
+EXPECT=<<EOF
+struct Wrapper {
+  const struct Table *functions;
+};
+struct Table {
+  char pad[16];
+  char *slot;
+};
+EOF
+RUN
+
+NAME=arm64 field propagation follows a copied const interface wrapper
+FILE=malloc://64
+ARGS=-a arm -b 64 -e types.fields=true
+CMDS=<<EOF
+wa mov x19, x0
+wa ldr x2, [x19] @ 4
+wa ldr x0, [x2, 0x10] @ 8
+wa bl 0x20 @ 0xc
+wa ret @ 0x10
+wa ret @ 0x20
+af @ 0x20
+afn helper @ 0x20
+af @ 0
+afn caller @ 0
+"td struct Table { char pad[16]; int slot; };"
+"td struct Wrapper { const struct Table *functions; };"
+"td typedef struct Wrapper Env;"
+afs int helper(char *s) @ 0x20
+afvt arg1 "Env *" @ 0
+aei
+aeim
+aaft
+aaft
+tsc Table
+EOF
+EXPECT=<<EOF
+struct Table {
+  char pad[16];
+  char *slot;
 };
 EOF
 RUN

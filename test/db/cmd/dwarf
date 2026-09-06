@@ -132,7 +132,7 @@ line: 11
 colu: 1
 addr: 0x00001186
 - offset -  6061 6263 6465 6667 6869 6A6B 6C6D 6E6F  0123456789ABCDEF  comment
-0x00001060  f30f 1efa 31ed 4989 d15e 4889 e248 83e4  ....1.I..^H..H..  ; rip ; [16] -r-x section size 294 named .text ; arg3
+0x00001060  f30f 1efa 31ed 4989 d15e 4889 e248 83e4  ....1.I..^H..H..  ; rip ; [16] -r-x section size 294 named .text ; arg1
 0x00001070  f050 5445 31c0 31c9 488d 3de9 0000 00ff  .PTE1.1.H.=.....
 0x00001080  1553 2f00 00f4 662e 0f1f 8400 0000 0000  .S/...f.........
 0x00001090  488d 3d79 2f00 0048 8d05 722f 0000 4839  H.=y/..H..r/..H9  ; sym.deregister_tm_clones
@@ -248,13 +248,13 @@ EXPECT=<<EOF
 |           0x00001243      53             push rbx
 |           0x00001244      4883ec28       sub rsp, 0x28
 |           0x00001248      bf08000000     mov edi, 8
-|           0x0000124d      e81efeffff     call sym.imp.operator_new_unsigned_long_
+|           0x0000124d      e81efeffff     call sym.imp.operator_new_unsigned_long_ ; operator new(unsigned long)
 |           0x00001252      4889c3         mov rbx, rax
 |           0x00001255      4889df         mov rdi, rbx                ; int64_t arg1
 |           0x00001258      e827010000     call dbg.Bird::Bird()
 |           0x0000125d      48895de0       mov qword [b], rbx
 |           0x00001261      bf08000000     mov edi, 8
-|           0x00001266      e805feffff     call sym.imp.operator_new_unsigned_long_
+|           0x00001266      e805feffff     call sym.imp.operator_new_unsigned_long_ ; operator new(unsigned long)
 EOF
 RUN
 
@@ -304,7 +304,8 @@ EXPECT=<<EOF
 |           ; var int64_t var_68h @ rsp+0x68
 |           ; var int64_t var_70h @ rsp+0x70
 |           ; var int64_t var_78h @ rsp+0x78
-|           ; var i32[11] numbers @ rsp+0x80
+|           ; var i32[10] numbers @ rsp+0x80
+|           ; var int64_t var_a8h @ rsp+0xa8
 |           ; var int64_t var_d8h @ rsp+0xd8
 |           ; var int64_t var_e0h @ rsp+0xe0
 |           ; var int64_t var_e8h @ rsp+0xe8
@@ -312,7 +313,7 @@ EXPECT=<<EOF
 |           ; var int64_t var_120h @ rsp+0x120
 |           ; var int64_t var_128h @ rsp+0x128
 |           ; var int64_t var_130h @ rsp+0x130
-|           ; var &str[6] strings @ rsp+0x138
+|           ; var &str[5] strings @ rsp+0x138
 |           ; var int64_t var_140h @ rsp+0x140
 |           ; var int64_t var_148h @ rsp+0x148
 |           ; var int64_t var_150h @ rsp+0x150
@@ -333,7 +334,7 @@ EXPECT=<<EOF
 |           ; var int64_t var_218h @ rsp+0x218
 |           ; var int64_t var_220h @ rsp+0x220
 |           ; var int64_t var_228h @ rsp+0x228
-|           ; var &str[6] *arg0 @ rsp+0x230
+|           ; var &str[5] *arg0 @ rsp+0x230
 |           0x00005750      4881ec3802..   sub rsp, 0x238              ; void main();
 |           0x00005757      c784248000..   mov dword [numbers], 8
 |           0x00005762      c784248400..   mov dword [numbers[1]], 7
@@ -361,7 +362,7 @@ EXPECT=<<EOF
 |           0x00005817      488b4c2468     mov rcx, qword [var_68h]
 |           0x0000581c      48898c24e0..   mov qword [var_e0h], rcx
 |           0x00005824      488d9424d8..   lea rdx, [var_d8h]
-|           0x0000582c      488dbc24a8..   lea rdi, [numbers[10]]      ; int64_t arg1
+|           0x0000582c      488dbc24a8..   lea rdi, [var_a8h]          ; int64_t arg1
 |           0x00005834      488b742478     mov rsi, qword [var_78h]    ; int64_t arg2
 |           0x00005839      41b802000000   mov r8d, 2
 |           0x0000583f      4889542460     mov qword [var_60h], rdx
@@ -369,7 +370,7 @@ EXPECT=<<EOF
 |           0x00005847      488b4c2460     mov rcx, qword [var_60h]    ; int64_t arg4
 |           0x0000584c      41b801000000   mov r8d, 1                  ; int64_t arg5
 |           0x00005852      e8591b0000     call dbg.new_v1             ; core::fmt::Arguments::new_v1::h2673b5bf555c0288 ; Arguments new_v1(&[&str] pieces, &[core::fmt::ArgumentV1] args)
-|           0x00005857      488dbc24a8..   lea rdi, [numbers[10]]
+|           0x00005857      488dbc24a8..   lea rdi, [var_a8h]
 |           0x0000585f      ff15b3430300   call qword [dbg._print]     ; [0x39c18:8]=0xa2d0 dbg._print
 |           0x00005865      488d842480..   lea rax, [numbers]
 |           0x0000586d      4889c7         mov rdi, rax                ; int64_t arg1
@@ -507,7 +508,6 @@ aaa
 pdf @  dbg.init
 EOF
 EXPECT=<<EOF
-            ;-- method.Grid.init__:
             ;-- Grid::init():
             ; CALL XREF from dbg.main @ 0x10001ae8(x)
 / 64: void dbg.init (Grid * const this);
@@ -655,7 +655,9 @@ EOF
 EXPECT=<<EOF
             ;-- unit p(mozgkigyo palya(smallint,smallint)):
             ; CALL XREFS from dbg.$main @ 0x405237(x), 0x40542d(x), 0x405ba3(x), 0x406e29(x)
-/ 439: dbg.palya() (SmallInt szel, SmallInt mag);
+/ 439: dbg.palya() (int64_t arg1, int64_t arg2, SmallInt szel, SmallInt mag);
+|           ; arg int64_t arg1 @ rdi
+|           ; arg int64_t arg2 @ rsi
 |           ; arg SmallInt szel @ rbp+0x10
 |           ; arg SmallInt mag @ rbp+0x8
 |           ; var SmallInt i @ rbp-0x14
@@ -666,11 +668,11 @@ EXPECT=<<EOF
 |           0x00401984      488d6424d0     lea rsp, [rsp - 0x30]
 |           0x00401989      48895dd8       mov qword [var_28h], rbx
 |           0x0040198d      4c8965e0       mov qword [var_20h], r12
-|           0x00401991      66897df8       mov word [mag], di
-|           0x00401995      668975f0       mov word [szel], si
+|           0x00401991      66897df8       mov word [mag], di          ; arg1
+|           0x00401995      668975f0       mov word [szel], si         ; arg2
 |           0x00401999      b801000000     mov eax, 1
 |           0x0040199e      bf01000000     mov edi, 1                  ; int64_t arg1
-|           0x004019a3      89c6           mov esi, eax                ; int64_t arg_8h
+|           0x004019a3      89c6           mov esi, eax                ; int64_t arg2
 |           0x004019a5      e8b6a10200     call sym.CRT____GOTOXY_TCRTCOORD_TCRTCOORD ; unit crt gotoxy(tcrtcoord,tcrtcoord)
 |           0x004019aa      66448b65f0     mov r12w, word [szel]
 |           0x004019af      66c745ec0100   mov word [i], 1
@@ -682,5 +684,47 @@ EXPECT=<<EOF
 |       |   ; CODE XREF from unit p$mozgkigyo palya(smallint,smallint) @ 0x4019ff(x)
 |       |   0x004019c8      668145ec0100   add word [i], 1
 |       |   0x004019ce      e82d280200     call sym.fpc_get_output     ; fpc_get_output()
+EOF
+RUN
+
+NAME=dwarf formal parameter without location
+FILE=bins/elf/dwarf_rust_bubble
+CMDS=<<EOF
+aaa
+afvr @ 0x00010be0
+EOF
+EXPECT=<<EOF
+arg &str msg @ rdi
+arg int64_t arg2 @ rsi
+arg int64_t arg3 @ rdx
+EOF
+RUN
+
+NAME=dwarf float formal keeps out of the integer slots
+FILE=bins/elf/dwarf_go_tree
+CMDS=<<EOF
+aaa > /dev/null
+afvr @ 0x0048a1b0
+EOF
+EXPECT=<<EOF
+arg int64_t arg1 @ rdi
+arg int64_t arg2 @ rsi
+arg int prec @ r8
+var []uint8 dst @ rdx
+var int i @ rcx
+var bool hasDecimalPoint @ r9
+var []uint8 tail @ r10
+EOF
+RUN
+
+NAME=a base type spelled with spaces keeps its width
+FILE=bins/elf/ppc64_sudoku_dwarf
+CMDS=<<EOF
+k anal/types/long unsigned int
+tss long unsigned int
+EOF
+EXPECT=<<EOF
+type
+8
 EOF
 RUN

@@ -221,6 +221,7 @@ typedef struct r_io_plugin_t {
 	bool (*accept)(RIO *io, RIODesc *desc, int fd);
 	int (*create)(RIO *io, const char *file, int mode, int type);
 	bool (*check)(RIO *io, const char *, bool many);
+	const char *binuris; // comma-separated URI prefixes accepted from bin redirects
 } RIOPlugin;
 
 #define	R_IO_MAP_TIE_FLG_BACK	1		//ties a map so that it resizes when the desc resizes
@@ -319,7 +320,8 @@ typedef ut64(*RIODescSize)(RIODesc *desc);
 typedef RIODesc *(*RIOOpen)(RIO *io, const char *uri, int flags, int mode);
 typedef RIODesc *(*RIOOpenAt)(RIO *io, const  char *uri, int flags, int mode, ut64 at);
 typedef bool (*RIOClose)(RIO *io, int fd);
-typedef bool (*RIOReadAt)(RIO *io, ut64 addr, ut8 *buf, int len);
+// Returns the number of bytes in the contiguous read prefix, or -1 on error.
+typedef int (*RIOReadAt)(RIO *io, ut64 addr, ut8 *buf, int len);
 typedef bool (*RIOWriteAt)(RIO *io, ut64 addr, const ut8 *buf, int len);
 typedef bool (*RIOOverlayWriteAt)(RIO *io, ut64 addr, const ut8 *buf, int len);
 typedef char *(*RIOSystem)(RIO *io, const char* cmd);
@@ -588,6 +590,7 @@ R_API bool r_io_cache_writable(RIO *io);
 // apply patches in given buffer
 R_API bool r_io_cache_write_at(RIO *io, ut64 addr, const ut8 *buf, int len);
 R_API bool r_io_cache_read_at(RIO *io, ut64 addr, ut8 *buf, int len);
+R_IPI int r_io_cache_nread_at(RIO *io, ut64 addr, ut8 *buf, int len);
 // invalidate ranges and commit to io
 R_API int r_io_cache_invalidate(RIO *io, ut64 from, ut64 to, bool many);
 R_API void r_io_cache_commit(RIO *io, ut64 from, ut64 to, bool many);
@@ -654,6 +657,7 @@ extern RIOPlugin r_io_plugin_ebpf;
 extern RIOPlugin r_io_plugin_malloc;
 extern RIOPlugin r_io_plugin_sparse;
 extern RIOPlugin r_io_plugin_ptrace;
+extern RIOPlugin r_io_plugin_haiku;
 extern RIOPlugin r_io_plugin_w32dbg;
 extern RIOPlugin r_io_plugin_windbg;
 extern RIOPlugin r_io_plugin_mach;

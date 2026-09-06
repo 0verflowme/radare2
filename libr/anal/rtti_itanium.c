@@ -79,7 +79,7 @@ static bool rtti_itanium_read_type_name(RVTableContext *context, ut64 addr, clas
 	at &= ~unique_mask;
 	cti->name_addr = at;
 	ut8 buf[NAME_BUF_SIZE];
-	if (!context->anal->iob.read_at (context->anal->iob.io, at, buf, sizeof (buf))) {
+	if (context->anal->iob.read_at (context->anal->iob.io, at, buf, sizeof (buf)) != sizeof (buf)) {
 		return false;
 	}
 	buf[NAME_BUF_SIZE - 1] = 0;
@@ -101,7 +101,7 @@ static char *rtti_itanium_read_type_name_custom(RVTableContext *context, ut64 ad
 	at &= ~unique_mask;
 	*str_addr = at;
 	ut8 buf[NAME_BUF_SIZE];
-	if (!context->anal->iob.read_at (context->anal->iob.io, at, buf, sizeof (buf))) {
+	if (context->anal->iob.read_at (context->anal->iob.io, at, buf, sizeof (buf)) != sizeof (buf)) {
 		return NULL;
 	}
 	buf[NAME_BUF_SIZE - 1] = 0;
@@ -762,7 +762,19 @@ static void recovery_apply_vtable(RVTableContext *context, const char *class_nam
 		return;
 	}
 
-	RAnalVTable vtable = { .id = NULL, .offset = 0, .size = 0, .addr = vtable_info->saddr};
+	ut64 raw_offset_to_top = 0;
+	context->read_addr (context->anal,
+		vtable_info->saddr - 2 * context->word_size, &raw_offset_to_top);
+	const st64 offset_to_top = context->word_size == 4
+		? (st64)(st32)raw_offset_to_top
+		: (st64)raw_offset_to_top;
+	const ut64 class_offset = offset_to_top < 0? (ut64)-offset_to_top: 0;
+	RAnalVTable vtable = {
+		.id = NULL,
+		.offset = class_offset,
+		.size = RVecRVTableMethodInfo_length (&vtable_info->methods) * context->word_size,
+		.addr = vtable_info->saddr
+	};
 	r_anal_class_vtable_set (context->anal, class_name, &vtable);
 	r_anal_class_vtable_fini (&vtable);
 
@@ -771,7 +783,10 @@ static void recovery_apply_vtable(RVTableContext *context, const char *class_nam
 		RAnalMethod meth;
 		meth.addr = vmeth->addr;
 		meth.vtable_offset = vmeth->vtable_offset;
-		meth.name = r_str_newf ("virtual_%" PFMT64d, meth.vtable_offset);
+		meth.vtable_addr = vtable_info->saddr;
+		meth.name = class_offset
+			? r_str_newf ("virtual_%"PFMT64u"_%"PFMT64d, class_offset, meth.vtable_offset)
+			: r_str_newf ("virtual_%"PFMT64d, meth.vtable_offset);
 		r_anal_class_method_set (context->anal, class_name, &meth);
 		r_anal_class_method_fini (&meth);
 	}
@@ -806,8 +821,14 @@ static void add_class_bases(RVTableContext *context, const class_type_info *cti)
 			base_class_type_info *base_class_info = vmi_class->vmi_bases + i;
 			ut64 base_addr = base_class_info->base_class_addr + VT_WORD_SIZE (context); // offset to name
 			if (rtti_itanium_read_type_name (context, base_addr, &base_info)) {
-				// TODO in future, store the RTTI offset from vtable and use it
-				RAnalBaseClass base = { .class_name = base_info.name, .offset = 0 };
+				const st64 offset = (st64)(base_class_info->flags >> 8);
+				const bool is_virtual = base_class_info->flags & base_is_virtual;
+				RAnalBaseClass base = {
+					.class_name = base_info.name,
+					// A virtual base stores a vtable displacement here rather than a
+					// fixed object offset, which RAnalBaseClass cannot represent.
+					.offset = !is_virtual && offset >= 0? offset: 0,
+				};
 				r_anal_class_base_set (context->anal, cti->name, &base);
 				r_anal_class_base_fini (&base);
 			}

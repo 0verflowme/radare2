@@ -1,0 +1,169 @@
+NAME=aarch64 24-byte plt stride: imports land on their entries
+FILE=bins/elf/ls-toybox
+CMDS=<<EOF
+f~sym.imp.__libc_init
+f~sym.imp.__strchr_chk
+f~sym.imp.strtol
+EOF
+EXPECT=<<EOF
+0x000758e0 16 sym.imp.__libc_init
+0x000758f8 16 sym.imp.__strchr_chk
+0x00075910 16 sym.imp.strtol
+0x00075c10 16 sym.imp.strtoll
+0x00076f00 16 sym.imp.strtold
+EOF
+RUN
+
+NAME=aarch64 24-byte plt stride: the flagged entry decodes as a stub
+FILE=bins/elf/ls-toybox
+CMDS=<<EOF
+pd 2 @ 0x758f8
+EOF
+EXPECT=<<EOF
+            ;-- __strchr_chk:
+            0x000758f8      300000d0       adrp x16, 0x7b000
+            0x000758fc      114642f9       ldr x17, [x16, 0x488]
+EOF
+RUN
+
+NAME=aarch64 16-byte plt stride keeps its entry math
+FILE=bins/elf/libarm64.so
+CMDS=<<EOF
+f~sym.imp.__cxa_finalize
+f~sym.imp.__stack_chk_fail
+EOF
+EXPECT=<<EOF
+0x000006c0 16 sym.imp.__cxa_finalize
+0x000006d0 16 sym.imp.__stack_chk_fail
+EOF
+RUN
+
+NAME=ppc32 be: imports resolve to their plt_pic32 call thunks
+FILE=bins/elf/pltrel/ppc32be-plt.so
+CMDS=<<EOF2
+ii
+is~plt_pic32.ext
+EOF2
+EXPECT=<<EOF2
+nth vaddr      bind   type   lib name
+-------------------------------------
+1   0x0001040c GLOBAL NOTYPE     ext1
+2   0x0001041c GLOBAL NOTYPE     ext2
+3   0x0000040c 0x0001040c LOCAL  FUNC   16       00000000.plt_pic32.ext1
+4   0x0000041c 0x0001041c LOCAL  FUNC   16       00000000.plt_pic32.ext2
+EOF2
+RUN
+
+NAME=ppc32 le: imports resolve to their plt_pic32 call thunks
+FILE=bins/elf/pltrel/ppc32le-plt.so
+CMDS=<<EOF2
+ii
+EOF2
+EXPECT=<<EOF2
+nth vaddr      bind   type   lib name
+-------------------------------------
+1   0x0001040c GLOBAL NOTYPE     ext1
+2   0x0001041c GLOBAL NOTYPE     ext2
+EOF2
+RUN
+
+NAME=ppc32 exe with absolute glink stubs keeps the legacy import math
+FILE=bins/elf/powerpc-linux-gnu-symexec-palindrome
+CMDS=<<EOF2
+ii~fgets,puts,strlen
+EOF2
+EXPECT=<<EOF2
+1   0x10000810 GLOBAL FUNC       fgets
+3   0x10000830 GLOBAL FUNC       puts
+5   0x10000850 GLOBAL FUNC       strlen
+EOF2
+RUN
+
+NAME=ppc32 bss-plt keeps its unresolved imports
+FILE=bins/elf/hello.ppc
+CMDS=<<EOF2
+ii~printf
+EOF2
+EXPECT=<<EOF2
+1   ---------- GLOBAL FUNC       printf
+EOF2
+RUN
+
+NAME=ppc64 ELFv1: lazy plt_call stubs in .text are named after their slot target
+FILE=bins/elf/ppc64v1-libz.so
+CMDS=<<EOF2
+is~plt.~?
+is~plt.crc32_z
+EOF2
+EXPECT=<<EOF2
+50
+29  0x00003ac0 0x00003ac0 GLOBAL FUNC   28        plt.crc32_z
+EOF2
+RUN
+
+NAME=ppc64 ELFv1: eager addis+bctr stubs resolve their slot through the toc
+FILE=bins/elf/ppc64v1-more
+CMDS=<<EOF2
+is~plt.~?
+is~plt.feof
+EOF2
+EXPECT=<<EOF2
+113
+3   0x00003100 0x00003100 GLOBAL FUNC   24       plt.feof
+EOF2
+RUN
+
+NAME=ppc64 ELFv1: section-less binaries fall back to the executable segments
+FILE=bins/elf/ppc64v1-libz-noshdr.so
+CMDS=<<EOF
+iS~.text~?
+is~plt.~?
+is~plt.crc32_z
+EOF
+EXPECT=<<EOF
+0
+48
+29  0x00003ac0 0x00003ac0 GLOBAL FUNC   28        plt.crc32_z
+EOF
+RUN
+
+NAME=ppc64 ELFv1: --plt-static-chain env loads are accepted in both orders
+FILE=bins/elf/ppc64v1-libz-static-chain.so
+CMDS=<<EOF
+is~plt.~?
+is~plt.crc32_z
+o bins/elf/ppc64v1-libz-static-chain-shared.so
+is~plt.~?
+is~plt.crc32_z
+EOF
+EXPECT=<<EOF
+50
+29  0x00003ac0 0x00003ac0 GLOBAL FUNC   32        plt.crc32_z
+50
+29  0x00003ac0 0x00003ac0 GLOBAL FUNC   32        plt.crc32_z
+EOF
+RUN
+
+NAME=ppc64 ELFv1: a 20-byte eager stub that fills the whole .text is named
+FILE=bins/elf/ppc64v1-stub-eagerend.so
+CMDS=<<EOF
+is~plt.~?
+is~plt.leaf
+EOF
+EXPECT=<<EOF
+1
+4   0x000002a0 0x000002a0 GLOBAL FUNC   20       plt.leaf
+EOF
+RUN
+
+NAME=ppc64 ELFv1: a bogus .text size is clamped to the file, .init still scanned
+FILE=bins/elf/ppc64v1-libz-badshdr.so
+CMDS=<<EOF
+is~plt.~?
+is~plt.__gmon_start__
+EOF
+EXPECT=<<EOF
+1
+12  0x00003a00 0x00003a00 WEAK   FUNC   28        plt.__gmon_start__
+EOF
+RUN

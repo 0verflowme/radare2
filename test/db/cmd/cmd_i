@@ -527,38 +527,35 @@ pthread_mutex_unlock
 0x00012c54 28 std::bad_typeid::~bad_typeid()
 0x00014b58 15 typeinfo name for std::bad_typeid
 --
-0x00000000 [0x00006060 - 0x0000697c] jni _JNIEnv
-0x00000000 [0x0000699c - 0x000074f8] jni SystemClassLoaderInjector
-0x00000000 [0x0000886c - 0x000094c8] c++ std
-0x00000000 [0x00008884 - 0x000088f4] c++ std::exception
-0x00000000 [0x0000889c - 0x00008904] c++ std::bad_exception
-0x00000000 [0x000088c4 - 0x000088c4] c++ __cxxabiv1::__forced_unwind
-0x00000000 [0x000088dc - 0x000088dc] c++ __cxxabiv1::__foreign_exception
-0x00000000 [0x00008984 - 0x00008984] c++ __eh_globals_init
-0x00000000 [0x0000943c - 0x00009488] c++ __cxxabiv1
-0x00000000 [0x000094e4 - 0x000094e4] c++ __cxxabiv1::__fundamental_type_info
-0x00000000 [0x000097bc - 0x00009854] c++ std::type_info
-0x00000000 [0x00009528 - 0x00009574] c++ __cxxabiv1::__pointer_type_info
-0x00000000 [0x00009dd0 - 0x00009e34] c++ __cxxabiv1::__pbase_type_info
-0x00000000 [0x000095f4 - 0x0000977c] c++ __cxxabiv1::__si_class_type_info
-0x00000000 [0x00009868 - 0x0000998c] c++ __cxxabiv1::__class_type_info
-0x00000000 [0x00009ec4 - 0x000127c8] c++ __gnu_cxx
-0x00000000 [0x000126b0 - 0x000126f8] c++ __gnu_cxx::__concurrence_lock_error
-0x00000000 [0x000126c0 - 0x000126d0] c++ __gnu_cxx::__concurrence_unlock_error
-0x00000000 [0x00012bc8 - 0x00012bd8] c++ std::bad_cast
-0x00000000 [0x00012c1c - 0x00012c2c] c++ std::bad_typeid
+0x00006060 [0x00006060 - 0x0000699a] jni _JNIEnv
+0x000074f8 [0x0000699c - 0x0000755c] jni SystemClassLoaderInjector
+0x00008884 [0x00008884 - 0x00008930] c++ std::exception
+0x0000889c [0x0000889c - 0x0000894c] c++ std::bad_exception
+0x000088c4 [0x000088c4 - 0x00008968] c++ __cxxabiv1::__forced_unwind
+0x000088dc [0x000088dc - 0x00008984] c++ __cxxabiv1::__foreign_exception
+0x00008984 [0x00008984 - 0x000089b8] c++ __eh_globals_init
+0x000094e4 [0x000094e4 - 0x00009528] c++ __cxxabiv1::__fundamental_type_info
+0x000097bc [0x000097bc - 0x00009858] c++ std::type_info
+0x00009528 [0x00009528 - 0x000095f4] c++ __cxxabiv1::__pointer_type_info
+0x00009df0 [0x00009dd0 - 0x00009ec4] c++ __cxxabiv1::__pbase_type_info
+0x000095f4 [0x000095f4 - 0x000097bc] c++ __cxxabiv1::__si_class_type_info
+0x000098d8 [0x00009868 - 0x000099fc] c++ __cxxabiv1::__class_type_info
+0x000126b0 [0x000126b0 - 0x00012780] c++ __gnu_cxx::__concurrence_lock_error
+0x000126c0 [0x000126c0 - 0x00012750] c++ __gnu_cxx::__concurrence_unlock_error
+0x00012bd8 [0x00012bc8 - 0x00012c1c] c++ std::bad_cast
+0x00012c2c [0x00012c1c - 0x00012c70] c++ std::bad_typeid
 --
 0x00006060 10 _JNIEnv::FindClass(char const*)
 0x00007c7a 10 __aeabi_unwind_cpp_pr1
 0x0000606a 10 _JNIEnv::DeleteLocalRef(_jobject*)
-0x00006074 26 _JNIEnv::NewObject(_jclass*, _jmethodID*, ...)
+0x00006074 26 _JNIEnv::NewObject(_jclass*, _jmethodID*, ::)
 0x0000608e 10 _JNIEnv::GetObjectClass(_jobject*)
 0x00006098 12 _JNIEnv::GetMethodID(_jclass*, char const*, char const*)
 0x00007c70 10 __aeabi_unwind_cpp_pr0
-0x000060a4 28 _JNIEnv::CallObjectMethod(_jobject*, _jmethodID*, ...)
-0x000060c0 28 _JNIEnv::CallVoidMethod(_jobject*, _jmethodID*, ...)
+0x000060a4 28 _JNIEnv::CallObjectMethod(_jobject*, _jmethodID*, ::)
+0x000060c0 28 _JNIEnv::CallVoidMethod(_jobject*, _jmethodID*, ::)
 0x000060dc 14 _JNIEnv::GetStaticMethodID(_jclass*, char const*, char const*)
-0x000060ea 30 _JNIEnv::CallStaticObjectMethod(_jclass*, _jmethodID*, ...)
+0x000060ea 30 _JNIEnv::CallStaticObjectMethod(_jclass*, _jmethodID*, ::)
 0x00006108 48 getPackageName(_JNIEnv*, _jobject*)
 0x00006138 164 JstringToString(_JNIEnv*, _jstring*)
 0x000061dc 136 CharTojstring(_JNIEnv*, char const*)
@@ -579,8 +576,8 @@ pthread_mutex_unlock
 0x00006918 28 register_ndk_load(_JNIEnv*)
 0x00006934 40 JNI_OnLoad
 0x0000695c 2 decodeFile()
-0x0000695e 30 _JNIEnv::CallStaticIntMethod(_jclass*, _jmethodID*, ...)
-0x0000697c 30 _JNIEnv::CallStaticVoidMethod(_jclass*, _jmethodID*, ...)
+0x0000695e 30 _JNIEnv::CallStaticIntMethod(_jclass*, _jmethodID*, ::)
+0x0000697c 30 _JNIEnv::CallStaticVoidMethod(_jclass*, _jmethodID*, ::)
 0x0000699c 144 SystemClassLoaderInjector::findBaseDexClassloader(_JNIEnv*, _jobject*)
 0x00006a2c 144 SystemClassLoaderInjector::getField(_JNIEnv*, _jobject*, _jobject*, _jstring*)
 0x00006abc 56 SystemClassLoaderInjector::getPathList(_JNIEnv*, _jobject*)

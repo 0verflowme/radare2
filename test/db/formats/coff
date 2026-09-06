@@ -96,6 +96,14 @@ vaddr      paddr      type   ntype name
 EOF
 RUN
 
+NAME=tiny coff2 symbol language
+FILE=bins/coff/coff2.obj
+CMDS=e bin.lang
+EXPECT=<<EOF
+msvc
+EOF
+RUN
+
 NAME=tiny coff2
 FILE=bins/coff/coff2.obj
 CMDS=<<EOF
@@ -117,7 +125,7 @@ EXPECT=<<EOF
 0   0x00000d8f 0x00000c20 LOCAL  SECT 4        .text$mn
 0   0x00000ec2 0x00000d30 LOCAL  SECT 4        .text$mn
             ;-- section..text_mn_5:
-            ;-- ??1FooBar@@QAE@XZ:
+            ;-- public: void __thiscall FooBar::~destructor(void):
             0x00000d30      55             push ebp                    ; [05] -r-x section size 42 named .text$mn-5
             0x00000d31      8bec           mov ebp, esp
 EOF

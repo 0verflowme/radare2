@@ -67,62 +67,52 @@ R_API char *r_bin_demangle_plugin(RBin *bin, const char *name, const char *str) 
 	return demangle_legacy_plugin (bin, name, str);
 }
 
-R_API int r_bin_demangle_type(const char *str) {
+R_API RBinLanguage r_bin_demangle_type(const char *str) {
+	RBinLanguage type = r_bin_lang_fromstring (str);
+	switch (type) {
+	case R_BIN_LANG_JAVA:
+	case R_BIN_LANG_CXX:
+	case R_BIN_LANG_OBJC:
+	case R_BIN_LANG_SWIFT:
+	case R_BIN_LANG_DLANG:
+	case R_BIN_LANG_MSVC:
+	case R_BIN_LANG_RUST:
+	case R_BIN_LANG_KOTLIN:
+	case R_BIN_LANG_PASCAL:
+	case R_BIN_LANG_DART:
+	case R_BIN_LANG_GROOVY:
+	case R_BIN_LANG_CIL:
+	case R_BIN_LANG_IBMXL:
+		return type;
+	default:
+		break;
+	}
 	if (R_STR_ISNOTEMPTY (str)) {
-		if (!strcmp (str, "swift")) {
-			return R_BIN_LANG_SWIFT;
-		}
-		if (!strcmp (str, "java")) {
-			return R_BIN_LANG_JAVA;
-		}
-		if (!strcmp (str, "kotlin")) {
-			return R_BIN_LANG_KOTLIN;
-		}
-		if (!strcmp (str, "groovy")) {
-			return R_BIN_LANG_GROOVY;
-		}
-		if (!strcmp (str, "dart")) {
-			return R_BIN_LANG_DART;
-		}
-		if (!strcmp (str, "objc")) {
-			return R_BIN_LANG_OBJC;
-		}
-		if (!strcmp (str, "pascal") || !strcmp (str, "freepascal")) {
+		if (!strcmp (str, "freepascal")) {
 			return R_BIN_LANG_PASCAL;
 		}
-		if (!strcmp (str, "cxx") || !strcmp (str, "c++")) {
+		if (!strcmp (str, "cxx")) {
 			return R_BIN_LANG_CXX;
 		}
-		if (!strcmp (str, "ibmxl") || !strcmp (str, "xlc") || !strcmp (str, "xlc++")) {
+		if (!strcmp (str, "xlc") || !strcmp (str, "xlc++")) {
 			return R_BIN_LANG_IBMXL;
 		}
 		if (!strcmp (str, "dlang")) {
 			return R_BIN_LANG_DLANG;
 		}
-		if (!strcmp (str, "msvc")) {
-			return R_BIN_LANG_MSVC;
-		}
-		if (!strcmp (str, "rust")) {
-			return R_BIN_LANG_RUST;
-		}
-		if (!strcmp (str, "cil")) {
-			return R_BIN_LANG_CIL;
-		}
 	}
 	return R_BIN_LANG_NONE;
 }
 
-static RBinDemanglePlugin *demangle_plugin_by_type(RBin *bin, int type) {
-	ut32 value = (ut32)type & 0xffff;
-	if (!bin || !value || (value & (value - 1))) {
+static RBinDemanglePlugin *demangle_plugin_by_type(RBin *bin, RBinLanguage type) {
+	if (!bin || type <= R_BIN_LANG_NONE || type >= R_BIN_DEMANGLE_TYPE_SLOTS) {
 		return NULL;
 	}
-	int index = r_bits_ctz32 (value);
-	return index < R_BIN_DEMANGLE_TYPE_SLOTS? bin->demangle_by_type[index]: NULL;
+	return bin->demangle_by_type[type];
 }
 
-static char *demangle_without_bin(RBinFile *bf, int type, const char *str, ut64 vaddr) {
-	switch (type & 0xffff) {
+static char *demangle_without_bin(RBinFile *bf, RBinLanguage type, const char *str, ut64 vaddr) {
+	switch (type) {
 	case R_BIN_LANG_JAVA: return r_bin_demangle_java (str);
 	case R_BIN_LANG_RUST: return r_bin_demangle_rust (bf, str, vaddr);
 	case R_BIN_LANG_OBJC: return r_bin_demangle_objc (NULL, str);
@@ -132,12 +122,13 @@ static char *demangle_without_bin(RBinFile *bf, int type, const char *str, ut64 
 	case R_BIN_LANG_PASCAL: return r_bin_demangle_freepascal (str);
 	case R_BIN_LANG_MSVC: return r_bin_demangle_msvc (str);
 	case R_BIN_LANG_DLANG: return r_bin_demangle_dlang (str);
+	default: break;
 	}
 	return NULL;
 }
 
 R_API char *r_bin_demangle(RBinFile *bf, const char *def, const char *str, ut64 vaddr, bool libs) {
-	int type = -1;
+	RBinLanguage type = R_BIN_LANG_ANY;
 	if (R_STR_ISEMPTY (str)) {
 		return NULL;
 	}
@@ -190,11 +181,11 @@ R_API char *r_bin_demangle(RBinFile *bf, const char *def, const char *str, ut64 
 	if (r_bin_lang_rustv0 (str)) {
 		type = R_BIN_LANG_RUST;
 	}
-	if (type == -1 && r_str_startswith (str, "__")) {
+	if (type == R_BIN_LANG_ANY && r_str_startswith (str, "__")) {
 		if (str[2] == 'T') {
 			type = R_BIN_LANG_SWIFT;
 		} else {
-			if (type == -1 && str[2] == 's') {
+			if (type == R_BIN_LANG_ANY && str[2] == 's') {
 				type = R_BIN_LANG_SWIFT;
 			} else {
 				type = R_BIN_LANG_CXX;
@@ -205,7 +196,7 @@ R_API char *r_bin_demangle(RBinFile *bf, const char *def, const char *str, ut64 
 	if (!*str) {
 		return NULL;
 	}
-	if (type == -1) {
+	if (type == R_BIN_LANG_ANY) {
 		type = r_bin_lang_type (bf, def, str);
 	}
 	char *demangled = NULL;
@@ -222,6 +213,9 @@ R_API char *r_bin_demangle(RBinFile *bf, const char *def, const char *str, ut64 
 		}
 	} else {
 		demangled = demangle_without_bin (bf, type, str, vaddr);
+	}
+	if (demangled && bf && bf->bo && type > R_BIN_LANG_NONE && type < R_BIN_LANG_LAST) {
+		r_bin_file_add_language (bf, type);
 	}
 	if (libs && demangled && lib) {
 		char *d = r_str_newf ("%s_%s", lib, demangled);

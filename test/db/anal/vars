@@ -273,8 +273,8 @@ afv=
 EOF
 EXPECT=<<EOF
 afvR
-      argv  0x10000106c
       argc  0x10000106f
+      argv  0x10000106c
   var_640h  0x100001072
   var_648h  0x100001617,0x100001691
   var_654h  0x100001784
@@ -289,8 +289,8 @@ afvR
    var_30h  0x1000010d6
    var_2eh  0x1000010f0
 afvW
-      argv
       argc
+      argv
   var_640h
   var_648h  0x100001079
   var_654h  0x100001137,0x100001315
@@ -304,10 +304,10 @@ afvW
   var_440h
    var_30h
    var_2eh
-* argv
-R 0x10000106c  mov rbx, rsi
 * argc
 R 0x10000106f  mov r14d, edi
+* argv
+R 0x10000106c  mov rbx, rsi
 * var_640h
 R 0x100001072  lea rax, [var_640h]
 * var_648h
@@ -521,21 +521,21 @@ afvW
 |           0x00000000      80b4           push {r7}
 |           0x00000002      83b0           sub sp, 0xc
 |           0x00000004      00af           add r7, sp, 0
-|           0x00000006      7860           str r0, [r7, 4]
+|           0x00000006      7860           str r0, [var_ch]
 |           0x00000008      0b46           mov r3, r1
-|           0x0000000a      7b80           strh r3, [r7, 2]
+|           0x0000000a      7b80           strh r3, [var_eh]
 |           0x0000000c      1346           mov r3, r2
-|           0x0000000e      7b70           strb r3, [r7, 1]
-|           0x00000010      7b78           ldrb r3, [r7, 1]
+|           0x0000000e      7b70           strb r3, [var_fh]
+|           0x00000010      7b78           ldrb r3, [var_fh]
 |           0x00000012      002b           cmp r3, 0
 |       ,=< 0x00000014      03d0           beq 0x1e
-|       |   0x00000016      7a88           ldrh r2, [r7, 2]
-|       |   0x00000018      7b68           ldr r3, [r7, 4]
+|       |   0x00000016      7a88           ldrh r2, [var_eh]
+|       |   0x00000018      7b68           ldr r3, [var_ch]
 |       |   0x0000001a      9a61           str r2, [r3, 0x18]
 |      ,==< 0x0000001c      03e0           b 0x26
-|      |`-> 0x0000001e      7b88           ldrh r3, [r7, 2]
+|      |`-> 0x0000001e      7b88           ldrh r3, [var_eh]
 |      |    0x00000020      1a04           lsls r2, r3, 0x10
-|      |    0x00000022      7b68           ldr r3, [r7, 4]
+|      |    0x00000022      7b68           ldr r3, [var_ch]
 |      |    0x00000024      9a61           str r2, [r3, 0x18]
 |      `--> 0x00000026      00bf           nop
 |           0x00000028      0c37           adds r7, 0xc
@@ -695,5 +695,117 @@ EXPECT=<<EOF
 'afvs 86 var_46h int8_t
 'afvs 40 var_18h int64_t
 'afvs 66 var_32h int16_t
+EOF
+RUN
+
+NAME=a direct tail jump forwards the callee args to the function it leaves
+FILE=bins/elf/ppc64v1-libz.so
+CMDS=<<EOF
+aa
+afs @ sym.gzopen
+afvr @ sym.gzwrite
+EOF
+EXPECT=<<EOF
+void sym.gzopen (int64_t arg1, int64_t arg2);
+arg int64_t arg1 @ r3
+arg int64_t arg2 @ r4
+arg int64_t arg3 @ r5
+EOF
+RUN
+
+NAME=x86_64 conditional and unconditional tail jumps forward args, own writes do not
+FILE=bins/elf/pltrel/x86_64-thunks.so
+CMDS=<<EOF
+aa
+afvr @ sym.forkwrap
+afvr @ sym.top_fork
+afs @ sym.setwrap
+afs @ sym.top_set
+EOF
+EXPECT=<<EOF
+arg int64_t arg1 @ rdi
+arg int64_t arg1 @ rdi
+void sym.setwrap ();
+void sym.top_set ();
+EOF
+RUN
+
+NAME=the signature and the variable list agree no matter which one is read first
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 4889f84889f04889d0c3
+af+ 0 myfcn
+afb+ 0 0 10
+afvr rdx arg0 int64_t
+afsq
+afvr
+afsq
+EOF
+EXPECT=<<EOF
+void myfcn (int64_t arg0);
+arg int64_t arg0 @ rdx
+void myfcn (int64_t arg0);
+EOF
+RUN
+
+NAME=float register arguments keep the same order in the signature and in the variable list
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 4889f84889f04889d0c3
+af+ 0 myfcn
+afb+ 0 0 10
+afvr xmm1 f2 double
+afvr xmm0 f1 double
+afvr rdi i1 int64_t
+afsq
+afvr
+EOF
+EXPECT=<<EOF
+void myfcn (int64_t i1, double f1, double f2);
+arg int64_t i1 @ rdi
+arg double f1 @ xmm0
+arg double f2 @ xmm1
+EOF
+RUN
+
+NAME=a declared struct takes over the recovered var inside it
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+"td struct pair {short lo; short hi;};"
+wx 8845ed897decc3
+af
+afvb
+afvt var_14h pair
+afvb
+afvx
+EOF
+EXPECT=<<EOF
+var int8_t var_13h @ rbp-0x13
+var int32_t var_14h @ rbp-0x14
+var pair var_14h @ rbp-0x14
+afvR
+      arg1  0x3
+   var_14h
+afvW
+      arg1
+   var_14h  0x3
+EOF
+RUN
+
+NAME=a declared scalar leaves its neighbours alone
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 897dec8975e8c3
+af
+afvt var_14h int32_t
+afvb
+EOF
+EXPECT=<<EOF
+var int32_t var_14h @ rbp-0x14
+var int32_t var_18h @ rbp-0x18
 EOF
 RUN

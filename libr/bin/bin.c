@@ -222,6 +222,7 @@ R_API void r_bin_symbol_copy(RBinSymbol *dst, RBinSymbol *src) {
 	dst->libname = src->libname? strdup (src->libname): NULL;
 	dst->classname = src->classname? strdup (src->classname): NULL;
 	dst->rtype = src->rtype? strdup (src->rtype): NULL;
+	dst->attr.ns = src->attr.ns? strdup (src->attr.ns): NULL;
 }
 
 R_API RBinSymbol *r_bin_symbol_clone(RBinSymbol *bs) {
@@ -256,6 +257,7 @@ R_API void r_bin_symbol_fini(RBinSymbol *sym) {
 		free (sym->libname);
 		free (sym->classname);
 		free (sym->rtype);
+		free (sym->attr.ns);
 	}
 }
 
@@ -599,12 +601,7 @@ R_API bool r_bin_plugin_remove(RBin *bin, RBinPlugin *plugin) {
 }
 
 static int demangle_type_index(RBinLanguage type) {
-	ut32 value = (ut32)type & 0xffff;
-	if (!value || (value & (value - 1))) {
-		return -1;
-	}
-	int index = r_bits_ctz32 (value);
-	return index < R_BIN_DEMANGLE_TYPE_SLOTS? index: -1;
+	return type > R_BIN_LANG_NONE && type < R_BIN_DEMANGLE_TYPE_SLOTS? type: -1;
 }
 
 static void demangle_names_remove(RBin *bin, RBinDemanglePlugin *plugin) {
@@ -1023,16 +1020,44 @@ R_API RList *r_bin_get_libs(RBin *bin) {
 	return o? o->libs: NULL;
 }
 
-R_API RRBTree *r_bin_patch_relocs(RBinFile *bf) {
+R_API RVecRBinReloc *r_bin_patch_relocs(RBinFile *bf) {
 	R_RETURN_VAL_IF_FAIL (bf && bf->rbin, NULL);
 	RBinObject *o = r_bin_cur_object (bf->rbin);
 	return o? r_bin_object_patch_relocs (bf, o): NULL;
 }
 
-R_API RRBTree *r_bin_get_relocs(RBin *bin) {
+R_API RVecRBinReloc *r_bin_get_relocs(RBin *bin) {
 	R_RETURN_VAL_IF_FAIL (bin, NULL);
 	RBinObject *o = r_bin_cur_object (bin);
 	return o? o->relocs: NULL;
+}
+
+// find the first reloc whose vaddr is inside [vaddr, vaddr + size)
+R_API RBinReloc *r_bin_reloc_at(RVecRBinReloc *relocs, ut64 vaddr, int size) {
+	R_RETURN_VAL_IF_FAIL (relocs, NULL);
+	if (size < 1 || vaddr == UT64_MAX) {
+		return NULL;
+	}
+	// relocs are sorted by vaddr, plain binary search for the lower bound
+	RBinReloc *a = R_VEC_START_ITER (relocs);
+	const size_t len = RVecRBinReloc_length (relocs);
+	size_t lo = 0, hi = len;
+	while (lo < hi) {
+		const size_t mid = lo + ((hi - lo) >> 1);
+		if (a[mid].vaddr < vaddr) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return (lo < len && a[lo].vaddr < vaddr + size)? &a[lo]: NULL;
+}
+
+// the relocation recorded against exactly vaddr, or NULL
+static RBinReloc *get_reloc_at(RBin *bin, ut64 vaddr) {
+	R_RETURN_VAL_IF_FAIL (bin, NULL);
+	RVecRBinReloc *relocs = r_bin_get_relocs (bin);
+	return relocs? r_bin_reloc_at (relocs, vaddr, 1): NULL;
 }
 
 R_API RVecRBinSection *r_bin_get_sections_vec(RBin *bin) {
@@ -1447,15 +1472,6 @@ R_API int r_bin_is_big_endian(RBin *bin) {
 	return (o && o->info)? o->info->big_endian: -1;
 }
 
-R_API bool r_bin_is_static(RBin *bin) {
-	R_RETURN_VAL_IF_FAIL (bin, false);
-	RBinObject *o = r_bin_cur_object (bin);
-	if (o && o->libs && r_list_length (o->libs) > 0) {
-		return R_BIN_DBG_STATIC & o->info->dbg_info;
-	}
-	return true;
-}
-
 static bool collect_symclass_glob(void *user, const char *k, const char *v) {
 	if (strchr (k, '*')) {
 		char *dup = strdup (k);
@@ -1792,6 +1808,8 @@ R_API void r_bin_bind(RBin *bin, RBinBind *b) {
 		b->get_vsect_at = __get_vsection_at;
 		b->get_symbols_vec = r_bin_get_symbols_vec;
 		b->get_symbol_at = r_bin_get_symbol_at;
+		b->get_sym = r_bin_get_sym;
+		b->get_reloc_at = get_reloc_at;
 		b->demangle = r_bin_demangle;
 	}
 }
@@ -1968,7 +1986,7 @@ R_API RBinField *r_bin_field_new(ut64 paddr, ut64 vaddr, ut64 value, int size, c
 	ptr->format_named = format_named;
 	ptr->vaddr = vaddr;
 	ptr->paddr = paddr;
-	ptr->size = size;
+	ptr->attr.size = size > 0? size: 0;
 	ptr->value = value;
 	// ptr->attr = default attributes for fields?
 	return ptr;
@@ -1980,6 +1998,7 @@ R_API void r_bin_field_fini(RBinField *field) {
 		r_bin_name_free (field->type);
 		free (field->comment);
 		free (field->format);
+		free (field->attr.ns);
 	}
 }
 
@@ -2003,14 +2022,6 @@ R_API void r_bin_section_fini(RBinSection *bs) {
 		free (bs->name);
 		free (bs->format);
 	}
-}
-
-R_API RBinSection *r_bin_section_clone(RBinSection *s) {
-	RBinSection *d = R_NEW0 (RBinSection);
-	memcpy (d, s, sizeof (RBinSection));
-	d->name = s->name? strdup (s->name): NULL;
-	d->format = s->format? strdup (s->format): NULL;
-	return d;
 }
 
 R_API void r_bin_section_free(RBinSection *bs) {
@@ -2039,23 +2050,9 @@ R_API RBinFile *r_bin_file_at(RBin *bin, ut64 at) {
 	return NULL;
 }
 
-R_API RBinTrycatch *r_bin_trycatch_new(ut64 source, ut64 from, ut64 to, ut64 handler, ut64 filter) {
-	RBinTrycatch *tc = R_NEW0 (RBinTrycatch);
-	tc->source = source;
-	tc->from = from;
-	tc->to = to;
-	tc->handler = handler;
-	tc->filter = filter;
-	return tc;
-}
-
-R_API void r_bin_trycatch_free(RBinTrycatch *tc) {
-	free (tc);
-}
-
 R_API const char *r_bin_field_kindstr(RBinField *f) {
 	R_RETURN_VAL_IF_FAIL (f, NULL);
-	switch (f->kind) {
+	switch (f->attr.kind) {
 	case R_BIN_FIELD_KIND_PROPERTY:
 		return "property";
 	case R_BIN_FIELD_KIND_FIELD:
@@ -2201,12 +2198,20 @@ static const char *attr_bit_name(ut64 n, bool compact) {
 		return compact? "": "transient";
 	case R_BIN_ATTR_ENUM:
 		return compact? "": "enum";
+	case R_BIN_ATTR_STRUCT:
+		return compact? "": "struct";
 	case R_BIN_ATTR_RACIST:
 		return compact? "": "racist";
 	case R_BIN_ATTR_SUPER:
 		return compact? "S": "super";
 	case R_BIN_ATTR_ANNOTATION:
 		return compact? "A": "annotation";
+	case R_BIN_ATTR_MIXIN:
+		return compact? "M": "mixin";
+	case R_BIN_ATTR_LATE:
+		return compact? "l": "late";
+	case R_BIN_ATTR_GENERATOR:
+		return compact? "G": "generator";
 	case R_BIN_ATTR_WEAK:
 		return compact? "w": "weak";
 	case R_BIN_ATTR_CLASS:
@@ -2251,6 +2256,8 @@ static const char *attr_bit_name(ut64 n, bool compact) {
 		return compact? "A": "miranda";
 	case R_BIN_ATTR_CONSTRUCTOR:
 		return compact? "C": "constructor";
+	case R_BIN_ATTR_DESTRUCTOR:
+		return compact? "D": "destructor";
 	case R_BIN_ATTR_DECLARED_SYNCHRONIZED:
 		return compact? "y": "declared_synchronized";
 	default:
@@ -2264,10 +2271,14 @@ R_API char *r_bin_attr_tostring(ut64 attr, bool singlechar) {
 	for (i = 0; i < 64; i++) {
 		const ut64 bit = (1ULL << i);
 		if (attr & bit) {
+			const char *bn = attr_bit_name (bit, singlechar);
+			if (R_STR_ISEMPTY (bn)) {
+				continue;
+			}
 			if (!singlechar && !r_strbuf_is_empty (sb)) {
 				r_strbuf_append (sb, " ");
 			}
-			r_strbuf_append (sb, attr_bit_name (bit, singlechar));
+			r_strbuf_append (sb, bn);
 		}
 	}
 	return r_strbuf_drain (sb);
@@ -2282,8 +2293,8 @@ R_API ut64 r_bin_attr_fromstring(const char *s, bool compact) {
 		const char *w = s;
 		while (*w) {
 			for (i = 0; i < 64; i++) {
-				const char *bn = attr_bit_name (i, true);
-				if (bn && *w == *bn) {
+				const char *bn = attr_bit_name (1ULL << i, true);
+				if (R_STR_ISNOTEMPTY (bn) && *w == *bn) {
 					bits |= (1ULL << i);
 					break;
 				}
@@ -2294,9 +2305,13 @@ R_API ut64 r_bin_attr_fromstring(const char *s, bool compact) {
 		char *a = strdup (s);
 		RList *words = r_str_split_list (a, " ", 0);
 		r_list_foreach (words, iter, word) {
+			if (!strcmp (word, "factory")) { // static constructor
+				bits |= R_BIN_ATTR_CONSTRUCTOR | R_BIN_ATTR_STATIC;
+				continue;
+			}
 			for (i = 0; i < 64; i++) {
-				const char *bn = attr_bit_name (i, false);
-				if (!strcmp (bn, word)) {
+				const char *bn = attr_bit_name (1ULL << i, false);
+				if (bn && !strcmp (bn, word)) {
 					bits |= (1ULL << i);
 					break;
 				}
@@ -2306,6 +2321,55 @@ R_API ut64 r_bin_attr_fromstring(const char *s, bool compact) {
 		free (a);
 	}
 	return bits;
+}
+
+R_API char *r_bin_attr_update(RBinAttr *a, const char *s) {
+	R_RETURN_VAL_IF_FAIL (a, NULL);
+	RStrBuf *rest = r_strbuf_new ("");
+	char *w, *save, *str = strdup (r_str_get (s));
+	for (w = r_str_tok_r (str, " ", &save); w; w = r_str_tok_r (NULL, " ", &save)) {
+		bool handled = false;
+		char *eq = strchr (w, '=');
+		if (eq) {
+			*eq++ = 0;
+			if (!strcmp (w, "size")) {
+				a->size = r_num_get (NULL, eq);
+				handled = true;
+			} else if (!strcmp (w, "offset")) {
+				a->offset = r_num_get (NULL, eq);
+				handled = true;
+			} else if (!strcmp (w, "ns") || !strcmp (w, "lib")) {
+				free (a->ns);
+				a->ns = strdup (eq);
+				handled = true;
+			} else if (!strcmp (w, "lang")) {
+				RBinLanguage lang = r_bin_lang_fromstring (eq);
+				if (lang) {
+					a->lang = lang;
+					handled = true;
+				}
+			}
+			eq[-1] = '=';
+		} else {
+			ut64 attr = r_bin_attr_fromstring (w, false);
+			if (attr) {
+				a->flags |= attr;
+				handled = true;
+			} else if (!strcmp (w, "property")) {
+				a->kind = R_BIN_FIELD_KIND_PROPERTY;
+				handled = true;
+			}
+		}
+		if (!handled) {
+			r_strbuf_appendf (rest, "%s%s", r_strbuf_is_empty (rest)? "": " ", w);
+		}
+	}
+	free (str);
+	if (r_strbuf_is_empty (rest)) {
+		r_strbuf_free (rest);
+		return NULL;
+	}
+	return r_strbuf_drain (rest);
 }
 
 R_API bool r_bin_cmd(RBin *bin, const char *input) {

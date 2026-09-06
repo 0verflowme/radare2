@@ -115,25 +115,30 @@ typedef enum {
 
 typedef enum {
 	R_BIN_LANG_NONE = 0,
-	R_BIN_LANG_JAVA = 1,
-	R_BIN_LANG_C = 1<<1,
-	R_BIN_LANG_GO = 1<<2,
-	R_BIN_LANG_CXX = 1<<3,
-	R_BIN_LANG_OBJC = 1<<4,
-	R_BIN_LANG_SWIFT = 1<<5,
-	R_BIN_LANG_DLANG = 1<<6,
-	R_BIN_LANG_MSVC = 1<<7,
-	R_BIN_LANG_RUST = 1<<8,
-	R_BIN_LANG_KOTLIN = 1<<9,
-	R_BIN_LANG_PASCAL = 1<<10,
-	R_BIN_LANG_DART = 1<<11,
-	R_BIN_LANG_GROOVY = 1<<12,
-	R_BIN_LANG_JNI = 1U<<13,
-	R_BIN_LANG_CIL = 1<<14,
-	R_BIN_LANG_IBMXL = 1<<15,
-	R_BIN_LANG_BLOCKS = 1U<<31,
+	R_BIN_LANG_JAVA,
+	R_BIN_LANG_C,
+	R_BIN_LANG_GO,
+	R_BIN_LANG_CXX,
+	R_BIN_LANG_OBJC,
+	R_BIN_LANG_SWIFT,
+	R_BIN_LANG_DLANG,
+	R_BIN_LANG_MSVC,
+	R_BIN_LANG_RUST,
+	R_BIN_LANG_KOTLIN,
+	R_BIN_LANG_PASCAL,
+	R_BIN_LANG_DART,
+	R_BIN_LANG_GROOVY,
+	R_BIN_LANG_JNI,
+	R_BIN_LANG_CIL,
+	R_BIN_LANG_IBMXL,
+	R_BIN_LANG_C_BLOCKS,
+	R_BIN_LANG_CXX_BLOCKS,
+	R_BIN_LANG_OBJC_BLOCKS,
+	R_BIN_LANG_LAST,
 	R_BIN_LANG_ANY = -1,
 } RBinLanguage;
+
+typedef RVPack RBinLanguages;
 
 typedef enum {
 	R_BIN_CLASS_ORIGIN_BIN,
@@ -162,14 +167,13 @@ struct R_PDB7_ROOT_STREAM;
 typedef struct r_pdb_t {
 	bool (*pdb_parse)(struct r_pdb_t *pdb);
 	void (*finish_pdb_parse)(struct r_pdb_t *pdb);
-	void (*print_types)(const struct r_pdb_t *pdb, PJ *pj, int mode);
-	PrintfCallback cb_printf;
+	char *(*print_types)(const struct r_pdb_t *pdb, PJ *pj, int mode);
 	struct R_PDB7_ROOT_STREAM *root_stream;
 	void *stream_map;
 	RList *pdb_streams;
 	RList *pdb_streams2;
 	RBuffer *buf; // mmap of file
-	void (*print_gvars)(struct r_pdb_t *pdb, ut64 img_base, PJ *pj, int format);
+	char *(*print_gvars)(struct r_pdb_t *pdb, ut64 img_base, PJ *pj, int format);
 } RBinPdb;
 
 // TODO: use better api names
@@ -213,7 +217,7 @@ typedef uint64_t RBinAttribute;
 #define R_BIN_ATTR_GETTER (1ULL << 27) // accessor
 #define R_BIN_ATTR_SETTER (1ULL << 28) // accessor
 #define R_BIN_ATTR_OPTIMIZED (1ULL << 29)
-//#define R_BIN_ATTR_ANNOTATED (1ULL << 30)
+#define R_BIN_ATTR_STRUCT (1ULL << 30)
 #define R_BIN_ATTR_BRIDGE (1ULL << 31)
 #define R_BIN_ATTR_STRICT (1ULL << 32)
 #define R_BIN_ATTR_ASYNC (1ULL << 33)
@@ -227,6 +231,25 @@ typedef uint64_t RBinAttribute;
 #define R_BIN_ATTR_VARARGS (1ULL << 41)
 #define R_BIN_ATTR_SUPER (1ULL << 42)
 #define R_BIN_ATTR_ANNOTATION (1ULL << 43)
+#define R_BIN_ATTR_MIXIN (1ULL << 44)
+#define R_BIN_ATTR_LATE (1ULL << 45)
+#define R_BIN_ATTR_GENERATOR (1ULL << 46)
+#define R_BIN_ATTR_DESTRUCTOR (1ULL << 47)
+
+typedef enum {
+	R_BIN_FIELD_KIND_VARIABLE,
+	R_BIN_FIELD_KIND_FIELD,
+	R_BIN_FIELD_KIND_PROPERTY,
+} RBinFieldKind;
+
+typedef struct r_bin_attr_t {
+	RBinAttribute flags;
+	char *ns;
+	ut32 size;
+	int offset;
+	RBinLanguage lang;
+	RBinFieldKind kind;
+} RBinAttr;
 
 typedef enum {
 	R_BIN_RELOC_1 = 1,
@@ -339,11 +362,11 @@ typedef struct r_bin_symbol_t {
 	/* only used by java */
 	ut64 vaddr;
 	ut64 paddr;
-	ut32 size;
+	/* Contiguous format metadata immediately before the code entrypoint. */
+	ut32 hsize;
+	RBinAttr attr;
 	ut32 ordinal;
-	int lang;
 	int bits;
-	RBinAttribute attr; // previously known as method_flags + visibility
 	int dup_count;
 	ut16 ret_count;          // number of return slots (0 = void)
 	const char *arg_prefix;  // interned register name prefix, e.g. "v" or "l"
@@ -429,6 +452,35 @@ R_VEC_TYPE_WITH_FINI (RVecRBinResource, RBinResource, r_bin_resource_fini);
 R_VEC_TYPE(RVecRBinEntry, RBinSymbol);
 R_VEC_TYPE(RVecBinSymclassGlob, char *);
 
+typedef struct r_bin_reloc_t {
+	ut8 type; // type have implicit size.. but its anoying
+	ut8 additive;
+	bool is_ifunc;
+	ut32 visibility;
+	ut64 ntype; // type number coming from the bin file
+	RBinSymbol *symbol;
+	RBinImport *import;
+	ut64 laddr; // local symbol address | UT64_MAX
+	// RBinSymbol *lsymbol; // still unused
+	st64 addend;
+	ut64 vaddr;
+	ut64 paddr;
+	/* is_ifunc: indirect function, `addend` points to a resolver function
+	 * that returns the actual relocation value, e.g. chooses
+	 * an optimized version depending on the CPU.
+	 * cf. https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html
+	 */
+} RBinReloc;
+
+R_API void r_bin_import_free(RBinImport *imp);
+static inline void r_bin_reloc_fini(RBinReloc *reloc) {
+	if (reloc) {
+		r_bin_import_free (reloc->import);
+	}
+}
+// sorted by vaddr, relocs own their import (if any)
+R_VEC_TYPE_WITH_FINI (RVecRBinReloc, RBinReloc, r_bin_reloc_fini);
+
 typedef struct r_bin_object_t {
 	ut64 baddr;
 	st64 baddr_shift;
@@ -445,7 +497,7 @@ typedef struct r_bin_object_t {
 	RList/*<??>*/ *entries;
 	RList/*<??>*/ *fields;
 	RList/*<??>*/ *libs;
-	RRBTree/*<RBinReloc>*/ *relocs;
+	RVecRBinReloc *relocs;
 	RVecRBinString strings;
 	RList/*<RBinClass>*/ *classes;
 	HtPP *classes_ht;
@@ -457,7 +509,7 @@ typedef struct r_bin_object_t {
 	RBinInfo *info;
 	RBinAddr *binsym[R_BIN_SYM_LAST];
 	struct r_bin_plugin_t *plugin;
-	int lang;
+	RBinLanguages langs;
 	Sdb *kv;
 	HtUP *addr2klassmethod;
 	HtUP *symbol_addr_ht; // vaddr/paddr -> RBinSymbol* (lazy, owned by object)
@@ -544,7 +596,7 @@ typedef struct r_bin_file_t {
 	RArena *arena;
 } RBinFile;
 
-#define R_BIN_DEMANGLE_TYPE_SLOTS 16
+#define R_BIN_DEMANGLE_TYPE_SLOTS (R_BIN_LANG_IBMXL + 1)
 
 typedef struct r_bin_demangle_plugin_t {
 	RPluginMeta meta;
@@ -680,17 +732,43 @@ typedef struct r_bin_arch_options_t {
 	int bits;
 } RBinArchOptions;
 
+typedef enum r_bin_trycatch_kind_t {
+	R_BIN_TRYCATCH_UNSPECIFIED,
+	R_BIN_TRYCATCH_CATCH,
+	R_BIN_TRYCATCH_CLEANUP,
+	R_BIN_TRYCATCH_FILTER,
+} RBinTrycatchKind;
+
 typedef struct r_bin_trycatch_t {
+	char *type;
 	ut64 source;
 	ut64 from;
 	ut64 to;
 	ut64 handler;
 	ut64 filter;
-	// TODO: add type/name of exception
+	st64 type_filter;
+	RBinTrycatchKind kind;
+	bool catch_all;
 } RBinTrycatch;
 
-R_API RBinTrycatch *r_bin_trycatch_new(ut64 source, ut64 from, ut64 to, ut64 handler, ut64 filter);
-R_API void r_bin_trycatch_free(RBinTrycatch *tc);
+static inline void r_bin_trycatch_fini(RBinTrycatch *tc) {
+	if (tc) {
+		free (tc->type);
+	}
+}
+R_VEC_TYPE_WITH_FINI (RVecRBinTrycatch, RBinTrycatch, r_bin_trycatch_fini);
+
+static inline R_MUSTUSE RBinTrycatch *r_bin_trycatch_add(RVecRBinTrycatch *trycatch, ut64 source, ut64 from, ut64 to, ut64 handler, ut64 filter) {
+	RBinTrycatch *tc = RVecRBinTrycatch_emplace_back (trycatch);
+	if (tc) {
+		tc->source = source;
+		tc->from = from;
+		tc->to = to;
+		tc->handler = handler;
+		tc->filter = filter;
+	}
+	return tc;
+}
 
 typedef struct r_bin_plugin_t {
 	RPluginMeta meta;
@@ -712,16 +790,16 @@ typedef struct r_bin_plugin_t {
 	RBinInfo/*<RBinInfo>*/* (*info)(RBinFile *bf);
 	RList/*<RBinField>*/* (*fields)(RBinFile *bf);
 	RList/*<char *>*/* (*libs)(RBinFile *bf);
-	RList/*<RBinReloc>*/* (*relocs)(RBinFile *bf);
-	RList/*<RBinTrycatch>*/* (*trycatch)(RBinFile *bf);
+	RVecRBinReloc *(*relocs)(RBinFile *bf);
+	R_UNOWNED RVecRBinTrycatch *(*trycatch)(RBinFile *bf);
 	RList/*<RBinClass>*/* (*classes)(RBinFile *bf);
 	RList/*<RBinMem>*/* (*mem)(RBinFile *bf);
-	RList/*<RBinReloc>*/* (*patch_relocs)(RBinFile *bf);
+	RVecRBinReloc *(*patch_relocs)(RBinFile *bf); // NULL keeps the current relocs
 	RList/*<RBinMap>*/* (*maps)(RBinFile *bf); // this should be segments!
 	RList/*<RBinFileHash>*/* (*hashes)(RBinFile *bf);
 	char* (*header)(RBinFile *bf, int mode);
 	char* (*signature)(RBinFile *bf, bool json);
-	int (*demangle_type)(const char *str);
+	RBinLanguage (*demangle_type)(const char *str);
 	struct r_bin_write_t *write;
 	ut64 (*get_offset) (RBinFile *bf, int type, int idx);
 	const char* (*get_name)(RBinFile *bf, int type, int idx, bool simplified);
@@ -742,29 +820,22 @@ typedef struct r_bin_plugin_t {
 	bool (*load_resources)(RBinFile *bf);
 	/* Optional raw-data resolver. The returned buffer is owned by the caller. */
 	RBuffer *(*get_resource_data)(RBinFile *bf, const RBinResource *resource);
+	const char *iouris; // comma-separated IO URI prefixes allowed for redirects
+	const char *(*iouri)(RBinFile *bf); // selects one iouris item, or the sole item by default
 } RBinPlugin;
 
 typedef void (*RBinSymbollCallback)(RBinObject *obj, void *symbol);
-
-typedef enum {
-	R_BIN_FIELD_KIND_VARIABLE,
-	R_BIN_FIELD_KIND_FIELD,
-	R_BIN_FIELD_KIND_PROPERTY,
-} RBinFieldKind;
 
 typedef struct r_bin_field_t {
 	ut64 vaddr;
 	ut64 paddr;
 	ut64 value;
-	int size;
-	int offset;
+	RBinAttr attr;
 	RBinName *name;
 	RBinName *type;
-	RBinFieldKind kind;
 	bool format_named; // whether format is the name of a format or a raw pf format string
 	char *comment;
 	char *format;
-	RBinAttribute attr;
 } RBinField;
 
 R_API void r_bin_field_fini(RBinField *f);
@@ -777,13 +848,10 @@ typedef struct r_bin_class_t {
 	int index; // should be unsigned?
 	RBinClassOrigin origin;
 	ut64 addr;
-	size_t instance_size;
-	char *ns; // namespace // maybe RBinName?
-	ut64 lang;
+	RBinAttr attr;
 	RVecRBinSymbol methods;
 	RVecRBinField fields;
 	// RList *interfaces; // <char *>
-	RBinAttribute attr;
 } RBinClass;
 
 #define RBinSectionName r_offsetof(RBinSection, name)
@@ -798,27 +866,6 @@ typedef struct r_bin_class_t {
 		}\
 	} while (0)
 
-typedef struct r_bin_reloc_t {
-	ut8 type; // type have implicit size.. but its anoying
-	ut8 additive;
-	bool is_ifunc;
-	ut32 visibility;
-	ut64 ntype; // type number coming from the bin file
-	RBinSymbol *symbol;
-	RBinImport *import;
-	ut64 laddr; // local symbol address | UT64_MAX
-	// RBinSymbol *lsymbol; // still unused
-	st64 addend;
-	ut64 vaddr;
-	ut64 paddr;
-	/* is_ifunc: indirect function, `addend` points to a resolver function
-	 * that returns the actual relocation value, e.g. chooses
-	 * an optimized version depending on the CPU.
-	 * cf. https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html
-	 */
-} RBinReloc;
-
-R_VEC_TYPE (RVecRBinReloc, RBinReloc);
 
 R_API const char *r_bin_field_kindstr(RBinField *f);
 R_API RBinField *r_bin_field_new(ut64 paddr, ut64 vaddr, ut64 value, int size, const char *name, const char *comment, const char *format, bool format_named);
@@ -863,7 +910,9 @@ typedef char *(*RBinDemangle)(RBinFile *bf, const char *def, const char *str, ut
 typedef ut64 (*RBinBaddr)(RBinFile *bf, ut64 addr);
 typedef RVecRBinSymbol *(*RBinGetSymbolsVec)(RBin *bin);
 typedef RBinSymbol *(*RBinGetSymbolAt)(RBin *bin, ut64 addr);
+typedef RBinReloc *(*RBinGetRelocAt)(RBin *bin, ut64 vaddr);
 typedef const char *(*RBinGetCC)(RBin *bin, ut64 vaddr);
+typedef RBinAddr *(*RBinGetSym)(RBin *bin, int sym);
 
 typedef struct r_bin_bind_t {
 	RBin *bin;
@@ -874,14 +923,18 @@ typedef struct r_bin_bind_t {
 	RBinGetSectionAt get_vsect_at;
 	RBinGetSymbolsVec get_symbols_vec;
 	RBinGetSymbolAt get_symbol_at;
+	RBinGetSym get_sym;
 	RBinDemangle demangle;
 	RBinAddrLineAdd addrline_add;
 	RBinAddrLineGet addrline_get;
 	RBinBaddr baddr;
 	ut32 visibility;
+	// The relocation recorded against exactly this address, if any. An
+	// analysis holding only the bind can ask what a loaded slot names
+	// without reaching for the RBin behind it.
+	RBinGetRelocAt get_reloc_at;
 } RBinBind;
 
-R_API RBinSection *r_bin_section_clone(RBinSection *s);
 R_API void r_bin_info_free(RBinInfo *rb);
 R_API void r_bin_import_free(RBinImport *imp);
 R_API void r_bin_symbol_free(void *sym);
@@ -892,13 +945,6 @@ R_API void r_bin_symbol_copy(RBinSymbol *dst, RBinSymbol *src);
 R_API void r_bin_string_free(void *_str);
 
 #ifdef R_API
-
-static inline void r_bin_reloc_free(RBinReloc *reloc) {
-	if (reloc) {
-		r_bin_import_free (reloc->import);
-		free (reloc);
-	}
-}
 
 R_API RBinImport *r_bin_import_clone(RBinImport *o);
 typedef void (*RBinSymbolCallback)(RBinObject *obj, RBinSymbol *symbol);
@@ -955,13 +1001,14 @@ R_API RVecRBinString *r_bin_dump_strings(RBinFile *a, int min, int raw);
 // use RBinFile instead
 R_API const RList *r_bin_get_entries(RBin *bin);
 R_API RList *r_bin_get_libs(RBin *bin);
-R_API RRBTree *r_bin_patch_relocs(RBinFile *bin);
-R_API RRBTree *r_bin_get_relocs(RBin *bin);
+R_API RVecRBinReloc *r_bin_patch_relocs(RBinFile *bin);
+R_API RVecRBinReloc *r_bin_get_relocs(RBin *bin);
+R_API RBinReloc *r_bin_reloc_at(RVecRBinReloc *relocs, ut64 vaddr, int size);
 R_API RVecRBinSection *r_bin_get_sections_vec(RBin *bin);
 R_API RList *r_bin_get_classes(RBin *bin);
 R_API char* r_bin_get_types(RBin *bin);
 R_API RVecRBinString *r_bin_get_strings(RBin *bin);
-R_API RList *r_bin_file_get_trycatch(RBinFile *bf);
+R_API R_UNOWNED RVecRBinTrycatch *r_bin_file_get_trycatch(RBinFile * R_NONNULL bf);
 R_API RVecRBinSymbol *r_bin_get_symbols_vec(RBin *bin);
 // O(1) lookup by address (vaddr first, then paddr). Builds a lazy index on the
 // current RBinObject on first call; returns NULL if no symbol matches.
@@ -969,11 +1016,11 @@ R_API RBinSymbol *r_bin_get_symbol_at(RBin *bin, ut64 addr);
 R_API RVecRBinImport *r_bin_get_imports_vec(RBin *bin);
 R_API RVecRBinString *r_bin_reset_strings(RBin *bin);
 R_API int r_bin_is_big_endian(RBin *bin); // R2_590: deprecate. also it returns -1, false and true
-R_API bool r_bin_is_static(RBin *bin); // R2_590: deprecate
 R_API ut64 r_bin_get_vaddr(RBin *bin, ut64 paddr, ut64 vaddr);
 R_API ut64 r_bin_file_get_vaddr(RBinFile *bf, ut64 paddr, ut64 vaddr);
 
-R_API int r_bin_load_languages(RBinFile *binfile);
+R_API void r_bin_file_add_language(RBinFile *binfile, RBinLanguage lang);
+R_API RBinLanguages r_bin_load_languages(RBinFile *binfile);
 R_API RBinFile *r_bin_cur(RBin *bin);
 R_API RBinObject *r_bin_cur_object(RBin *bin);
 
@@ -1044,11 +1091,15 @@ R_API char *r_bin_demangle_freepascal(const char *str);
 R_API char *r_bin_demangle_cxx(RBinFile *binfile, const char *str, ut64 vaddr);
 R_API char *r_bin_demangle_msvc(const char *str);
 R_API char *r_bin_demangle_swift(const char *s, bool syscmd, bool trylib);
+// resolves a swift symbolic type reference at addr into a qualified type name
+typedef char *(*RBinSwiftResolver)(void *user, ut64 addr, bool indirect);
+R_API char *r_bin_demangle_swift_typeref(const ut8 *p, int len, ut64 va, RBinSwiftResolver resolver, void *user);
+R_API char *r_bin_demangle_swift_member(const char *context, const char *rest, ut64 *attr);
 R_API char *r_bin_demangle_objc(RBinFile *binfile, const char *sym);
 R_API char *r_bin_demangle_rust(RBinFile *binfile, const char *str, ut64 vaddr);
 R_API char *r_bin_demangle_dlang(const char *str);
 R_API char *r_bin_demangle_ibmxl(const char *str);
-R_API int r_bin_demangle_type(const char *str);
+R_API RBinLanguage r_bin_demangle_type(const char *str);
 R_API void r_bin_demangle_list(RBin *bin);
 R_API char *r_bin_demangle_plugin(RBin *bin, const char *name, const char *str);
 R_API const char *r_bin_get_meth_flag_string(ut64 flag, bool compact);
@@ -1075,7 +1126,8 @@ R_API bool r_bin_wr_rpath_del(RBin *bin);
 R_API bool r_bin_wr_entry(RBin *bin, ut64 addr);
 R_API bool r_bin_wr_output(RBin *bin, const char *filename);
 
-R_API const char *r_bin_lang_tostring(int type);
+R_API const char *r_bin_lang_tostring(RBinLanguage type);
+R_API RBinLanguage r_bin_lang_fromstring(const char *name);
 
 R_API RList *r_bin_get_mem(RBin *bin);
 
@@ -1091,12 +1143,12 @@ R_API void r_bin_name_free(RBinName *bn);
 
 R_API char *r_bin_attr_tostring(ut64 attr, bool singlechar);
 R_API ut64 r_bin_attr_fromstring(const char *s, bool compact);
+R_API char *r_bin_attr_update(RBinAttr *attr, const char *s);
 
 /* filter.c */
 typedef struct HtSU_t HtSU;
 
 R_API void r_bin_load_filter(RBin *bin, ut64 rules);
-R_API void r_bin_filter_sections(RBinFile *bf, RList *list);
 R_API void r_bin_filter_sections_vec(RBinFile *bf, RVecRBinSection *sections);
 R_API char *r_bin_filter_name(RBinFile *bf, HtSU *db, ut64 addr, const char *name);
 R_API bool r_bin_strpurge(RBin *bin, const char *str, ut64 refaddr);

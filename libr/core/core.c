@@ -3,6 +3,7 @@
 #define R_LOG_ORIGIN "core"
 
 #include "../include/r_core.h"
+#include <r_core_priv.h>
 #include <r_vec.h>
 
 R_LIB_VERSION(r_core);
@@ -28,8 +29,10 @@ static int on_fcn_new(RAnal *_anal, void *_user, RAnalFunction *fcn) {
 }
 
 static int on_fcn_delete(RAnal *_anal, void *_user, RAnalFunction *fcn) {
-	RCore *core = (RCore *)_user;
-	const char *cmd = r_config_get (core->config, "cmd.fcn.delete");
+	(void)_user;
+	RCore *core = _anal? _anal->coreb.core: NULL;
+	const char *cmd = core && core->config
+		? r_config_get (core->config, "cmd.fcn.delete"): NULL;
 	if (R_STR_ISNOTEMPTY (cmd)) {
 		ut64 oaddr = core->addr;
 		ut64 addr = fcn->addr;
@@ -84,37 +87,10 @@ static void r_core_debug_syscall_hit(RCore *core) {
 	}
 }
 
-struct getreloc_t {
-	ut64 vaddr;
-	int size;
-};
-
-static int getreloc_tree(void *incoming, void *in, void *user) {
-	struct getreloc_t *gr = (struct getreloc_t *)incoming;
-	RBinReloc *r = (RBinReloc *)in;
-	if ((r->vaddr >= gr->vaddr) && (r->vaddr < (gr->vaddr + gr->size))) {
-		return 0;
-	}
-	if (gr->vaddr > r->vaddr) {
-		return 1;
-	}
-	if (gr->vaddr < r->vaddr) {
-		return -1;
-	}
-	return 0;
-}
-
 R_API RBinReloc *r_core_getreloc(RCore *core, ut64 addr, int size) {
 	R_RETURN_VAL_IF_FAIL (core, NULL);
-	if (size < 1 || addr == UT64_MAX) {
-		return NULL;
-	}
-	RRBTree *relocs = r_bin_get_relocs (core->bin);
-	if (R_LIKELY (relocs)) {
-		struct getreloc_t gr = { .vaddr = addr, .size = size };
-		return r_crbtree_find (relocs, &gr, getreloc_tree, NULL);
-	}
-	return NULL;
+	RVecRBinReloc *relocs = r_bin_get_relocs (core->bin);
+	return relocs? r_bin_reloc_at (relocs, addr, size): NULL;
 }
 
 /* returns the address of a jmp/call given a shortcut by the user or UT64_MAX
@@ -753,6 +729,43 @@ static int autocomplete_pfele(RCore *core, RLineCompletion *completion, char *ke
 	if (!strncmp (buf->data + chr, x, strlen (buf->data + chr))) { \
 		r_line_completion_push (completion, x); \
 	}
+
+static bool autocomplete_has(RLineCompletion *completion, RStrs name) {
+	const size_t length = r_strs_len (name);
+	char **it;
+	R_VEC_FOREACH (&completion->args, it) {
+		if (strlen (*it) == length && !strncmp (*it, name.a, length)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool autocomplete_registered(RStrs name, void *user) {
+	RLineCompletion *completion = user;
+	if (autocomplete_has (completion, name)) {
+		return true;
+	}
+	const size_t length = r_strs_len (name);
+	if (length > ST32_MAX) {
+		return false;
+	}
+	char *command = r_str_ndup (name.a, (int)length);
+	if (!command) {
+		return false;
+	}
+	r_line_completion_push (completion, command);
+	free (command);
+	return !completion->quit;
+}
+
+static void autocomplete_registered_commands(RCore *core, RLineCompletion *completion, RLineBuffer *buf) {
+	const int index = R_MIN (R_MAX (buf->index, 0), (int)sizeof (buf->data) - 1);
+	const char saved = buf->data[index];
+	buf->data[index] = 0;
+	r_cmd_foreach_prefix (core->rcmd, buf->data, autocomplete_registered, completion);
+	buf->data[index] = saved;
+}
 
 static void autocomplete_default(RCore *core, RLineCompletion *completion, RLineBuffer *buf) {
 	RCoreAutocomplete *a = core->autocomplete;
@@ -1621,8 +1634,11 @@ R_API void r_core_autocomplete(RCore *core, RLineCompletion *completion, RLineBu
 		autocomplete_flags (core, completion, buf->data);
 	} else if (prompt_type == R_LINE_PROMPT_FILE) {
 		autocomplete_file (completion, buf->data);
-	} else if (!find_autocomplete (core, completion, buf)) {
-		autocomplete_default (core, completion, buf);
+	} else {
+		if (!find_autocomplete (core, completion, buf)) {
+			autocomplete_default (core, completion, buf);
+		}
+		autocomplete_registered_commands (core, completion, buf);
 	}
 }
 
@@ -2406,12 +2422,17 @@ R_API void r_core_autocomplete_reload(RCore *core) {
 }
 
 R_API RFlagItem *r_core_flag_get_by_spaces(RFlag *f, bool prionospace, ut64 off) {
-	return r_flag_get_by_spaces (f, prionospace, off, R_FLAGS_FS_FUNCTIONS, R_FLAGS_FS_SIGNS, R_FLAGS_FS_CLASSES, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, R_FLAGS_FS_RELOCS, R_FLAGS_FS_STRINGS, R_FLAGS_FS_RESOURCES, R_FLAGS_FS_SYMBOLS_SECTIONS,
+	RFlagItem *fi = r_flag_get_by_spaces (f, prionospace, off, R_FLAGS_FS_FUNCTIONS, R_FLAGS_FS_SIGNS, R_FLAGS_FS_CLASSES, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, R_FLAGS_FS_RELOCS, R_FLAGS_FS_STRINGS, R_FLAGS_FS_RESOURCES, R_FLAGS_FS_SYMBOLS_SECTIONS,
 #if 1
 		R_FLAGS_FS_SECTIONS,
 		R_FLAGS_FS_SEGMENTS,
 #endif
 		NULL);
+	if (!fi) {
+		// nothing in the well known spaces, take whatever else is flagged here
+		fi = r_flag_get_by_spaces (f, prionospace, off, NULL);
+	}
+	return fi;
 }
 
 static void ev_iowrite_cb(REvent *ev, int type, void *user, void *data) {
@@ -2841,6 +2862,7 @@ R_API void r_core_fini(RCore *c) {
 	free (c->table_query);
 	r_list_free (c->watchers);
 	r_list_free (c->scriptstack);
+	r_list_free (c->scripts);
 	r_core_task_scheduler_fini (&c->tasks);
 	free (c->sessionfile);
 	r_libstore_free (c->libstore);
@@ -3164,10 +3186,29 @@ R_API int r_core_prompt_exec(RCore *r) {
 	return ret;
 }
 
+R_API ut32 r_core_block_size_get(RCore *core) {
+	R_RETURN_VAL_IF_FAIL (core, 0);
+	RCoreTask *task = r_core_task_self (&core->tasks);
+	if (task && task->cur_context) {
+		return task->cur_context->blocksize;
+	}
+	r_th_lock_enter (core->lock);
+	const ut32 blocksize = core->blocksize;
+	r_th_lock_leave (core->lock);
+	return blocksize;
+}
+
+static void core_context_set_block_size(RCore *core, ut32 blocksize) {
+	RCoreTask *task = r_core_task_self (&core->tasks);
+	RCmdContext *ctx = task? task->cur_context: NULL;
+	while (ctx) {
+		ctx->blocksize = blocksize;
+		ctx = ctx->parent;
+	}
+}
+
 R_API int r_core_block_size(RCore *core, int bsize) {
-	const ut64 addr = core->addr;
-	ut8 *bump;
-	int ret = false;
+	R_RETURN_VAL_IF_FAIL (core, false);
 	if (r_sandbox_enable (0)) {
 		// TODO : restrict to filesize?
 		if (bsize > 1024 * 1024 * 32) {
@@ -3175,31 +3216,29 @@ R_API int r_core_block_size(RCore *core, int bsize) {
 			return false;
 		}
 	}
+	r_th_lock_enter (core->lock);
 	if (bsize < 0) {
+		r_th_lock_leave (core->lock);
 		return false;
 	}
 	if (bsize == core->blocksize) {
+		r_th_lock_leave (core->lock);
+		core_context_set_block_size (core, bsize);
 		return true;
 	}
 	if (bsize > core->blocksize_max) {
 		R_LOG_ERROR ("Block size %d is too big", bsize);
 		// r_sys_breakpoint ();
+		r_th_lock_leave (core->lock);
 		return false;
 	}
-	R_CRITICAL_ENTER (core);
-	core->addr = addr;
 	if (bsize < 1) {
 		bsize = 1;
-	} else if (core->blocksize_max && bsize > core->blocksize_max) {
-		R_LOG_ERROR ("bsize is bigger than `bm`. dimmed to 0x%x > 0x%x",
-			bsize,
-			core->blocksize_max);
-		bsize = core->blocksize_max;
 	}
-	bump = realloc (core->block, bsize + 1);
+	ut8 *bump = realloc (core->block, bsize + 1);
+	int ret = false;
 	if (!bump) {
 		R_LOG_ERROR ("Oops. cannot allocate that much (%u)", bsize);
-		ret = false;
 	} else {
 		ret = true;
 		core->block = bump;
@@ -3207,7 +3246,10 @@ R_API int r_core_block_size(RCore *core, int bsize) {
 		memset (core->block, 0xff, core->blocksize);
 		r_core_block_read (core);
 	}
-	R_CRITICAL_LEAVE (core);
+	r_th_lock_leave (core->lock);
+	if (ret) {
+		core_context_set_block_size (core, bsize);
+	}
 	return ret;
 }
 

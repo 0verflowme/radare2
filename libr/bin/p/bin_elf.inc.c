@@ -115,6 +115,113 @@ static bool sections_vec(RBinFile *bf) {
 	return true;
 }
 
+static inline bool reloc_is_import(ELFOBJ *eo, const RBinElfReloc *rel) {
+	return rel->sym && rel->sym < eo->imports_by_ord_size && eo->imports_by_ord[rel->sym];
+}
+
+#ifndef R_BIN_CGC
+#include "../format/swift/swift.h"
+
+// glue for the shared swift5 metadata walker in format/swift/swift.c
+
+typedef struct {
+	RBinFile *bf;
+	ELFOBJ *eo;
+	HtUP *relocs_ht; // rva -> RBinElfReloc*
+} SwiftElfCtx;
+
+static int swift_elf_read_at(void *user, ut64 va, ut8 *buf, int len) {
+	SwiftElfCtx *ctx = user;
+	const ut64 pa = Elf_(v2p) (ctx->eo, va);
+	if (pa == UT64_MAX) {
+		return 0;
+	}
+	return r_buf_read_at (ctx->bf->buf, pa, buf, len);
+}
+
+static char *swift_elf_slot(void *user, ut64 va, ut64 *target) {
+	SwiftElfCtx *ctx = user;
+	ELFOBJ *eo = ctx->eo;
+	RBinElfReloc *rel = ctx->relocs_ht? ht_up_find (ctx->relocs_ht, va, NULL): NULL;
+	if (rel) {
+		if (rel->sym > 0) {
+			if (reloc_is_import (eo, rel)) {
+				return strdup (r_bin_name_tostring2 (eo->imports_by_ord[rel->sym]->name, 'o'));
+			}
+			if (rel->sym < eo->symbols_by_ord_size && eo->symbols_by_ord[rel->sym]) {
+				return strdup (r_bin_name_tostring2 (eo->symbols_by_ord[rel->sym]->name, 'o'));
+			}
+		}
+		if (rel->laddr) {
+			*target = rel->laddr + rel->addend;
+		} else if (rel->addend > 0) {
+			*target = rel->addend;
+		}
+		return NULL;
+	}
+	ut8 b[sizeof (Elf_(Addr))] = {0};
+	if (swift_elf_read_at (user, va, b, sizeof (b)) == (int)sizeof (b)) {
+		const ut64 v = r_read_ble (b, eo->endian, 8 * sizeof (Elf_(Addr)));
+		if (v) {
+			*target = v;
+		}
+	}
+	return NULL;
+}
+
+static RList *swift_classes(RBinFile *bf) {
+	R_RETURN_VAL_IF_FAIL (bf && bf->bo && bf->bo->bin_obj, NULL);
+	ELFOBJ *eo = bf->bo->bin_obj;
+	const RVecRBinSection *sections = Elf_(load_sections) (bf, eo);
+	if (!sections) {
+		return NULL;
+	}
+	ut64 types_va = 0, protos_va = 0;
+	ut64 types_size = 0, protos_size = 0;
+	RBinSection *s;
+	R_VEC_FOREACH (sections, s) {
+		if (!s->name) {
+			continue;
+		}
+		if (strstr (s->name, "swift5_type_metadata")) {
+			types_va = s->vaddr;
+			types_size = s->size;
+		} else if (strstr (s->name, "swift5_protocols")) {
+			protos_va = s->vaddr;
+			protos_size = s->size;
+		}
+	}
+	if (!types_va || !types_size) {
+		return NULL;
+	}
+	SwiftElfCtx ctx = { .bf = bf, .eo = eo, .relocs_ht = ht_up_new0 () };
+	Elf_(load_imports_vec) (eo); // fill imports_by_ord for reloc symbol names
+	const RVecRBinElfReloc *relocs = Elf_(load_relocs) (eo);
+	if (relocs) {
+		RBinElfReloc *r;
+		R_VEC_FOREACH (relocs, r) {
+			ht_up_insert (ctx.relocs_ht, r->rva, r);
+		}
+	}
+	RList *ret = r_list_newf ((RListFree)r_bin_class_free);
+	RBinSwiftLoader ld = {
+		.bf = bf,
+		.user = &ctx,
+		.read_at = swift_elf_read_at,
+		.slot = swift_elf_slot,
+		.symbols = Elf_(load_symbols_vec) (bf, eo),
+	};
+	const int limit = bf->rbin? bf->rbin->options.limit: 0;
+	r_bin_swift_load_classes (&ld, ret, types_va, types_size, protos_va, protos_size, limit);
+	ht_up_free (ctx.relocs_ht);
+	if (r_list_empty (ret)) {
+		r_list_free (ret);
+		return NULL;
+	}
+	return ret;
+}
+#endif
+
 #ifndef R_BIN_CGC
 static bool load_resources(RBinFile *bf) {
 	R_RETURN_VAL_IF_FAIL (bf && bf->bo && bf->bo->bin_obj, false);
@@ -326,7 +433,7 @@ static bool symbols_vec(RBinFile *bf) {
 		return true;
 	}
 	ELFOBJ *eo = bf->bo->bin_obj;
-	RVecRBinSymbol *symbols = Elf_(load_symbols_vec) (eo);
+	RVecRBinSymbol *symbols = Elf_(load_symbols_vec) (bf, eo);
 	if (!symbols) {
 		return false;
 	}
@@ -336,7 +443,7 @@ static bool symbols_vec(RBinFile *bf) {
 	eo->symbols_cached = false;
 
 	// Also add PLT entries from imports
-	RVecRBinSymbol *plt_symbols = Elf_(load_plt_symbols_vec) (eo);
+	RVecRBinSymbol *plt_symbols = Elf_(load_plt_symbols_vec) (bf, eo);
 	if (plt_symbols && !RVecRBinSymbol_empty (plt_symbols)) {
 		RBinSymbol *sym;
 		R_VEC_FOREACH (plt_symbols, sym) {
@@ -384,12 +491,13 @@ static RList* libs(RBinFile *bf) {
 	return ret;
 }
 
-static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
+// appends the converted reloc to `out` and returns it, or NULL if unsupported
+static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr, RVecRBinReloc *out) {
 	R_RETURN_VAL_IF_FAIL (eo && rel, NULL);
 	ut64 B = eo->baddr;
 	ut64 P = rel->rva; // rva has taken baddr into account
 
-	RBinReloc *r = R_NEW0 (RBinReloc);
+	RBinReloc *r = RVecRBinReloc_emplace_back (out);
 	r->ntype = rel->type;
 	r->addend = rel->addend;
 	r->vaddr = rel->rva;
@@ -405,20 +513,18 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
 		} else {
 			r->type = R_BIN_RELOC_64;
 		}
-		r->additive = true;
+		r->additive = !rel->implicit_addend;
 	}
-	if (rel->sym) {
-		if (rel->sym < eo->imports_by_ord_size && eo->imports_by_ord[rel->sym]) {
-			r->import = r_bin_import_clone (eo->imports_by_ord[rel->sym]);
-		} else if (rel->sym < eo->symbols_by_ord_size && eo->symbols_by_ord[rel->sym]) {
-			r->symbol = eo->symbols_by_ord[rel->sym];
-		}
+	if (reloc_is_import (eo, rel)) {
+		r->import = r_bin_import_clone (eo->imports_by_ord[rel->sym]);
+	} else if (rel->sym && rel->sym < eo->symbols_by_ord_size && eo->symbols_by_ord[rel->sym]) {
+		r->symbol = eo->symbols_by_ord[rel->sym];
 	}
 
 	ut64 sym_vaddr = r->symbol ? r->symbol->vaddr : (rel->sym ? rel->rva : 0);
 
 	#define SET(T) r->type = R_BIN_RELOC_ ## T; r->additive = 0; return r
-	#define ADD(T, A) do { r->type = R_BIN_RELOC_ ## T; st32 _tmp; if (!r_add_overflow_st32 (r->addend, A, &_tmp)) { r->addend = _tmp; } r->additive = rel->mode == DT_RELA || rel->mode == DT_CREL; return r; } while (0)
+	#define ADD(T, A) do { r->type = R_BIN_RELOC_ ## T; st32 _tmp; if (!r_add_overflow_st32 (r->addend, A, &_tmp)) { r->addend = _tmp; } r->additive = !rel->implicit_addend; return r; } while (0)
 
 	// Early return if it's a CREL relocation - it was already set up in the initialization above
 	if (rel->mode == DT_CREL) {
@@ -439,6 +545,12 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
 	}
 
 	switch (eo->ehdr.e_machine) {
+	case EM_CUDA:
+		/* CUDA's standard ELF relocation is a 64-bit absolute reference. */
+		if (rel->type == 2) {
+			ADD (64, 0);
+		}
+		break;
 	case EM_S390:
 		switch (rel->type) {
 		case R_390_GLOB_DAT: // globals
@@ -552,6 +664,7 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
 		case R_AARCH64_JUMP_SLOT: SET (64); break;
 		case R_AARCH64_COPY: ADD (64, 0); break; // copy symbol at runtime
 		case R_AARCH64_RELATIVE: ADD (64, B); break;
+		case R_AARCH64_IRELATIVE: r->is_ifunc = true; SET (64); break;
 		// data references
 		case R_AARCH64_PREL16: ADD (16, B); break;
 		case R_AARCH64_PREL32: ADD (32, B); break;
@@ -571,8 +684,15 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
 		case R_AARCH64_LDST32_ABS_LO12_NC:
 		case R_AARCH64_LDST64_ABS_LO12_NC:
 		case R_AARCH64_LDST128_ABS_LO12_NC:
-			ADD (32, 0);
-			break;
+		case R_AARCH64_ADR_PREL_LO21:
+		case R_AARCH64_LD_PREL_LO19:
+		case R_AARCH64_GOT_LD_PREL19:
+		case R_AARCH64_ADR_GOT_PAGE:
+		case R_AARCH64_LD64_GOT_LO12_NC:
+		case R_AARCH64_TSTBR14:
+		case R_AARCH64_CONDBR19:
+		// a type patched here but unconverted aliases onto the next import slot
+		case R_AARCH64_JUMP26:
 		case R_AARCH64_CALL26:
 			ADD (32, 0);
 			break;
@@ -632,7 +752,7 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
 #define R_AARCH64_MOVW_PREL_G3		293
 #endif
 		default:
-			R_LOG_WARN ("Unsupported reloc type %d for aarch64", rel->type);
+			R_LOG_DEBUG ("Unsupported reloc type %d for aarch64", rel->type);
 			break; // reg relocations
 		}
 		break;
@@ -783,7 +903,7 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
 	}
 #undef SET
 #undef ADD
-	r_bin_reloc_free (r);
+	RVecRBinReloc_pop_back (out);
 	return NULL;
 }
 
@@ -836,13 +956,10 @@ static ut32 murmur3_32(const char* data, ut32 len, ut32 seed) {
 	return hash;
 }
 
-static RList* relocs(RBinFile *bf) {
+static RVecRBinReloc *relocs(RBinFile *bf) {
 	R_RETURN_VAL_IF_FAIL (bf && bf->bo && bf->bo->bin_obj, NULL);
 	ELFOBJ *eo = bf->bo->bin_obj;
-	if (eo->relocs_list) {
-		return eo->relocs_list;
-	}
-	RList *ret = r_list_newf ((RListFree)r_bin_reloc_free);
+	RVecRBinReloc *ret = RVecRBinReloc_new ();
 	if (!ret) {
 		return NULL;
 	}
@@ -865,6 +982,7 @@ static RList* relocs(RBinFile *bf) {
 		return ret;
 	}
 
+	RVecRBinReloc_reserve (ret, RVecRBinElfReloc_length (relocs));
 	RBinElfReloc *reloc;
 	R_VEC_FOREACH (relocs, reloc) {
 		bool already_inserted = false;
@@ -872,54 +990,132 @@ static RList* relocs(RBinFile *bf) {
 		if (already_inserted) {
 			continue;
 		}
-
-		RBinReloc *ptr = reloc_convert (eo, reloc, got_addr);
-		if (ptr && ptr->paddr != UT64_MAX) {
-			r_list_append (ret, ptr);
-			ht_up_insert (reloc_ht, reloc->rva, ptr);
-		} else {
-			if (ptr) {
-				ht_up_insert (reloc_ht, reloc->rva, NULL);
-				r_bin_reloc_free (ptr);
-			} else {
-				if (reloc->rva != reloc->offset) {
-					ht_up_insert (reloc_ht, reloc->rva, ptr);
-					R_LOG_DEBUG ("Suspicious reloc patching at 0x%"PFMT64x" for 0x%08"PFMT64x" via 0x%"PFMT64x,
-						got_addr, reloc->rva, reloc->offset);
-				} else {
-					if (reloc->rva) {
-						R_LOG_WARN ("reloc conversion failed for 0x%"PFMT64x, got_addr);
-					} else {
-						R_LOG_DEBUG ("wrong reloc conversion failed for 0x%"PFMT64x, got_addr);
-					}
-				}
+		RBinReloc *ptr = reloc_convert (eo, reloc, got_addr, ret);
+		if (ptr) {
+			ht_up_insert (reloc_ht, reloc->rva, NULL);
+			if (ptr->paddr == UT64_MAX) {
+				RVecRBinReloc_pop_back (ret);
 			}
+		} else if (reloc->rva != reloc->offset) {
+			ht_up_insert (reloc_ht, reloc->rva, NULL);
+			R_LOG_DEBUG ("Suspicious reloc patching at 0x%"PFMT64x" for 0x%08"PFMT64x" via 0x%"PFMT64x,
+				got_addr, reloc->rva, reloc->offset);
+		} else if (reloc->rva && got_addr != UT64_MAX) {
+			R_LOG_WARN ("reloc conversion failed for 0x%"PFMT64x, got_addr);
+		} else {
+			R_LOG_DEBUG ("wrong reloc conversion failed for 0x%"PFMT64x, got_addr);
 		}
 	}
 	ht_up_free (reloc_ht);
-	eo->relocs_list = ret;
-#if 0
-	ret->free = NULL; // already freed in the hashtable
-	return r_list_clone (eo->relocs_list, NULL);
-#endif
-	RList *result = ret;
-	eo->relocs_list = NULL; // caller takes ownership
-	return result;
+	return ret;
 }
 
-static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc *rel, ut64 S, ut64 B, ut64 L, ut64 toc) {
+// a64 instruction words are little endian on disk even on be targets
+static void aarch64_patch_insn(RIOBind *iob, ut64 at, ut32 mask, ut32 val) {
+	ut8 buf[4] = {0};
+	// without the original opcode bits a patch would fabricate an instruction
+	if (iob->read_at (iob->io, at, buf, sizeof (buf)) != sizeof (buf)) {
+		return;
+	}
+	r_write_le32 (buf, (r_read_le32 (buf) & ~mask) | (val & mask));
+	iob->overlay_write_at (iob->io, at, buf, sizeof (buf));
+}
+
+static bool disp_fits(st64 x, int bits) {
+	return x >= -(1LL << (bits - 1)) && x < (1LL << (bits - 1));
+}
+
+// adr and adrp scatter their 21 bit immediate into the immlo:immhi fields
+static void aarch64_patch_adr(RIOBind *iob, ut64 at, st64 imm) {
+	aarch64_patch_insn (iob, at, (0x3 << 29) | (0x7ffff << 5),
+		((ut32)(imm & 3) << 29) | ((ut32)(imm >> 2) << 5));
+}
+
+static bool aarch64_got_reloc(int type) {
+	return type == R_AARCH64_ADR_GOT_PAGE || type == R_AARCH64_LD64_GOT_LO12_NC
+		|| type == R_AARCH64_GOT_LD_PREL19;
+}
+
+static void aarch64_patch_branch(RIOBind *iob, RBinElfReloc *rel, ut64 at, st64 disp, int nbits, int shift) {
+	// a truncated branch invents a call target, worse than leaving it
+	if ((disp & 3) || !disp_fits (disp, nbits + 2)) {
+		R_LOG_DEBUG ("unencodable aarch64 reloc %d at 0x%"PFMT64x, rel->type, rel->rva);
+		return;
+	}
+	aarch64_patch_insn (iob, at, ((1U << nbits) - 1) << shift, (ut32)(disp >> 2) << shift);
+}
+
+// where the loader put a bin-space address: its owner either moved by
+// baddr_shift or did not, and the maps of the file's own fd say which
+static ut64 elf_io_addr(RBinFile *bf, ELFOBJ *eo, ut64 v) {
+	RBinObject *o = bf->bo;
+	const st64 shift = o->baddr_shift;
+	if (!shift || !o->info || !o->info->has_va) {
+		return v;
+	}
+	const ut64 moved = v + shift;
+	const ut64 off = Elf_(v2p) (eo, v);
+	if (off == UT64_MAX) {
+		return moved;
+	}
+	RBin *b = bf->rbin;
+	RIO *io = b->iob.io;
+	RIOBank *bank = b->iob.bank_get (io, io->bank);
+	if (!bank) {
+		return moved;
+	}
+	RListIter *iter;
+	RIOMapRef *mapref;
+	ut64 agreed = UT64_MAX;
+	bool any = false, disagree = false, unmoved = false;
+	r_list_foreach (bank->maprefs, iter, mapref) {
+		RIOMap *map = b->iob.map_get (io, mapref->id);
+		if (!map || map->fd != bf->fd || off < map->delta
+				|| off >= map->delta + r_io_map_size (map)) {
+			continue;
+		}
+		const ut64 at = r_io_map_from (map) + (off - map->delta);
+		if (at == moved) {
+			return moved;
+		}
+		if (at == v) {
+			unmoved = true;
+		} else if (!any) {
+			agreed = at;
+			any = true;
+		} else if (at != agreed) {
+			disagree = true;
+		}
+	}
+	if (unmoved) {
+		return v;
+	}
+	return (any && !disagree)? agreed: moved;
+}
+
+static void _patch_reloc(RBinFile *bf, ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc *rel, ut64 P, ut64 S, ut64 B, ut64 L, ut64 toc) {
 	ut64 V = 0;
 	ut64 A = rel->addend;
-	ut64 P = rel->rva;
 	ut8 buf[8] = {0};
+	// rel/relr carry no explicit addend: the slot's own word is it
+	if (rel->mode == DT_RELR || e_machine == EM_386) {
+		ut8 slot[8] = {0};
+		const int ws = (e_machine == EM_386)? 4: (int)sizeof (Elf_(Addr));
+		if (iob->read_at (iob->io, P, slot, ws) != ws) {
+			return;
+		}
+		if (rel->implicit_addend) {
+			A = r_read_ble (slot, bo->endian, 8 * ws);
+		}
+	}
 	switch (e_machine) {
 	case EM_S390:
 		switch (rel->type) {
 		case R_390_GLOB_DAT: // globals
-			iob->overlay_write_at (iob->io, rel->rva, buf, 8);
+			iob->overlay_write_at (iob->io, P, buf, 8);
 			break;
 		case R_390_RELATIVE:
-			iob->overlay_write_at (iob->io, rel->rva, buf, 8);
+			iob->overlay_write_at (iob->io, P, buf, 8);
 			break;
 		}
 		break;
@@ -927,7 +1123,9 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 	{
 		ut32 insn = 0;
 		st64 addend = rel->addend;
-		iob->read_at (iob->io, rel->rva, buf, 4);
+		if (iob->read_at (iob->io, P, buf, 4) != 4) {
+			return;
+		}
 		insn = r_read_ble32 (buf, bo->endian);
 		if (rel->mode == DT_REL) {
 			switch (rel->type) {
@@ -937,6 +1135,22 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 				st32 imm = (st32)((insn & 0x00ffffff) << 2);
 				if (imm & 0x02000000) {
 					imm |= ~0x03ffffff;
+				}
+				addend = imm;
+				break;
+			}
+			case R_ARM_THM_PC22:
+			case R_ARM_THM_JUMP24: {
+				const ut32 hi = r_read_ble16 (buf, bo->endian);
+				const ut32 lo = r_read_ble16 (buf + 2, bo->endian);
+				const ut32 sb = (hi >> 10) & 1;
+				// i1/i2 are stored inverted against the sign
+				const ut32 i1 = ((lo >> 13) & 1) ^ sb ^ 1;
+				const ut32 i2 = ((lo >> 11) & 1) ^ sb ^ 1;
+				st32 imm = (sb << 24) | (i1 << 23) | (i2 << 22)
+					| ((hi & 0x3ff) << 12) | ((lo & 0x7ff) << 1);
+				if (sb) {
+					imm |= ~0x01ffffff;
 				}
 				addend = imm;
 				break;
@@ -977,6 +1191,25 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 			r_write_ble32 (buf, insn, bo->endian);
 			break;
 		}
+		case R_ARM_THM_PC22:
+		case R_ARM_THM_JUMP24: {
+			const st64 target = S + addend - P;
+			ut32 hi = r_read_ble16 (buf, bo->endian);
+			ut32 lo = r_read_ble16 (buf + 2, bo->endian);
+			// blx switches to arm state, so it needs 4 alignment
+			const st64 amask = (lo & 0x1000)? 1: 3;
+			// a thumb branch reaches +-16MB, leave the rest alone
+			if ((target & amask) || !disp_fits (target, 25)) {
+				return;
+			}
+			const ut32 sb = (target >> 24) & 1;
+			hi = (hi & 0xf800) | (sb << 10) | ((target >> 12) & 0x3ff);
+			lo = (lo & 0xd000) | ((((target >> 23) & 1) ^ sb ^ 1) << 13)
+				| ((((target >> 22) & 1) ^ sb ^ 1) << 11) | ((target >> 1) & 0x7ff);
+			r_write_ble16 (buf, hi, bo->endian);
+			r_write_ble16 (buf + 2, lo, bo->endian);
+			break;
+		}
 		case R_ARM_MOVW_ABS_NC:
 		case R_ARM_MOVW_PREL_NC: {
 			ut64 val = S + addend;
@@ -1010,24 +1243,30 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 			}
 			break;
 		}
-		iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+		iob->overlay_write_at (iob->io, P, buf, 4);
 		}
 		break;
 	case EM_AARCH64: {
-		ut32 insn = 0;
+		int word = 0;
+		// only an import has a GOT entry here: the .got.r2 slot that S names
+		if (aarch64_got_reloc (rel->type)) {
+			if (!reloc_is_import (bo, rel)) {
+				R_LOG_DEBUG ("unpatched aarch64 got reloc %d at 0x%"PFMT64x, rel->type, rel->rva);
+				break;
+			}
+			A = 0; // the addend selects the entry, it is no offset from it
+		}
 		switch (rel->type) {
+		case R_AARCH64_ADR_GOT_PAGE:
 		case R_AARCH64_ADR_PREL_PG_HI21:
 		case R_AARCH64_ADR_PREL_PG_HI21_NC: {
-			iob->read_at (iob->io, rel->rva, buf, 4);
-			insn = r_read_ble32 (buf, bo->endian);
-			st64 page_delta = ((S + A) & ~(st64)0xfff) - (P & ~(st64)0xfff);
-			st64 imm = page_delta >> 12;
-			ut32 immlo = (ut32)(imm & 3);
-			ut32 immhi = (ut32)((imm >> 2) & 0x7ffff);
-			insn &= ~((0x3 << 29) | (0x7ffff << 5));
-			insn |= (immlo << 29) | (immhi << 5);
-			r_write_ble32 (buf, insn, bo->endian);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+			const st64 imm = (((st64)(S + A) & ~(st64)0xfff) - ((st64)P & ~(st64)0xfff)) >> 12;
+			// the _NC variant is defined to wrap, so only the checked ones are refused
+			if (rel->type != R_AARCH64_ADR_PREL_PG_HI21_NC && !disp_fits (imm, 21)) {
+				R_LOG_DEBUG ("unencodable aarch64 reloc %d at 0x%"PFMT64x, rel->type, rel->rva);
+				break;
+			}
+			aarch64_patch_adr (iob, P, imm);
 			break;
 		}
 		case R_AARCH64_ADD_ABS_LO12_NC:
@@ -1035,9 +1274,8 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 		case R_AARCH64_LDST16_ABS_LO12_NC:
 		case R_AARCH64_LDST32_ABS_LO12_NC:
 		case R_AARCH64_LDST64_ABS_LO12_NC:
+		case R_AARCH64_LD64_GOT_LO12_NC:
 		case R_AARCH64_LDST128_ABS_LO12_NC: {
-			iob->read_at (iob->io, rel->rva, buf, 4);
-			insn = r_read_ble32 (buf, bo->endian);
 			int shift = 0;
 			switch (rel->type) {
 			case R_AARCH64_LDST16_ABS_LO12_NC:
@@ -1047,43 +1285,91 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 				shift = 2;
 				break;
 			case R_AARCH64_LDST64_ABS_LO12_NC:
+			case R_AARCH64_LD64_GOT_LO12_NC:
 				shift = 3;
 				break;
 			case R_AARCH64_LDST128_ABS_LO12_NC:
 				shift = 4;
 				break;
-			default:
-				shift = 0;
-				break;
 			}
-			ut32 imm12 = (ut32)(((S + A) >> shift) & 0xfff);
-			insn &= ~(0xfff << 10);
-			insn |= imm12 << 10;
-			r_write_ble32 (buf, insn, bo->endian);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+			// the field is bits 11:shift of S + A, not bits shift+11:shift
+			aarch64_patch_insn (iob, P, 0xfff << 10,
+				(ut32)(((S + A) & 0xfff) >> shift) << 10);
 			break;
 		}
+		case R_AARCH64_JUMP26:
+		case R_AARCH64_CALL26:
+			aarch64_patch_branch (iob, rel, P, (st64)(S + A) - (st64)P, 26, 0);
+			break;
+		case R_AARCH64_CONDBR19:
+		case R_AARCH64_LD_PREL_LO19:
+		case R_AARCH64_GOT_LD_PREL19:
+			aarch64_patch_branch (iob, rel, P, (st64)(S + A) - (st64)P, 19, 5);
+			break;
+		case R_AARCH64_TSTBR14:
+			aarch64_patch_branch (iob, rel, P, (st64)(S + A) - (st64)P, 14, 5);
+			break;
+		case R_AARCH64_ADR_PREL_LO21: {
+			const st64 disp = (st64)(S + A) - (st64)P;
+			if (disp_fits (disp, 21)) {
+				aarch64_patch_adr (iob, P, disp);
+			} else {
+				R_LOG_DEBUG ("unencodable aarch64 reloc %d at 0x%"PFMT64x, rel->type, rel->rva);
+			}
+			break;
+		}
+		case R_AARCH64_MOVW_UABS_G0:
+		case R_AARCH64_MOVW_UABS_G0_NC:
+		case R_AARCH64_MOVW_UABS_G1:
+		case R_AARCH64_MOVW_UABS_G1_NC:
+		case R_AARCH64_MOVW_UABS_G2:
+		case R_AARCH64_MOVW_UABS_G2_NC:
+		case R_AARCH64_MOVW_UABS_G3: {
+			// hw already selects the group, only imm16 may be rewritten
+			const int g = (rel->type - R_AARCH64_MOVW_UABS_G0) / 2;
+			aarch64_patch_insn (iob, P, 0xffff << 5,
+				(ut32)(((S + A) >> (g * 16)) & 0xffff) << 5);
+			break;
+		}
+		case R_AARCH64_ABS16:
+			word = 2;
+			V = S + A;
+			break;
+		case R_AARCH64_ABS32:
+			word = 4;
+			V = S + A;
+			break;
+		case R_AARCH64_PREL16:
+			word = 2;
+			V = S + A - P;
+			break;
+		case R_AARCH64_PREL32:
+			word = 4;
+			V = S + A - P;
+			break;
+		case R_AARCH64_PREL64:
+			word = 8;
+			V = S + A - P;
+			break;
 		case R_AARCH64_RELATIVE:
+		case R_AARCH64_IRELATIVE:
+			word = 8;
 			V = B + A;
-			r_write_ble64 (buf, V, bo->endian);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 8);
+			break;
 			break;
 		case R_AARCH64_GLOB_DAT:
 		case R_AARCH64_JUMP_SLOT:
 		case R_AARCH64_ABS64:
+			word = 8;
 			V = S + A;
-			r_write_ble64 (buf, V, bo->endian);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 8);
 			break;
 		default:
-			V = S + A;
-			iob->read_at (iob->io, rel->rva, buf, 8);
-			// only patch the relocs that are initialized with zeroes
-			// if the destination contains a different value it's a constant useful for static analysis
-			ut64 addr = r_read_ble64 (buf, bo->endian);
-			r_write_ble64 (buf, addr? A: S, bo->endian);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 8);
+			R_LOG_DEBUG ("unpatched aarch64 reloc type %d at 0x%"PFMT64x, rel->type, rel->rva);
 			break;
+		}
+		if (word) {
+			r_write_ble (buf, V, bo->endian, word * 8);
+			iob->overlay_write_at (iob->io, P, buf, word);
 		}
 		}
 		break;
@@ -1113,7 +1399,7 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 		case R_PPC64_JMP_SLOT: { // 21 — write the PLT stub vaddr to the GOT slot, S when no stub is known
 			ut64 stub = Elf_(ppc64_get_plt_stub_for_slot) (bo, rel->rva);
 			word = 8;
-			V = (stub != UT64_MAX) ? stub : S;
+			V = (stub != UT64_MAX)? elf_io_addr (bf, bo, stub): S;
 			break;
 		}
 		case R_PPC64_ADDR64: // 38 — S + A (absolute 64-bit)
@@ -1158,58 +1444,68 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 			switch (low) {
 			case 14:
 				V &= (1 << 14) - 1;
-				iob->read_at (iob->io, rel->rva, buf, 4);
+				if (iob->read_at (iob->io, P, buf, 4) != 4) {
+					return;
+				}
 				r_write_ble32 (buf, (r_read_ble32 (buf, bo->endian) & ~((1<<16) - (1<<2))) | V << 2, bo->endian);
-				iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+				iob->overlay_write_at (iob->io, P, buf, 4);
 				break;
 			case 24:
 				V &= (1 << 24) - 1;
-				iob->read_at (iob->io, rel->rva, buf, 4);
+				if (iob->read_at (iob->io, P, buf, 4) != 4) {
+					return;
+				}
 				r_write_ble32 (buf, (r_read_ble32 (buf, bo->endian) & ~((1<<26) - (1<<2))) | V << 2, bo->endian);
-				iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+				iob->overlay_write_at (iob->io, P, buf, 4);
 				break;
 			}
 		} else if (word) {
 			switch (word) {
 			case 2:
 				r_write_ble16 (buf, V, bo->endian);
-				iob->overlay_write_at (iob->io, rel->rva, buf, 2);
+				iob->overlay_write_at (iob->io, P, buf, 2);
 				break;
 			case 4:
 				r_write_ble32 (buf, V, bo->endian);
-				iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+				iob->overlay_write_at (iob->io, P, buf, 4);
 				break;
 			case 8:
 				r_write_ble64 (buf, V, bo->endian);
-				iob->overlay_write_at (iob->io, rel->rva, buf, 8);
+				iob->overlay_write_at (iob->io, P, buf, 8);
 				break;
 			}
 		} else if (ds) {
-			iob->read_at (iob->io, rel->rva, buf, 2);
+			if (iob->read_at (iob->io, P, buf, 2) != 2) {
+				return;
+			}
 			ut16 cur = r_read_ble16 (buf, bo->endian);
 			r_write_ble16 (buf, (cur & 3) | (V & 0xfffc), bo->endian);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 2);
+			iob->overlay_write_at (iob->io, P, buf, 2);
 		}
 		break;
 	}
 	case EM_386:
- 		switch (rel->type) {
- 		case R_386_32:
- 		case R_386_PC32:
-			{
- 			r_io_read_at (iob->io, rel->rva, buf, 4);
- 			ut32 v = r_read_le32 (buf) + S + A;
- 			if (rel->type == R_386_PC32) {
- 				v -= P;
- 			}
- 			r_write_le32 (buf, v);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 4);
-			}
+		switch (rel->type) {
+		case R_386_32:
+			V = S + A;
 			break;
- 		default:
- 			break;
- 		}
- 		break;
+		case R_386_PC32:
+			V = S + A - P;
+			break;
+		case R_386_GLOB_DAT:
+		case R_386_JMP_SLOT:
+			V = S;
+			break;
+		case R_386_RELATIVE:
+			// wants the load bias, which is 0 in an unrebased view
+			V = A;
+			break;
+		default:
+			return;
+		}
+		r_write_ble32 (buf, V, bo->endian);
+		iob->overlay_write_at (iob->io, P, buf, 4);
+		break;
 	case EM_X86_64: {
 		int word = 0;
 		switch (rel->type) {
@@ -1280,19 +1576,19 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 			break;
 		case 1:
 			buf[0] = V;
-			iob->overlay_write_at (iob->io, rel->rva, buf, 1);
+			iob->overlay_write_at (iob->io, P, buf, 1);
 			break;
 		case 2:
 			r_write_le16 (buf, V);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 2);
+			iob->overlay_write_at (iob->io, P, buf, 2);
 			break;
 		case 4:
 			r_write_le32 (buf, V);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 4);
+			iob->overlay_write_at (iob->io, P, buf, 4);
 			break;
 		case 8:
 			r_write_le64 (buf, V);
-			iob->overlay_write_at (iob->io, rel->rva, buf, 8);
+			iob->overlay_write_at (iob->io, P, buf, 8);
 			break;
 		}
 		break;
@@ -1380,7 +1676,7 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 			ut64 sym_addr = 0;
 			if (rel->sym) {
 				// Check imports first
-				if (rel->sym < bo->imports_by_ord_size && bo->imports_by_ord[rel->sym]) {
+				if (reloc_is_import (bo, rel)) {
 					RBinImport *import = bo->imports_by_ord[rel->sym];
 					if (import && import->name) {
 						sym_name = r_bin_name_tostring (import->name);
@@ -1427,7 +1723,19 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc 
 	}
 }
 
-static RList* patch_relocs(RBinFile *bf) {
+// parse the exception regions referenced by the eh_frame FDEs
+static RVecRBinTrycatch *trycatch(RBinFile *bf) {
+	R_RETURN_VAL_IF_FAIL (bf && bf->bo && bf->bo->bin_obj, NULL);
+	ELFOBJ *eo = bf->bo->bin_obj;
+	if (!eo->trycatch_loaded) {
+		eo->trycatch_loaded = true;
+		r_bin_dwarf_parse_eh_frame (bf, &eo->trycatch);
+		RVecRBinTrycatch_shrink_to_fit (&eo->trycatch);
+	}
+	return &eo->trycatch;
+}
+
+static RVecRBinReloc *patch_relocs(RBinFile *bf) {
 	R_RETURN_VAL_IF_FAIL (bf && bf->rbin, NULL);
 	RBinReloc *ptr = NULL;
 	RBin *b = bf->rbin;
@@ -1469,10 +1777,16 @@ static RList* patch_relocs(RBinFile *bf) {
 		return NULL;
 	}
 	ut64 n_vaddr = g->itv.addr + g->itv.size;
-	// Align ET_REL PPC REL24/REL14 relocs
-	if ((eo->ehdr.e_machine == EM_PPC64 || eo->ehdr.e_machine == EM_PPC)
-			&& eo->ehdr.e_type == ET_REL) {
-		n_vaddr = (n_vaddr + 3) & ~(ut64)3;
+	// the loader put the slot area below its NOBITS block; 0 without shdr
+	if (eo->ehdr.e_type == ET_REL && eo->etrel_slots) {
+		n_vaddr = elf_io_addr (bf, eo, eo->baddr + eo->etrel_slots);
+	}
+	// branch and lo12 relocs cannot encode a misaligned import slot address
+	if (eo->ehdr.e_type == ET_REL && (eo->ehdr.e_machine == EM_PPC64
+			|| eo->ehdr.e_machine == EM_PPC || eo->ehdr.e_machine == EM_AARCH64
+			|| eo->ehdr.e_machine == EM_ARM)) {
+		const ut64 slot = (cdsz > 0)? cdsz: 4;
+		n_vaddr = (n_vaddr + slot - 1) & ~(slot - 1);
 	}
 	// reserve at least that space
 	size = eo->g_reloc_num * cdsz;
@@ -1496,13 +1810,13 @@ static RList* patch_relocs(RBinFile *bf) {
 	if (!relocs) {
 		return NULL;
 	}
-	RList *ret = r_list_newf ((RListFree)r_bin_reloc_free);
+	RVecRBinReloc *ret = RVecRBinReloc_new ();
 	if (!ret) {
 		return NULL;
 	}
 	HtUU *relocs_by_sym = ht_uu_new0 ();
 	if (!relocs_by_sym) {
-		r_list_free (ret);
+		RVecRBinReloc_free (ret);
 		return NULL;
 	}
 	ut64 vaddr = n_vaddr;
@@ -1513,57 +1827,57 @@ static RList* patch_relocs(RBinFile *bf) {
 			t = Elf_(get_section_addr) (eo, ".got");
 		}
 		if (t != UT64_MAX) {
-			toc_base = t + 0x8000;
+			toc_base = elf_io_addr (bf, eo, t) + 0x8000;
 		}
 	}
+	const ut64 B = elf_io_addr (bf, eo, eo->baddr);
 	RBinElfReloc *reloc;
 	R_VEC_FOREACH (relocs, reloc) {
 		ut64 plt_entry_addr = vaddr;
 		ut64 sym_addr = UT64_MAX;
+		const bool is_import = reloc_is_import (eo, reloc);
 
-		if (reloc->sym) {
-			if (reloc->sym < eo->imports_by_ord_size && eo->imports_by_ord[reloc->sym]) {
-				bool found;
-				sym_addr = ht_uu_find (relocs_by_sym, reloc->sym, &found);
-				if (found) {
-					plt_entry_addr = sym_addr;
-				}
-			} else if (reloc->sym < eo->symbols_by_ord_size && eo->symbols_by_ord[reloc->sym]) {
-				sym_addr = eo->symbols_by_ord[reloc->sym]->vaddr;
+		if (is_import) {
+			bool found;
+			sym_addr = ht_uu_find (relocs_by_sym, reloc->sym, &found);
+			if (found) {
 				plt_entry_addr = sym_addr;
 			}
+		} else if (reloc->sym && reloc->sym < eo->symbols_by_ord_size && eo->symbols_by_ord[reloc->sym]) {
+			RBinSymbol *sym = eo->symbols_by_ord[reloc->sym];
+			// a tls symbol's value is an offset in the thread block, not an address
+			const bool is_tls = sym->type && !strcmp (sym->type, R_BIN_TYPE_TLS_STR);
+			sym_addr = sym->vaddr;
+			if (!is_tls && sym_addr && sym_addr != UT64_MAX) {
+				sym_addr = elf_io_addr (bf, eo, sym_addr);
+			}
+			plt_entry_addr = sym_addr;
 		}
-		// ut64 raddr = sym_addr? sym_addr: vaddr;
-		// For sBPF, use rel->rva for relocations without symbols (like R_BPF_64_RELATIVE)
-		ut64 raddr;
-		if (sym_addr && sym_addr != UT64_MAX) {
-			raddr = sym_addr;
-		} else {
-			raddr = vaddr;
-		}
-		_patch_reloc (eo, eo->ehdr.e_machine, &b->iob, reloc, raddr, eo->baddr, plt_entry_addr, toc_base);
-		ptr = reloc_convert (eo, reloc, n_vaddr);
+		const bool resolved = sym_addr && sym_addr != UT64_MAX;
+		const ut64 raddr = resolved? sym_addr: vaddr;
+		_patch_reloc (bf, eo, eo->ehdr.e_machine, &b->iob, reloc,
+			elf_io_addr (bf, eo, reloc->rva), raddr, B, plt_entry_addr, toc_base);
+		ptr = reloc_convert (eo, reloc, n_vaddr - bf->bo->baddr_shift, ret);
 		if (!ptr) {
 			continue;
 		}
-
-		if (sym_addr && sym_addr != UT64_MAX) {
-			// PPC64 ET_REL only: S + A so multiple .rela.opd entries don't
-			// collapse onto the section base. Other architectures emit ET_REL
-			// relocs against section symbols + addend on every reference, and
-			// folding A in would alias ptr->vaddr onto unrelated instruction
-			// addresses (showing up as phantom RELOC comments mid-function).
-			const bool ppc64_etrel = eo->ehdr.e_type == ET_REL && eo->ehdr.e_machine == EM_PPC64;
-			ptr->vaddr = ppc64_etrel ? sym_addr + reloc->addend : sym_addr;
-		} else {
-			// In sBPF, symbol relocations are handled independently as R_BPF_64_64
-			if (eo->ehdr.e_machine != EM_SBPF) {
-				ptr->vaddr = vaddr;
-				ht_uu_insert (relocs_by_sym, reloc->sym, vaddr);
-				vaddr += cdsz;
+		// a patched code site branches to the slot, so the slot is what the
+		// reloc describes; a data site holds the value and keeps its own vaddr
+		if (is_import) {
+			const st64 shift = bf->bo->baddr_shift;
+			RBinSection *s = r_bin_get_section_at (bf->bo, ptr->vaddr + shift, true);
+			if (s && (s->perm & R_PERM_X)) {
+				if (resolved) {
+					ptr->vaddr = sym_addr - shift;
+				} else if (eo->ehdr.e_machine != EM_SBPF) {
+					ptr->vaddr = vaddr - shift;
+				}
 			}
 		}
-		r_list_append (ret, ptr);
+		if (!resolved && eo->ehdr.e_machine != EM_SBPF) {
+			ht_uu_insert (relocs_by_sym, reloc->sym, vaddr);
+			vaddr += cdsz;
+		}
 	}
 	ht_uu_free (relocs_by_sym);
 	return ret;

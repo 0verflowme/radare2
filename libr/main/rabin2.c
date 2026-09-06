@@ -262,9 +262,9 @@ static int rabin_dump_symbols(RBin *bin, int len) {
 	RBinSymbol *symbol;
 	int olen = len;
 	R_VEC_FOREACH (symbols, symbol) {
-		if (symbol->size && (olen > symbol->size || !olen)) {
-			len = symbol->size;
-		} else if (!symbol->size && !olen) {
+		if (symbol->attr.size && (olen > symbol->attr.size || !olen)) {
+			len = symbol->attr.size;
+		} else if (!symbol->attr.size && !olen) {
 			len = 32;
 		} else {
 			len = olen;
@@ -567,7 +567,7 @@ static bool __lib_bin_demangle_dt(RLibPlugin *pl, void *user, void *data) {
 	return true;
 }
 
-static char *__demangleAs(RBin *bin, int type, const char *file) {
+static char *__demangleAs(RBin *bin, RBinLanguage type, const char *file) {
 	const char *name = NULL;
 	switch (type) {
 	case R_BIN_LANG_CXX: name = "cxx"; break;
@@ -993,7 +993,7 @@ R_API int r_main_rabin2(int argc, const char **argv) {
 
 	if (do_demangle) {
 		char *res = NULL;
-		int type = R_BIN_LANG_NONE;
+		RBinLanguage type = R_BIN_LANG_NONE;
 		if (!*do_demangle || !strcmp (do_demangle, "?") || !strcmp (do_demangle, "help")) {
 			r_bin_demangle_list (core.bin);
 			r_cons_flush (core.cons);

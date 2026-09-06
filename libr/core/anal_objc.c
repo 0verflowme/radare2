@@ -386,7 +386,7 @@ static void objc_recover_class(RAnal *anal, RBinClass *klass) {
 			continue;
 		}
 		char *class_method_name = NULL;
-		if (method->attr & R_BIN_ATTR_CLASS) {
+		if (method->attr.flags & R_BIN_ATTR_CLASS) {
 			class_method_name = r_str_newf ("class.%s", method_name);
 			if (!class_method_name) {
 				continue;
@@ -396,7 +396,8 @@ static void objc_recover_class(RAnal *anal, RBinClass *klass) {
 		RAnalMethod meth = {
 			.name = (char *)method_name,
 			.addr = method->vaddr,
-			.vtable_offset = -1
+			.vtable_offset = -1,
+			.vtable_addr = UT64_MAX
 		};
 		r_anal_class_method_set (anal, class_name, &meth);
 		free (class_method_name);
@@ -413,7 +414,7 @@ R_API bool r_core_anal_objc_recover_classes(RCore *core) {
 	RListIter *iter;
 	RBinClass *klass;
 	r_list_foreach (classes, iter, klass) {
-		if (klass && klass->lang == R_BIN_LANG_OBJC) {
+		if (klass && klass->attr.lang == R_BIN_LANG_OBJC) {
 			objc_recover_class (core->anal, klass);
 			recovered = true;
 		}

@@ -13,6 +13,24 @@ int main (int argc, char **argv);
 EOF
 RUN
 
+NAME=af function assumptions json
+FILE=bins/mach0/ls-osx-x86_64
+CMDS=<<EOF
+s main
+af
+afAj
+afAj [{"kind":"nonnull","target":"rdi"}]
+afAj
+afA-
+afAj
+EOF
+EXPECT=<<EOF
+[]
+[{"kind":"nonnull","target":"rdi"}]
+[]
+EOF
+RUN
+
 NAME=af localflag
 FILE=bins/mach0/mac-ls2
 CMDS=<<EOF
@@ -193,6 +211,51 @@ WARN: Relocs has not been applied. Please use `-e bin.relocs.apply=true` or `-e 
 EOF
 RUN
 
+NAME=afbi lists every switch case and leaves them in the analysis
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+af+ 0 foo
+afb+ 0 0 16
+afbe 0 0x20
+afbe 0 0x20
+afbe 0 0x30
+afbi~case
+afbi~case
+EOF
+EXPECT=<<EOF
+cases: 3
+case.0: 0x00000020
+case.0: 0x00000020
+case.0: 0x00000030
+cases: 3
+case.0: 0x00000020
+case.0: 0x00000020
+case.0: 0x00000030
+EOF
+RUN
+
+NAME=afb dedupes the printed successors without dropping the cases
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+af+ 0 foo
+afb+ 0 0 16
+afbe 0 0x20
+afbe 0 0x20
+afbe 0 0x30
+afb
+afbi~case
+EOF
+EXPECT=<<EOF
+0x00000000 0x00000010 00:0000 16 s 0x00000020 s 0x00000030
+cases: 3
+case.0: 0x00000020
+case.0: 0x00000020
+case.0: 0x00000030
+EOF
+RUN
+
 NAME=Adding basic blocks with with wrong size (afb+)
 BROKEN=1
 FILE=bins/pe/a.exe
@@ -279,6 +342,97 @@ EOF
 EXPECT=<<EOF
 fcn.00013c70 (int64_t arg1, int64_t arg2, int64_t arg3);
 [{"name":"fcn.00013c70","args":[{"name":"arg1","type":"int64_t"},{"name":"arg2","type":"int64_t"},{"name":"arg3","type":"int64_t"}],"count":3}]
+EOF
+RUN
+
+NAME=float args keep their own sequence beside the integer one
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 4889f04889d0f20f58c8c3 @ 0
+af
+afv
+pdf~arg
+EOF
+EXPECT=<<EOF
+arg int64_t arg1 @ rsi
+arg int64_t arg2 @ rdx
+arg double arg3 @ xmm0
+arg double arg4 @ xmm1
+/ 11: fcn.00000000 (int64_t arg1, int64_t arg2, double arg3, double arg4);
+| `- args(rsi, rdx, xmm0, xmm1)
+|           0x00000000      4889f0         mov rax, rsi                ; arg1
+|           0x00000003      4889d0         mov rax, rdx                ; arg2
+|           0x00000006      f20f58c8       addsd xmm1, xmm0            ; arg4
+EOF
+RUN
+
+NAME=arm64 float args come from the v register sequence
+FILE=malloc://64
+ARGS=-a arm -b 64
+CMDS=<<EOF
+wx 0000669e2100669ec0035fd6 @ 0
+af
+afv
+EOF
+EXPECT=<<EOF
+arg double arg1 @ d0
+arg double arg2 @ d1
+EOF
+RUN
+
+NAME=arm64 float args match the s register spelling of the v sequence
+FILE=malloc://32
+ARGS=-a arm -b 64
+CMDS=<<EOF
+wx 0000261ec0035fd6 @ 0
+af
+afv
+EOF
+EXPECT=<<EOF
+arg double arg1 @ d0
+EOF
+RUN
+
+NAME=arm64 d0 read after a call is not an argument
+FILE=malloc://64
+ARGS=-a arm -b 64
+CMDS=<<EOF
+wx 040000940000669ec0035fd6 @ 0
+wx c0035fd6 @ 0x10
+af @ 0x10
+af @ 0
+afv @ 0
+EOF
+EXPECT=<<EOF
+EOF
+RUN
+
+NAME=float args are recovered when no integer argument is passed
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx f20f58c8c3 @ 0
+af
+afv
+EOF
+EXPECT=<<EOF
+arg double arg1 @ xmm0
+arg double arg2 @ xmm1
+EOF
+RUN
+
+NAME=xmm0 read after a call is not an argument
+FILE=malloc://32
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx e80b000000f20f59c0c3 @ 0
+wx c3 @ 0x10
+af @ 0x10
+af @ 0
+afv @ 0
+EOF
+EXPECT=<<EOF
 EOF
 RUN
 
@@ -540,8 +694,8 @@ EXPECT=<<EOF
 1
 EOF
 EXPECT_ERR=<<EOF
-WARN: Analysis skipped on non-executable map at 0x00010000
-INFO: Fix perms with 'ompg +x' or ignore them with 'e anal.in=io.maps'
+HINT: Analysis skipped on non-executable map at 0x00010000
+HINT: Fix perms with 'ompg +x' or ignore them with 'e anal.in=io.maps'
 EOF
 RUN
 

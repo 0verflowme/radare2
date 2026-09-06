@@ -57,6 +57,14 @@ EXPECT=<<EOF
 EOF
 RUN
 
+NAME=DEX exception handlers
+FILE=bins/java/Main.dex
+CMDS=iwj
+EXPECT=<<EOF
+[{"index":0,"source":572,"from":590,"to":670,"handler":672,"filter":0,"kind":"catch","typeFilter":5,"type":"Ljava/lang/Exception;"},{"index":1,"source":572,"from":708,"to":714,"handler":672,"filter":0,"kind":"catch","typeFilter":5,"type":"Ljava/lang/Exception;"}]
+EOF
+RUN
+
 NAME=Checking file size
 FILE=bins/dex/HelloSlack.dex
 CMDS=<<EOF
@@ -302,9 +310,9 @@ NAME=DEX HelloWorld.dex debug info
 FILE=bins/dex/HelloWorld.dex
 CMDS=e io.va=0; pd 1 @0x00000290|grep Hello.java; pd 1 @0x000002f4|grep World.java; pd 1 @0x00000318|grep World.java;
 EXPECT=<<EOF
-            0x00000290      62000400       sget-object v0, Ljava/lang/System;->out Ljava/io/PrintStream; ; Hello.java:9 ; 0x180
+            0x00000290      62000400       sget-object v0, Ljava/lang/System;->out Ljava/io/PrintStream; ; Hello.java:9 ; [0x180:4]=0x30008
             0x000002f4      701008000100   invoke-direct {v1}, Ljava/lang/Object.<init>()V ; 0x8 ; World.java:5
-            0x00000318      62000400       sget-object v0, Ljava/lang/System;->out Ljava/io/PrintStream; ; World.java:11 ; 0x180
+            0x00000318      62000400       sget-object v0, Ljava/lang/System;->out Ljava/io/PrintStream; ; World.java:11 ; [0x180:4]=0x30008
 EOF
 RUN
 
@@ -1992,7 +2000,7 @@ NAME=DEX test.dex
 FILE=bins/dex/test.dex
 CMDS=pd 1 @ 0x000001c4
 EXPECT=<<EOF
-            0x000001c4      1234           const/4 v4, 0x3
+            0x000001c4      1234           const/4 v4, 3
 EOF
 RUN
 
@@ -2065,9 +2073,9 @@ s method.public.final.Landroid_arch_a_a_a_1.Landroid_arch_a_a_a_1.method.execute
 pd 2
 EOF
 EXPECT=<<EOF
-{"name":"Landroid/arch/a/a/a$1.method.<init>()V","flagname":"sym.Landroid_arch_a_a_a_1.method._init___V","realname":"Landroid/arch/a/a/a$1.method.<init>()V","ordinal":0,"bind":"LOCAL","size":8,"type":"FUNC","vaddr":874156,"paddr":69220,"is_imported":false}
+{"name":"Landroid/arch/a/a/a$1.method.<init>()V","flagname":"sym.Landroid_arch_a_a_a_1.method._init___V","realname":"Landroid/arch/a/a/a$1.method.<init>()V","ordinal":0,"bind":"LOCAL","size":8,"hsize":16,"type":"FUNC","flags":["constructor"],"arg_first":0,"arg_count":1,"cc_arg_count":0,"ret_count":0,"arg_prefix":"v","vaddr":874156,"paddr":69220,"is_imported":false}
 {}
-{"name":"Landroid/arch/a/a/a$1.method.execute(Ljava/lang/Runnable;)V","flagname":"sym.Landroid_arch_a_a_a_1.method.execute_Ljava_lang_Runnable__V","realname":"Landroid/arch/a/a/a$1.method.execute(Ljava/lang/Runnable;)V","ordinal":1,"bind":"GLOBAL","size":16,"type":"FUNC","vaddr":874180,"paddr":69244,"is_imported":false}
+{"name":"Landroid/arch/a/a/a$1.method.execute(Ljava/lang/Runnable;)V","flagname":"sym.Landroid_arch_a_a_a_1.method.execute_Ljava_lang_Runnable__V","realname":"Landroid/arch/a/a/a$1.method.execute(Ljava/lang/Runnable;)V","ordinal":1,"bind":"GLOBAL","size":16,"hsize":16,"type":"FUNC","flags":["public final"],"arg_first":1,"arg_count":2,"cc_arg_count":0,"ret_count":0,"arg_prefix":"v","vaddr":874180,"paddr":69244,"is_imported":false}
             ;-- method.public.final.Landroid_arch_a_a_a_1.Landroid_arch_a_a_a_1.method.execute_Ljava_lang_Runnable__V:
             0x000d56c4      710024000000   invoke-static {}, Landroid/arch/a/a/a.a()Landroid/arch/a/a/a; ; 0x24
             0x000d56ca      0c00           move-result-object v0

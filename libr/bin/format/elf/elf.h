@@ -70,6 +70,7 @@ typedef struct r_bin_elf_reloc_t {
 	int sym;
 	int type;
 	Elf_(Xword) mode;
+	bool implicit_addend;
 	st64 addend;
 	ut64 offset;
 	ut64 rva;
@@ -89,6 +90,7 @@ typedef struct Elf_(dynamic_info) {
 	Elf_(Xword) dt_pltrelsz;
 	Elf_(Addr) dt_pltgot;
 	Elf_(Addr) dt_hash;
+	Elf_(Addr) dt_gnu_hash;
 	Elf_(Addr) dt_strtab;
 	Elf_(Addr) dt_symtab;
 	Elf_(Addr) dt_rela;
@@ -99,6 +101,7 @@ typedef struct Elf_(dynamic_info) {
 	Elf_(Xword) dt_relaent;
 	Elf_(Xword) dt_strsz;
 	Elf_(Xword) dt_syment;
+	Elf_(Addr) dt_init;
 	Elf_(Addr) dt_fini;
 	Elf_(Addr) dt_rel;
 	Elf_(Xword) dt_relsz;
@@ -111,7 +114,11 @@ typedef struct Elf_(dynamic_info) {
 	Elf_(Xword) dt_mips_symtabno;
 	Elf_(Addr) dt_ppc64_glink; /* PPC64 ELFv1: DT_PPC64_GLINK lazy PLT resolver anchor */
 	Elf_(Addr) dt_crel;    // Address of Crel relocs
+	Elf_(Addr) dt_android_rel;    // Address of Android packed (APS2) relocs
+	Elf_(Xword) dt_android_relsz; // Size in bytes of the packed reloc stream
+	bool dt_android_is_rela;      // true for DT_ANDROID_RELA, false for DT_ANDROID_REL
 	bool dt_bind_now;
+	bool dt_aarch64_pac_plt; /* AArch64 -z pac-plt: 24 byte plt entries */
 	Elf_(Xword) dt_flags;
 	Elf_(Xword) dt_flags_1;
 	Elf_(Xword) dt_rpath;
@@ -183,10 +190,14 @@ struct Elf_(obj_t) {
 	RList *inits;
 	HtUU *rel_cache;
 	HtUU *ppc64_plt_stubs; // ppc64: slot_vaddr -> stub_vaddr (lazy, NULL until first use)
+	ut64 arm64_plt_esize; // aarch64: measured plt entry stride, 0 until probed
+	ut64 *ppc32_thunks; // ppc32: plt slot index -> call thunk vaddr, lazy
+	ut64 ppc32_nthunks;
+	bool ppc32_thunks_done;
 	ut32 g_reloc_num;
+	ut64 etrel_slots; // ET_REL: file offset of the import slot area
 	bool relocs_loaded;
 	RVecRBinElfReloc g_relocs;
-	RList *relocs_list;
 	bool sections_loaded;
 	bool sections_cached;
 	RVecRBinElfSection g_sections;
@@ -198,6 +209,8 @@ struct Elf_(obj_t) {
 	RVecRBinElfField g_fields;
 	int limit;
 	char *osabi;
+	RVecRBinTrycatch trycatch;
+	bool trycatch_loaded;
 };
 
 int Elf_(has_va)(struct Elf_(obj_t) *bin);
@@ -233,9 +246,9 @@ const RVecRBinSection *Elf_(load_sections)(RBinFile *bf, ELFOBJ *eo);
 bool Elf_(load_gresources)(RBinFile *bf, ELFOBJ *eo, RVecRBinResource *resources);
 bool Elf_(load_symbols)(ELFOBJ *eo);
 bool Elf_(load_imports)(ELFOBJ *eo);
-RVecRBinSymbol *Elf_(load_symbols_vec)(ELFOBJ *eo);
+RVecRBinSymbol *Elf_(load_symbols_vec)(RBinFile *bf, ELFOBJ *eo);
 RVecRBinImport *Elf_(load_imports_vec)(ELFOBJ *eo);
-RVecRBinSymbol *Elf_(load_plt_symbols_vec)(ELFOBJ *eo);
+RVecRBinSymbol *Elf_(load_plt_symbols_vec)(RBinFile *bf, ELFOBJ *eo);
 const RVecRBinElfField *Elf_(load_fields)(struct Elf_(obj_t) *bin);
 char *Elf_(get_rpath)(struct Elf_(obj_t) *bin);
 
@@ -257,5 +270,15 @@ bool Elf_(has_nobtcfi)(ELFOBJ *eo);
 ut8 *Elf_(grab_regstate)(struct Elf_(obj_t) *bin, int *len);
 RList *Elf_(get_maps)(ELFOBJ *bin);
 ut64 Elf_(ppc64_get_plt_stub_for_slot)(ELFOBJ *eo, ut64 slot_vaddr);
-R_API RBinSection *r_bin_section_clone(RBinSection *s);
+#if R_BIN_ELF64
+void Elf_(plt_ppc64v1_load_text_stubs)(RBinFile *bf, ELFOBJ *eo);
+#endif
+/* plt.c */
+ut64 Elf_(plt_get_import_addr)(ELFOBJ *eo, int sym);
+int Elf_(plt_ppc64_abi)(ELFOBJ *eo);
+ut64 Elf_(plt_arm64_entry)(ELFOBJ *eo, ut64 plt_addr, ut64 pos);
+ut64 Elf_(plt_ppc32_thunk)(ELFOBJ *eo, ut64 slot_vaddr);
+/* elf.c helpers exported for plt.c */
+RBinElfSection *Elf_(plt_section_by_name)(ELFOBJ *eo, const char *name);
+ut64 Elf_(plt_num_relocs)(ELFOBJ *eo);
 #endif

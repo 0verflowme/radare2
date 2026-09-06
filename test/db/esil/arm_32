@@ -3132,3 +3132,446 @@ EXPECT=<<EOF
 0xabcdffff
 EOF
 RUN
+
+NAME=rev family reverses a register into itself
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 300fbfe6
+aer r0=0x12345680
+aes
+aer r0
+wx b00fbfe6
+aer r0=0x12345680
+aer PC=0
+aes
+aer r0
+wx b00fffe6
+aer r0=0x12345680
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x80563412
+0x34128056
+0xffff8056
+EOF
+RUN
+
+NAME=clz counts the zeros of a register that is also its destination
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 100f6fe1
+aer r0=0x1234f680
+aes
+aer r0
+aer r0=0x00001234
+aer PC=0
+aes
+aer r0
+aer r0=0
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x00000003
+0x00000013
+0x00000020
+EOF
+RUN
+
+NAME=a conditional rev keeps its condition
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 300fbf16
+aer cpsr=0
+aer r0=0x12345680
+aes
+aer r0
+aer cpsr=0x40000000
+aer r0=0x12345680
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x80563412
+0x12345680
+EOF
+RUN
+
+NAME=a conditional clz keeps its condition
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 100f6f11
+aer cpsr=0
+aer r0=0x00001234
+aes
+aer r0
+aer cpsr=0x40000000
+aer r0=0x00001234
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x00000013
+0x00001234
+EOF
+RUN
+
+NAME=adc sbc and rsc assign their result instead of accumulating it
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 0200a1e0
+aer cpsr=0x20000000
+aer r0=0x1000
+aer r1=9
+aer r2=3
+aer PC=0
+aes
+aer r0
+wx 0200c1e0
+aer cpsr=0x20000000
+aer r0=0x1000
+aer r1=9
+aer r2=3
+aer PC=0
+aes
+aer r0
+wx 0200e1e0
+aer cpsr=0x20000000
+aer r0=0x1000
+aer r1=9
+aer r2=3
+aer PC=0
+aes
+aer r0
+wx 010da1e2
+aer cpsr=0x20000000
+aer r0=0x1000
+aer r1=9
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x0000000d
+0x00000006
+0xfffffffa
+0x0000004a
+EOF
+RUN
+
+NAME=sbc and rsc borrow the complement of the carry flag
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 0200c1e0
+aer cpsr=0
+aer r0=0x1000
+aer r1=9
+aer r2=3
+aer PC=0
+aes
+aer r0
+wx 0200e1e0
+aer cpsr=0
+aer r0=0x1000
+aer r1=9
+aer r2=3
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x00000005
+0xfffffff9
+EOF
+RUN
+
+NAME=the unprivileged loads write back their post-index offset
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 11223344 @ 0x40
+wx 0100f3e4 @ 0
+aei
+aeim
+aer r3=0x40
+aer PC=0
+aes
+aer r0
+aer r3
+wx 0400b3e4 @ 0
+aer r3=0x40
+aer PC=0
+aes
+aer r0
+aer r3
+wx 0100b3e6 @ 0
+aer r3=0x40
+aer r1=4
+aer PC=0
+aes
+aer r0
+aer r3
+wx 040013e4 @ 0
+aer r3=0x40
+aer PC=0
+aes
+aer r0
+aer r3
+EOF
+EXPECT=<<EOF
+0x00000011
+0x00000041
+0x44332211
+0x00000044
+0x44332211
+0x00000044
+0x44332211
+0x0000003c
+EOF
+RUN
+
+NAME=a register shift count is taken from the low byte of the register
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+aei
+aeim
+wx 1102a0e1 @ 0
+aer r1=0x80000005
+aer r2=255
+aer PC=0
+aes
+aer r0
+aer r2=256
+aer PC=0
+aes
+aer r0
+wx 3102a0e1 @ 0
+aer r2=256
+aer PC=0
+aes
+aer r0
+wx 5102a0e1 @ 0
+aer r2=40
+aer PC=0
+aes
+aer r0
+wx 7102a0e1 @ 0
+aer r2=256
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x00000000
+0x80000005
+0x80000005
+0xffffffff
+0x80000005
+EOF
+RUN
+NAME=the shift carry follows the count that was actually applied
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+aei
+aeim
+wx 1102b0e1 @ 0
+aer r1=0x80000005
+aer r2=31
+aer cf=1
+aer PC=0
+aes
+aer cf
+wx 5102b0e1 @ 0
+aer r2=40
+aer cf=0
+aer PC=0
+aes
+aer cf
+EOF
+EXPECT=<<EOF
+0x00000000
+0x00000001
+EOF
+RUN
+NAME=asr by 32 fills the register with the sign bit
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+aei
+aeim
+wx 4100a0e1 @ 0
+aer r1=0x80000000
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0xffffffff
+EOF
+RUN
+NAME=rrx rotates the carry in and rrxs takes the carry from the source
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+aei
+aeim
+wx 6100a0e1 @ 0
+aer r1=0x80000000
+aer cf=1
+aer PC=0
+aes
+aer r0
+aer cf
+wx 6100b0e1 @ 0
+aer r1=0x80000000
+aer cf=1
+aer PC=0
+aes
+aer r0
+aer cf
+EOF
+EXPECT=<<EOF
+0xc0000000
+0x00000001
+0xc0000000
+0x00000000
+EOF
+RUN
+
+NAME=the signed byte and halfword loads sign-extend
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+wx 90 @ 0x3f
+wx 80ff @ 0x44
+aei
+aeim
+wx d400d3e1 @ 0
+aer r3=0x40
+aer PC=0
+aes
+aer r0
+wx f400d3e1 @ 0
+aer r3=0x40
+aer PC=0
+aes
+aer r0
+wx d10053e1 @ 0
+aer r3=0x40
+aer PC=0
+aes
+aer r0
+wx d400f3e1 @ 0
+aer r3=0x40
+aer PC=0
+aes
+aer r0
+aer r3
+EOF
+EXPECT=<<EOF
+0xffffff80
+0xffffff80
+0xffffff90
+0xffffff80
+0x00000044
+EOF
+RUN
+NAME=sxtb and sxth extend the low bits and honour the rotation
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+aei
+aeim
+wx 7100bfe6 @ 0
+aer r1=0x1234
+aer PC=0
+aes
+aer r0
+aer r1=0xf234
+aer PC=0
+aes
+aer r0
+wx 7104afe6 @ 0
+aer r1=0xf200
+aer PC=0
+aes
+aer r0
+EOF
+EXPECT=<<EOF
+0x00001234
+0xfffff234
+0xfffffff2
+EOF
+RUN
+NAME=uadd8 adds each byte on its own and leaves the flags alone
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+aei
+aeim
+wx 920f51e6 @ 0
+aer r1=0x80ff0102
+aer r2=0x80010102
+aer zf=1
+aer PC=0
+aes
+aer r0
+aer zf
+EOF
+EXPECT=<<EOF
+0x00000204
+0x00000001
+EOF
+RUN
+NAME=asr by the register width or more is the sign fill and asrs keeps the carry
+FILE=malloc://0x200
+ARGS=-a arm -b 32
+CMDS=<<EOF
+aei
+aeim
+aer r1=0x80000005
+ae 32,r1,ASR
+ae 40,r1,ASR
+wx 5102b0e1 @ 0
+aer r2=255
+aer cf=0
+aer PC=0
+aes
+aer cf
+aer r0
+aer r2=64
+aer cf=0
+aer PC=0
+aes
+aer cf
+aer r1=0x7fffffff
+aer r2=255
+aer cf=1
+aer PC=0
+aes
+aer cf
+aer r0
+EOF
+EXPECT=<<EOF
+0xffffffffffffffff
+0xffffffffffffffff
+0x00000001
+0xffffffff
+0x00000001
+0x00000000
+0x00000000
+EOF
+RUN

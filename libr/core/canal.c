@@ -3,12 +3,64 @@
 #define R_LOG_ORIGIN "core.anal"
 
 #include <r_core.h>
+#include <r_core_priv.h>
+#include <r_anal_priv.h>
 #include <r_vec.h>
 #include <sdb/ht_uu.h>
 
 HEAPTYPE (ut64);
 R_VEC_TYPE(RVecIntPtr, int *);
 R_VEC_TYPE(RVecUT64, ut64);
+
+static bool core_snapshot_io_is_debug(RIO *io) {
+	if (!io) {
+		return false;
+	}
+	RIODesc *desc = r_io_desc_get_lowest (io);
+	while (desc) {
+		if (r_io_desc_is_dbg (desc)) {
+			return true;
+		}
+		desc = r_io_desc_get_next (io, desc);
+	}
+	return false;
+}
+
+/* Content hash of one function's analysis, under the core lock.
+ *
+ * Callers store this next to an artifact and compare it later to find out
+ * whether the analysis has moved underneath them. It used to be answered by
+ * capturing a whole function snapshot and reading one field out of it; the
+ * capture now lives in the r2sleigh plugin, and radare2 answers its own
+ * question from its own state. */
+R_API bool r_core_function_context_hash(RCore *core, ut64 function_addr, ut64 *out_hash, const char **reason) {
+	R_RETURN_VAL_IF_FAIL (core && core->anal && core->lock && out_hash, false);
+	bool result = false;
+	r_th_lock_enter (core->lock);
+	if (reason) {
+		*reason = NULL;
+	}
+	if (core_snapshot_io_is_debug (core->io)) {
+		if (reason) {
+			*reason = "a revision is not taken from a debug-backed target";
+		}
+		goto beach;
+	}
+	RAnalFunction *fcn = r_anal_get_function_at (core->anal, function_addr);
+	if (!fcn || fcn->addr != function_addr) {
+		if (reason) {
+			*reason = "no function starts at that address";
+		}
+		goto beach;
+	}
+	r_th_lock_enter (core->anal->lock);
+	*out_hash = r_anal_function_context_hash (core->anal, fcn);
+	r_th_lock_leave (core->anal->lock);
+	result = *out_hash != 0;
+beach:
+	r_th_lock_leave (core->lock);
+	return result;
+}
 
 // used to speedup strcmp with rconfig.get in loops
 enum {
@@ -80,6 +132,11 @@ static void apply_call_regsets(RAnal *anal, RAnalFunction *fcn, RAnalOp *op, int
 	for (i = 0; i < max_count; i++) {
 		if (r_anal_cc_argclob (anal, fcncc, i, cc)) {
 			reg_set[i] = 2;
+		}
+	}
+	for (i = 0; i < R_ANAL_CC_MAXARG; i++) {
+		if (r_anal_cc_argclob (anal, fcncc, R_ANAL_CC_MAXARG + i, cc)) {
+			reg_set[R_ANAL_CC_FPSLOT_BASE + i] = 2;
 		}
 	}
 }
@@ -666,9 +723,63 @@ static bool is_entry_flag(RFlagItem *f) {
 static void warn_nonexec_map(RCore *core, ut64 at) {
 	RIORegion region;
 	if (r_io_get_region_at (core->io, &region, at) && !(region.sperm & R_PERM_X)) {
-		R_LOG_WARN ("Analysis skipped on non-executable map at 0x%08"PFMT64x, at);
-		R_LOG_INFO ("Fix perms with 'ompg +x' or ignore them with 'e anal.in=io.maps'");
+		R_LOG_HINT ("Analysis skipped on non-executable map at 0x%08"PFMT64x, at);
+		R_LOG_HINT ("Fix perms with 'ompg +x' or ignore them with 'e anal.in=io.maps'");
 	}
+}
+
+typedef struct {
+	const char *suffix;
+	RVecUT64 handlers;
+} TrycatchHandlerCollector;
+
+static bool collect_trycatch_handler(RFlagItem *flag, void *user) {
+	TrycatchHandlerCollector *ctx = user;
+	if (!r_str_endswith (flag->name, ctx->suffix)) {
+		return true;
+	}
+	ut64 *handler;
+	R_VEC_FOREACH (&ctx->handlers, handler) {
+		if (*handler == flag->addr) {
+			return true;
+		}
+	}
+	RVecUT64_push_back (&ctx->handlers, &flag->addr);
+	return true;
+}
+
+/* Exception handlers are not ordinary CFG successors. Analyze their entry
+ * blocks as part of the owning function without inventing conditional edges. */
+static void core_anal_fcn_trycatch(RCore *core, RAnalFunction *fcn) {
+	if (!core->anal->opt.trycatch) {
+		return;
+	}
+	// catch and filter handlers are entrypoints of the owning function, the
+	// cleanup ones only run while unwinding so they are left out on purpose
+	const char *kinds[] = { "catch", "filter" };
+	TrycatchHandlerCollector ctx = { 0 };
+	RVecUT64_init (&ctx.handlers);
+	size_t i;
+	for (i = 0; i < R_ARRAY_SIZE (kinds); i++) {
+		char *suffix = r_str_newf (".%"PFMT64x".%s", fcn->addr, kinds[i]);
+		if (!suffix) {
+			break;
+		}
+		ctx.suffix = suffix;
+		r_flag_foreach_prefix (core->flags, "try.", 4, collect_trycatch_handler, &ctx);
+		free (suffix);
+	}
+	ut64 *handler;
+	R_VEC_FOREACH (&ctx.handlers, handler) {
+		if (*handler == fcn->addr || r_anal_function_contains (fcn, *handler)) {
+			continue;
+		}
+		int ret = r_anal_function_bb (core->anal, fcn, *handler, core->anal->opt.depth);
+		if (ret < 0 && ret != R_ANAL_RET_END) {
+			R_LOG_DEBUG ("Cannot analyze exception handler at 0x%08"PFMT64x, *handler);
+		}
+	}
+	RVecUT64_fini (&ctx.handlers);
 }
 
 static bool __core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth) {
@@ -813,6 +924,7 @@ static bool __core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int de
 				RAnalRefType ref_type = reftype == UT64_MAX ? R_ANAL_REF_TYPE_CODE : reftype;
 				r_anal_xrefs_set (core->anal, from, fcn->addr, ref_type | R_ANAL_REF_TYPE_EXEC);
 			}
+			core_anal_fcn_trycatch (core, fcn);
 			if (!r_anal_add_function (core->anal, fcn)) {
 				r_anal_function_free (fcn);
 				fcn = NULL;
@@ -888,6 +1000,7 @@ error:
 				r_flag_set (core->flags, fcn->name, at, r_anal_function_linear_size (fcn));
 				r_flag_space_pop (core->flags);
 			}
+			core_anal_fcn_trycatch (core, fcn);
 			if (!r_anal_add_function (core->anal, fcn)) {
 				r_anal_function_free (fcn);
 				fcn = NULL;
@@ -1586,6 +1699,18 @@ static int core_anal_graph_construct_nodes(RCore *core, RAnalFunction *fcn, int 
 				pj_kn (pj, "defval", op->def_val);
 				pj_kn (pj, "maxval", op->max_val);
 				pj_kn (pj, "minval", op->min_val);
+				if (op->daddr && op->daddr != UT64_MAX) {
+					pj_kn (pj, "daddr", op->daddr);
+				}
+				if (op->baddr) {
+					pj_kn (pj, "baddr", op->baddr);
+				}
+				if (op->dsize > 0) {
+					pj_ki (pj, "dsize", op->dsize);
+				}
+				if (op->amount > 0) {
+					pj_ki (pj, "amount", op->amount);
+				}
 				pj_k (pj, "cases");
 				pj_a (pj);
 				RAnalCaseOp *case_op;
@@ -2015,10 +2140,21 @@ R_API int r_core_anal_fcn_clean(RCore *core, ut64 addr) {
 	RListIter *iter, *iter_tmp;
 
 	if (!addr) {
-		r_list_purge (core->anal->fcns);
-		if (!(core->anal->fcns = r_list_new ())) {
+		r_th_lock_enter (core->lock);
+		r_th_lock_enter (core->anal->lock);
+		if (!r_core_anal_artifacts_reset (core)) {
+			r_th_lock_leave (core->anal->lock);
+			r_th_lock_leave (core->lock);
 			return false;
 		}
+		r_list_purge (core->anal->fcns);
+		if (!(core->anal->fcns = r_list_new ())) {
+			r_th_lock_leave (core->anal->lock);
+			r_th_lock_leave (core->lock);
+			return false;
+		}
+		r_th_lock_leave (core->anal->lock);
+		r_th_lock_leave (core->lock);
 	} else {
 		r_list_foreach_safe (core->anal->fcns, iter, iter_tmp, fcni) {
 			if (r_anal_function_contains (fcni, addr)) {
@@ -3210,6 +3346,9 @@ static int fcn_print_detail(RCore *core, RAnalFunction *fcn) {
 	if (fcn->pin) {
 		r_cons_printf (cons, "'0x%"PFMT64x"'aflp %s\n", fcn->addr, fcn->pin);
 	}
+	if (R_STR_ISNOTEMPTY (fcn->assumptions_json) && strcmp (fcn->assumptions_json, "[]")) {
+		r_cons_printf (cons, "'@0x%08"PFMT64x"'afAj %s\n", fcn->addr, fcn->assumptions_json);
+	}
 	free (name);
 	return 0;
 }
@@ -3704,8 +3843,6 @@ static RList *recurse(RCore *core, RAnalBlock *from, RAnalBlock *dest) {
 	return NULL;
 }
 
-#define REG_SET_SIZE (R_ANAL_CC_MAXARG + 2 + R_ANAL_CC_DYNSLOT_COUNT)
-
 typedef struct {
 	int count;
 	RVecIntPtr reg_set;
@@ -3737,7 +3874,7 @@ static bool anal_block_on_exit(RAnalBlock *bb, BlockRecurseCtx *ctx) {
 	}
 	int *prev_regset = *RVecIntPtr_at (&ctx->reg_set, RVecIntPtr_length (&ctx->reg_set) - 1);
 	size_t i;
-	for (i = 0; i < REG_SET_SIZE; i++) {
+	for (i = 0; i < R_ANAL_CC_REGSET_SIZE; i++) {
 		if (!prev_regset[i] && cur_regset[i] == 1) {
 			prev_regset[i] = 1;
 		}
@@ -3784,8 +3921,8 @@ static bool anal_block_cb(RAnalBlock *bb, BlockRecurseCtx *ctx) {
 		return false;
 	}
 	int *parent_reg_set = *RVecIntPtr_at (&ctx->reg_set, RVecIntPtr_length (&ctx->reg_set) - 1);
-	int *reg_set = R_NEWS (int, REG_SET_SIZE);
-	memcpy (reg_set, parent_reg_set, REG_SET_SIZE * sizeof (int));
+	int *reg_set = R_NEWS (int, R_ANAL_CC_REGSET_SIZE);
+	memcpy (reg_set, parent_reg_set, R_ANAL_CC_REGSET_SIZE * sizeof (int));
 	RVecIntPtr_push_back (&ctx->reg_set, &reg_set);
 	RCore *core = ctx->core;
 	RAnalFunction *fcn = ctx->fcn;
@@ -3859,7 +3996,8 @@ R_API void r_core_recover_vars(RCore *core, RAnalFunction *fcn, bool argonly) {
 
 	// Try plugin-based variable recovery first
 	if (r_anal_function_recover_vars_plugin (core->anal, fcn)) {
-		return;  // Done, skip ESIL-based recovery
+		r_anal_function_rename_default_args (fcn);
+		return;
 	}
 
 	// Fall back to existing ESIL-based recovery
@@ -3879,7 +4017,7 @@ R_API void r_core_recover_vars(RCore *core, RAnalFunction *fcn, bool argonly) {
 	ctx.fcn = fcn;
 	ctx.core = core;
 	RVecIntPtr_init (&ctx.reg_set);
-	int *reg_set = R_NEWS0 (int, REG_SET_SIZE);
+	int *reg_set = R_NEWS0 (int, R_ANAL_CC_REGSET_SIZE);
 	RVecIntPtr_push_back (&ctx.reg_set, &reg_set);
 	int saved_stack = fcn->stack;
 	RAnalBlock *first_bb = r_anal_get_block_at (fcn->anal, fcn->addr);
@@ -3889,23 +4027,156 @@ R_API void r_core_recover_vars(RCore *core, RAnalFunction *fcn, bool argonly) {
 	RVecIntPtr_fini (&ctx.reg_set);
 	free (ctx.buf);
 	fcn->stack = saved_stack;
+	r_anal_function_rename_default_args (fcn);
 }
 
-// Collect plugin-provided data refs for all functions and add them as xrefs
-R_API void r_core_anal_plugin_data_refs(RCore *core) {
-	R_RETURN_IF_FAIL (core && core->anal);
+
+static RList *plugin_data_refs_function_scopes(RAnal *anal) {
+	RList *scopes = r_list_newf (free);
+	if (!scopes) {
+		return NULL;
+	}
 	RListIter *iter;
-	RAnalFunction *fcn;
-	r_list_foreach (core->anal->fcns, iter, fcn) {
-		RVecAnalRef *refs = r_anal_plugin_action (core->anal, R_ANAL_PLUGIN_ACTION_GET_DATA_REFS, fcn);
-		if (refs) {
-			RAnalRef *ref;
-			R_VEC_FOREACH (refs, ref) {
-				r_anal_xrefs_setf (core->anal, fcn, ref->at, ref->addr, ref->type);
-			}
-			RVecAnalRef_free (refs);
+	RAnalFunction *function;
+	r_list_foreach (anal->fcns, iter, function) {
+		ut64 *scope = R_NEW (ut64);
+		*scope = function->addr;
+		if (!r_list_append (scopes, scope)) {
+			free (scope);
+			r_list_free (scopes);
+			return NULL;
 		}
 	}
+	return scopes;
+}
+
+static bool plugin_data_refs_batches_include(const RList *batches, const char *provider_id) {
+	RListIter *iter;
+	RAnalPluginDataRefsBatch *batch;
+	r_list_foreach (batches, iter, batch) {
+		if (!strcmp (batch->provider_id, provider_id)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void plugin_data_refs_replace_for_function(RCore *core, ut64 scope_id) {
+	RAnal *anal = core->anal;
+	RAnalFunction *function = r_anal_get_function_at (anal, scope_id);
+	if (!function || function->addr != scope_id) {
+		return;
+	}
+	const ut64 function_epoch = r_anal_function_dirty_epoch (function);
+	const ut64 type_epoch = r_anal_types_dirty_epoch (anal);
+	ut64 revision = 0;
+	if (!r_core_function_context_hash (core, scope_id, &revision, NULL)
+			|| r_anal_function_dirty_epoch (function) != function_epoch
+			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
+		return;
+	}
+	RList *batches = NULL;
+	if (!r_anal_plugin_data_refs_collect (anal, function, &batches)) {
+		return;
+	}
+	size_t successful_count = 0;
+	RListIter *iter;
+	RAnalPluginDataRefsBatch *batch;
+	r_list_foreach (batches, iter, batch) {
+		if (batch->success) {
+			successful_count++;
+		}
+	}
+	size_t retired_count = 0;
+	const size_t artifact_set_count = r_core_anal_artifact_set_count (core);
+	size_t set_index;
+	for (set_index = 0; set_index < artifact_set_count; set_index++) {
+		RCoreAnalArtifactSetView set;
+		if (!r_core_anal_artifact_set_view (core, set_index, &set)) {
+			r_list_free (batches);
+			return;
+		}
+		if (set.scope_id == scope_id && !strcmp (set.domain_id, "dataref")
+				&& !plugin_data_refs_batches_include (batches, set.provider_id)) {
+			retired_count++;
+		}
+	}
+	const size_t replacement_count = successful_count + retired_count;
+	if (!replacement_count) {
+		r_list_free (batches);
+		return;
+	}
+	RCoreAnalArtifactReplacement *replacements = R_NEWS0 (
+		RCoreAnalArtifactReplacement, replacement_count);
+	if (!replacements) {
+		r_list_free (batches);
+		return;
+	}
+	size_t index = 0;
+	r_list_foreach (batches, iter, batch) {
+		if (!batch->success) {
+			continue;
+		}
+		replacements[index] = (RCoreAnalArtifactReplacement) {
+			.provider_id = batch->provider_id,
+			.domain_id = "dataref",
+			.scope_id = scope_id,
+			.expected_function_epoch = function_epoch,
+			.expected_type_epoch = type_epoch,
+			.expected_snapshot_revision = revision,
+			.xrefs = batch->refs? R_VEC_START_ITER (batch->refs): NULL,
+			.xref_count = batch->refs? RVecAnalRef_length (batch->refs): 0,
+		};
+		index++;
+	}
+	for (set_index = 0; set_index < artifact_set_count; set_index++) {
+		RCoreAnalArtifactSetView set;
+		if (!r_core_anal_artifact_set_view (core, set_index, &set)) {
+			free (replacements);
+			r_list_free (batches);
+			return;
+		}
+		if (set.scope_id != scope_id || strcmp (set.domain_id, "dataref")
+				|| plugin_data_refs_batches_include (batches, set.provider_id)) {
+			continue;
+		}
+		replacements[index] = (RCoreAnalArtifactReplacement) {
+			.provider_id = set.provider_id,
+			.domain_id = "dataref",
+			.scope_id = scope_id,
+			.expected_function_epoch = function_epoch,
+			.expected_type_epoch = type_epoch,
+			.expected_snapshot_revision = revision,
+		};
+		index++;
+	}
+	RCoreAnalArtifactReplaceResult result = r_core_anal_artifacts_replace (
+		core, replacements, replacement_count);
+	if (result.status != R_CORE_ANAL_ARTIFACT_REPLACE_OK) {
+		R_LOG_WARN ("Cannot replace plugin data references at 0x%08"PFMT64x": %u",
+			scope_id, result.status);
+	}
+	free (replacements);
+	r_list_free (batches);
+}
+
+// Collect each plugin's authoritative per-function data refs and replace all
+// successful producer sets atomically. A refused producer preserves its set.
+R_API void r_core_anal_plugin_data_refs(RCore *core) {
+	R_RETURN_IF_FAIL (core && core->anal);
+	r_th_lock_enter (core->lock);
+	RList *scopes = plugin_data_refs_function_scopes (core->anal);
+	if (!scopes) {
+		r_th_lock_leave (core->lock);
+		return;
+	}
+	RListIter *iter;
+	ut64 *scope;
+	r_list_foreach (scopes, iter, scope) {
+		plugin_data_refs_replace_for_function (core, *scope);
+	}
+	r_list_free (scopes);
+	r_th_lock_leave (core->lock);
 }
 
 static bool anal_path_exists(RCore *core, ut64 from, ut64 to, RList *bbs, int depth, HtUP *state, HtUP *avoid) {
@@ -5789,6 +6060,151 @@ R_API void r_core_anal_propagate_noreturn(RCore *core, ut64 addr) {
 	}
 	r_list_free (todo);
 	r_bitset_free (done);
+}
+
+// a -fPIC object calls its own globals through the plt; flag those stubs so
+// calls read sym.plt.<target> instead of an anonymous fcn address
+static void plt_stub_flag(RCore *core, ut64 entry, ut64 size, ut64 slot) {
+	const int ptrsz = R_MAX (4, core->anal->config->bits / 8);
+	// the reloc tree keeps file vaddrs while the decoded slot is a runtime address
+	RBinObject *bo = r_bin_cur_object (core->bin);
+	const st64 shift = bo? bo->baddr_shift: 0;
+	RBinReloc *rel = r_core_getreloc (core, slot - shift, ptrsz);
+	if (!rel || rel->import || !rel->symbol) {
+		return;
+	}
+	RBinSymbol *target = rel->symbol;
+	if (!target->vaddr || target->vaddr == UT64_MAX || target->vaddr == entry) {
+		return;
+	}
+	// STT_GNU_IFUNC is the only type r2 maps to LOOS
+	if (!target->type || (strcmp (target->type, R_BIN_TYPE_FUNC_STR)
+			&& strcmp (target->type, R_BIN_TYPE_LOOS_STR))) {
+		return;
+	}
+	const char *tname = r_bin_name_tostring2 (target->name, 'o');
+	if (R_STR_ISEMPTY (tname)) {
+		return;
+	}
+	char *fname = r_str_newf ("sym.plt.%s", tname);
+	r_name_filter (fname, -1);
+	if (!r_flag_get (core->flags, fname)) {
+		r_flag_set (core->flags, fname, entry, size);
+	}
+	free (fname);
+}
+
+// decode entries, tracking the last lea/load to derive each got slot
+static void plt_stub_scan_section(RCore *core, RBinSection *sec) {
+	if (sec->vsize < 8 || sec->vsize > 0x100000) {
+		return;
+	}
+	const ut64 sec_vaddr = r_bin_get_vaddr (core->bin, sec->paddr, sec->vaddr);
+	const int len = (int)sec->vsize;
+	const ut64 sec_end = sec_vaddr + len;
+	ut8 *buf = malloc (len);
+	if (!buf || !r_io_read_at (core->io, sec_vaddr, buf, len)) {
+		free (buf);
+		return;
+	}
+	const int minop = R_MAX (1, r_arch_info (core->anal->arch, R_ARCH_INFO_MINOP_SIZE));
+	ut64 entry = sec_vaddr;
+	ut64 lea_ptr = UT64_MAX;
+	ut64 load_disp = UT64_MAX;
+	// a dereferencing op yields the slot itself, lea/adrp only give its base
+	bool lea_is_load = false;
+	int i = 0;
+	while (i < len) {
+		const ut64 at = sec_vaddr + i;
+		RAnalOp op;
+		int oplen = r_anal_op (core->anal, &op, at, buf + i, len - i, R_ARCH_OP_MASK_BASIC);
+		const int type = op.type & R_ANAL_OP_TYPE_MASK & ~R_ANAL_OP_TYPE_COND;
+		const bool indirect = type == R_ANAL_OP_TYPE_UJMP
+			|| (type == R_ANAL_OP_TYPE_JMP && (op.type & R_ANAL_OP_TYPE_MEM));
+		bool ends = true;
+		ut64 slot = UT64_MAX;
+		if (oplen < 1) {
+			oplen = minop;
+		} else if (indirect) {
+			// x86 encodes the slot in one op; arm64-alikes split it lea/load/branch
+			slot = (op.ptr > 0)? (ut64)op.ptr: UT64_MAX;
+			if (slot == UT64_MAX && lea_ptr != UT64_MAX && load_disp != UT64_MAX) {
+				slot = lea_ptr + load_disp;
+			}
+		} else {
+			switch (type) {
+			case R_ANAL_OP_TYPE_LEA:
+			case R_ANAL_OP_TYPE_MOV:
+				if (op.ptr > 0) {
+					lea_ptr = (ut64)op.ptr;
+					lea_is_load = op.direction == R_ANAL_OP_DIR_READ;
+				}
+				ends = false;
+				break;
+			case R_ANAL_OP_TYPE_LOAD:
+				if (op.ptr > 0) {
+					// riscv-style loads resolve the slot in the op itself
+					lea_ptr = (ut64)op.ptr;
+					load_disp = 0;
+				} else {
+					load_disp = op.disp;
+				}
+				ends = false;
+				break;
+			case R_ANAL_OP_TYPE_JMP:
+			case R_ANAL_OP_TYPE_CALL:
+				// retpoline stubs reach an in-section thunk unconditionally
+				if (lea_ptr != UT64_MAX && !(op.type & R_ANAL_OP_TYPE_COND)
+						&& op.jump >= sec_vaddr && op.jump < sec_end) {
+					if (load_disp != UT64_MAX) {
+						slot = lea_ptr + load_disp;
+					} else if (lea_is_load) {
+						slot = lea_ptr;
+					}
+				}
+				break;
+			case R_ANAL_OP_TYPE_UCALL:
+			case R_ANAL_OP_TYPE_RET:
+			case R_ANAL_OP_TYPE_TRAP:
+			case R_ANAL_OP_TYPE_SWI:
+			case R_ANAL_OP_TYPE_ILL:
+			case R_ANAL_OP_TYPE_UNK:
+			case R_ANAL_OP_TYPE_NOP: // trailing padding belongs to no entry
+				break;
+			default:
+				ends = false;
+				break;
+			}
+		}
+		if (slot != UT64_MAX) {
+			plt_stub_flag (core, entry, at + oplen - entry, slot);
+		}
+		r_anal_op_fini (&op);
+		i += oplen;
+		if (ends) {
+			entry = sec_vaddr + i;
+			lea_ptr = UT64_MAX;
+			load_disp = UT64_MAX;
+			lea_is_load = false;
+		}
+	}
+	free (buf);
+}
+
+R_API void r_core_anal_plt_stubs(RCore *core) {
+	R_RETURN_IF_FAIL (core);
+	RVecRBinSection *sections = r_bin_get_sections_vec (core->bin);
+	if (!sections) {
+		return;
+	}
+	r_flag_space_push (core->flags, R_FLAGS_FS_SYMBOLS);
+	RBinSection *sec;
+	R_VEC_FOREACH (sections, sec) {
+		if (sec->name && strstr (sec->name, "plt") && (sec->perm & R_PERM_X)) {
+			plt_stub_scan_section (core, sec);
+		}
+	}
+	r_flag_space_pop (core->flags);
 }
 
 R_API char *r_core_anal_get_comments(RCore *core, ut64 addr) {

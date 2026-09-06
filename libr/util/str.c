@@ -113,6 +113,19 @@ R_API int r_str_replace_char(char *s, int a, int b) {
 	return r_str_replace_ch (s, a, b, true);
 }
 
+R_API void r_str_normalize_newlines(char *str) {
+	R_RETURN_IF_FAIL (str);
+	char *dst = str;
+	for (; *str; str++, dst++) {
+		const bool newline = *str == '\r' || *str == '\n';
+		if (newline && str[1] && str[1] != *str && strchr ("\r\n", str[1])) {
+			str++;
+		}
+		*dst = newline? '\n': *str;
+	}
+	*dst = 0;
+}
+
 R_API void r_str_remove_char(char *str, char c) {
 	while (*str) {
 		if (*str == c) {
@@ -747,35 +760,35 @@ R_API char *r_str_trunc_ellipsis(const char *str, int len) {
 }
 
 R_API char *r_str_newvf(const char *fmt, va_list ap) {
+	// format into a stack buffer first, most strings fit and this avoids
+	// running the formatter twice (once to measure, once to fill)
+	char tmp[256];
 	va_list ap2;
 	va_copy (ap2, ap);
-	int ret = vsnprintf (NULL, 0, fmt, ap2);
-	ret++;
-	char *p = calloc (1, ret);
-	if (p) {
-		(void)vsnprintf (p, ret, fmt, ap);
-	}
+	int ret = vsnprintf (tmp, sizeof (tmp), fmt, ap2);
 	va_end (ap2);
+	if (ret < 0) {
+		return NULL;
+	}
+	const size_t len = (size_t)ret;
+	char *p = malloc (len + 1);
+	if (p) {
+		if (len < sizeof (tmp)) {
+			memcpy (p, tmp, len + 1);
+		} else {
+			(void)vsnprintf (p, len + 1, fmt, ap);
+		}
+	}
 	return p;
 }
 
 R_API char *r_str_newf(const char *fmt, ...) {
-	va_list ap, ap2;
-
-	va_start (ap, fmt);
 	if (!strchr (fmt, '%')) {
-		char *p = strdup (fmt);
-		va_end (ap);
-		return p;
+		return strdup (fmt);
 	}
-	va_copy (ap2, ap);
-	int ret = vsnprintf (NULL, 0, fmt, ap2);
-	ret++;
-	char *p = calloc (1, ret);
-	if (p) {
-		(void)vsnprintf (p, ret, fmt, ap);
-	}
-	va_end (ap2);
+	va_list ap;
+	va_start (ap, fmt);
+	char *p = r_str_newvf (fmt, ap);
 	va_end (ap);
 	return p;
 }
@@ -816,20 +829,16 @@ R_API bool r_str_cmp_list(const char *list, const char *item, char sep) {
 	if (!list || !item) {
 		return false;
 	}
-	int i = 0, j = 0;
-	for (; list[i] && list[i] != sep; i++, j++) {
-		if (item[j] != list[i]) {
-			while (list[i] && list[i] != sep) {
-				i++;
-			}
-			if (!list[i]) {
-				return false;
-			}
-			j = -1;
-			continue;
+	const size_t item_len = strlen (item);
+	while (list && *list) {
+		const char *next = sep? strchr (list, sep): NULL;
+		const size_t list_len = next? (size_t)(next - list): strlen (list);
+		if (list_len == item_len && !strncmp (list, item, item_len)) {
+			return true;
 		}
+		list = next? next + 1: NULL;
 	}
-	return true;
+	return false;
 }
 
 R_API char *r_str_word_get_first(const char *text) {
@@ -1928,11 +1937,18 @@ static size_t str_dwidth(const char *str, size_t slen, bool ansi) {
 	size_t i = 0, len = 0;
 	const size_t maxlen = slen > 0? slen: (size_t)-1;
 	while (str[i] && i < maxlen) {
-		if (ansi && str[i] == 0x1b) {
-			i += __str_ansi_length (str + i);
+		const ut8 c = (ut8)str[i];
+		if (c < 0x80) {
+			// ascii fast path: one column per byte, no utf8 decoding needed
+			if (ansi && c == 0x1b) {
+				i += __str_ansi_length (str + i);
+				continue;
+			}
+			len++;
+			i++;
 			continue;
 		}
-		if (((ut8)str[i] & 0xc0) == 0x80) {
+		if ((c & 0xc0) == 0x80) {
 			i++;
 			continue;
 		}

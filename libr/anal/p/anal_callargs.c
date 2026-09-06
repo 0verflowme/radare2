@@ -75,7 +75,7 @@ static void emulate_to(RAnal *a, ut64 pcv) {
 
 static RAnalOp *decode(RAnal *a, ut64 pcv) {
 	ut8 buf[16] = {0};
-	if (!a->iob.read_at || !a->iob.read_at (a->iob.io, pcv, buf, sizeof (buf))) {
+	if (!a->iob.read_at || a->iob.read_at (a->iob.io, pcv, buf, sizeof (buf)) != sizeof (buf)) {
 		return NULL;
 	}
 	RAnalOp *op = r_anal_op_new ();
@@ -266,6 +266,9 @@ static char *analyze_call(RAnal *a, ut64 pcv, OutMode mode) {
 		return strdup ("");
 	}
 	const char *fcn_name = resolve_callee (a, op->jump);
+	if (!fcn_name) {
+		fcn_name = r_anal_call_type_at (a, pcv);
+	}
 	char *key = fcn_name ? r_type_func_name (a->sdb_types, fcn_name) : NULL;
 	const char *ret_type = key ? r_type_func_ret (a->sdb_types, key) : NULL;
 	const char *cc = key ? r_anal_cc_func (a, key) : NULL;

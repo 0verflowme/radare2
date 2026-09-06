@@ -62,6 +62,7 @@ R_LIB_VERSION_HEADER(r_core);
 #define R_FLAGS_FS_SEGMENTS "segments"
 #define R_FLAGS_FS_SIGNS "sign"
 #define R_FLAGS_FS_STRINGS "strings"
+#define R_FLAGS_FS_TRYCATCH "trycatch"
 #define R_FLAGS_FS_SYMBOLS "symbols"
 #define R_FLAGS_FS_SYMBOLS_SECTIONS "symbols.sections"
 #define R_FLAGS_FS_SYSCALLS "syscalls"
@@ -99,6 +100,7 @@ typedef struct r_core_plugin_session_t {
 	RCore *core;
 	struct r_core_plugin_t *plugin;
 	void *data; // plugin instance data
+	bool command_registered;
 } RCorePluginSession;
 
 typedef bool (*RCorePluginLife) (RCorePluginSession *ctx);
@@ -108,8 +110,18 @@ typedef struct r_core_plugin_t {
 	RPluginMeta meta;
 	RCorePluginLife init;
 	RCorePluginLife fini;
-	RCorePluginCall call;
+	RCorePluginCall call; // legacy callback receiving the complete input line
+	const char *command; // command prefix registered automatically for call_ctx
+	RCmdCtxCb call_ctx; // ctx->handler_user is this plugin's session
 } RCorePlugin;
+
+// script embedded in the binary, registered by static plugins and run at startup like plugins/*.r2.js
+typedef struct r_core_script_t {
+	char *name;
+	char *lang; // "qjs", "r2" or any lang plugin name
+	char *code;
+	int codelen;
+} RCoreScript;
 
 typedef struct r_core_rtr_host_t {
 	int proto;
@@ -426,6 +438,7 @@ struct r_core_t {
 	bool in_search;
 	RList *watchers;
 	RList *scriptstack;
+	RList *scripts; // embedded startup scripts (RCoreScript)
 	RCoreTaskScheduler tasks;
 	int max_cmd_depth;
 	ut8 switch_file_view;
@@ -586,6 +599,7 @@ R_API bool r_core_cmd_lines(RCore *core, const char *lines);
 R_API bool r_core_cmd_command(RCore *core, const char *command);
 R_API void r_core_af(RCore *core, ut64 addr, const char *name, bool anal_calls);
 R_API bool r_core_run_script(RCore *core, const char *file);
+R_API void r_core_script_embed(RCore *core, const char *name, const char *lang, const char *code, int codelen);
 R_API bool r_core_seek(RCore *core, ut64 addr, bool rb);
 R_API bool r_core_visual_bit_editor(RCore *core);
 R_API int r_core_seek_base(RCore *core, const char *hex);
@@ -599,6 +613,7 @@ R_API void r_core_seek_arch_bits(RCore *core, ut64 addr);
 R_API ut8 *r_core_readblock(RCore *core, ut64 size);
 R_API int r_core_block_read(RCore *core);
 R_API int r_core_block_size(RCore *core, int bsize);
+R_API ut32 r_core_block_size_get(RCore *core);
 R_API int r_core_seek_size(RCore *core, ut64 addr, int bsize);
 R_API bool r_core_shift_block(RCore *core, ut64 addr, ut64 b_size, st64 dist);
 R_API void r_core_autocomplete(RCore *core, RLineCompletion *completion, RLineBuffer *buf, RLinePromptType prompt_type);
@@ -734,6 +749,7 @@ R_API int r_core_get_stacksz(RCore *core, ut64 from, ut64 to);
 R_API RAnalOp* r_core_anal_op(RCore *core, ut64 addr, int mask);
 R_IPI int core_type_by_addr(RCore *core, ut64 addr);
 R_API void r_core_anal_esil(RCore *core, const char *str, const char *addr);
+R_API void r_core_anal_plt_stubs(RCore *core);
 R_API void r_core_anal_fcn_merge(RCore *core, ut64 addr, ut64 addr2);
 R_API const char *r_core_anal_optype_colorfor(RCore *core, ut64 addr, ut8 ch, bool verbose);
 R_API ut64 r_core_anal_address(RCore *core, ut64 addr);
@@ -768,6 +784,7 @@ R_API int r_core_esil_step(RCore *core, ut64 until_addr, const char *until_expr,
 R_API ut64 r_core_anal_get_bbaddr(RCore *core, ut64 addr);
 R_API bool r_core_anal_bb_seek(RCore *core, ut64 addr);
 R_API bool r_core_anal_fcn(RCore *core, ut64 at, ut64 from, int reftype, int depth);
+R_API bool r_core_function_context_hash(RCore *core, ut64 function_addr, ut64 *out_hash, const char **reason);
 R_API char *r_core_anal_fcn_autoname(RCore *core, RAnalFunction *fcn, int mode);
 R_API void r_core_anal_autoname_all_fcns(RCore *core);
 R_API void r_core_anal_autoname_all_golang_fcns(RCore *core);
@@ -907,7 +924,7 @@ R_API void r_core_anal_plugin_data_refs(RCore *core);
 #define R_CORE_BIN_ACC_TRYCATCH 0x20000000
 #define R_CORE_BIN_ACC_SECTIONS_MAPPING (ut64)0x40000000
 #define R_CORE_BIN_ACC_TYPES (ut64) 0x80000000
-#define R_CORE_BIN_ACC_ALL	(ut64) 0xD04FFF
+#define R_CORE_BIN_ACC_ALL	((ut64)0xD04FFF | R_CORE_BIN_ACC_TRYCATCH)
 
 #define R_CORE_PRJ_FLAGS	0x0001
 #define R_CORE_PRJ_EVAL		0x0002
@@ -1038,10 +1055,54 @@ typedef struct {
 	RCoreAnalStatsItem *block;
 } RCoreAnalStats;
 
+typedef struct r_core_anal_artifact_comment_t {
+	ut64 addr;
+	const char *prefix;
+	const char *text;
+} RCoreAnalArtifactComment;
+
+typedef struct r_core_anal_artifact_flag_t {
+	const char *name;
+	ut64 addr;
+	ut64 size;
+} RCoreAnalArtifactFlag;
+
+typedef struct r_core_anal_artifact_replacement_t {
+	const char *provider_id;
+	const char *domain_id;
+	ut64 scope_id;
+	ut64 expected_function_epoch;
+	ut64 expected_type_epoch;
+	ut64 expected_snapshot_revision;
+	const RCoreAnalArtifactComment *comments;
+	size_t comment_count;
+	const RCoreAnalArtifactFlag *flags;
+	size_t flag_count;
+	const RAnalRef *xrefs;
+	size_t xref_count;
+} RCoreAnalArtifactReplacement;
+
+typedef enum {
+	R_CORE_ANAL_ARTIFACT_REPLACE_OK = 0,
+	R_CORE_ANAL_ARTIFACT_REPLACE_INVALID_ARGUMENT,
+	R_CORE_ANAL_ARTIFACT_REPLACE_STALE_SOURCE,
+	R_CORE_ANAL_ARTIFACT_REPLACE_CONFLICT,
+	R_CORE_ANAL_ARTIFACT_REPLACE_PREPARATION_FAILED,
+} RCoreAnalArtifactReplaceStatus;
+
+typedef struct r_core_anal_artifact_replace_result_t {
+	RCoreAnalArtifactReplaceStatus status;
+	size_t failed_index;
+	size_t replaced;
+	ut64 revision;
+} RCoreAnalArtifactReplaceResult;
+
 R_API char *r_core_anal_hasrefs(RCore *core, ut64 value, int mode);
 R_API char *r_core_anal_get_comments(RCore *core, ut64 addr);
 R_API RCoreAnalStats* r_core_anal_get_stats(RCore *a, ut64 from, ut64 to, ut64 step);
 R_API void r_core_anal_stats_free(RCoreAnalStats *s);
+R_API RCoreAnalArtifactReplaceResult r_core_anal_artifacts_replace(RCore *core,
+	const RCoreAnalArtifactReplacement *replacements, size_t replacement_count);
 
 R_API void r_core_syscmd_ls(const char *input);
 R_API void r_core_syscmd_cat(const char *file);

@@ -263,28 +263,76 @@ R_API bool r_io_read_at(RIO *io, ut64 addr, ut8 *buf, int len) {
 	return internal_r_io_read_at (io, addr, buf, len);
 }
 
-// For both virtual and physical mode, returns the number of bytes of read
-// prefix.
-// Returns -1 on error.
-R_API int r_io_nread_at(RIO *io, ut64 addr, ut8 *buf, int len) {
+static int internal_r_io_nread_at(RIO *io, ut64 addr, ut8 *buf, int len) {
 	int ret;
-	R_RETURN_VAL_IF_FAIL (io && buf && len >= 0, -1);
-	if (len == 0) {
-		return 0;
-	}
 	if (io->va) {
 		if (io->ff) {
 			memset (buf, io->Oxff, len);
 		}
 		r_io_bank_drain (io, io->bank);
-		ret = r_io_bank_read_from_submap_at (io, io->bank, addr, buf, len);
+		ret = 0;
+		while (ret < len) {
+			const int n = r_io_bank_read_from_submap_at (io, io->bank,
+				addr + ret, buf + ret, len - ret);
+			if (n < 0) {
+				return ret > 0? ret: n;
+			}
+			if (!n) {
+				break;
+			}
+			ret += n;
+		}
 	} else {
 		ret = r_io_pread_at (io, addr, buf, len);
 	}
-	if (ret > 0 && io->cache.mode & R_PERM_R) {
-		(void)r_io_cache_read_at (io, addr, buf, len);
+	if (io->cache.mode & R_PERM_R) {
+		int total = R_MAX (ret, 0);
+		const int cached = r_io_cache_nread_at (io, addr, buf, len);
+		total = R_MAX (total, cached);
+		while (total < len) {
+			const int next = r_io_cache_nread_at (io, addr + total, buf + total, len - total);
+			if (next < 1) {
+				break;
+			}
+			total += next;
+		}
+		if (total > 0) {
+			ret = total;
+		}
 	}
 	return ret;
+}
+
+// For both virtual and physical mode, returns the number of bytes of the
+// contiguous read prefix. Returns -1 on error before any byte was read.
+R_API int r_io_nread_at(RIO *io, ut64 addr, ut8 *buf, int len) {
+	R_RETURN_VAL_IF_FAIL (io && buf && len >= 0, -1);
+	if (!len) {
+		return 0;
+	}
+	int total = 0;
+	while (total < len) {
+		ut64 at = addr + total;
+		int chunk = len - total;
+		if (io->mask) {
+			at &= io->mask;
+			const ut64 mask_left = io->mask - at + 1;
+			if (mask_left < chunk) {
+				chunk = mask_left;
+			}
+		} else if (at > UT64_MAX - (chunk - 1)) {
+			chunk = UT64_MAX - at + 1;
+		}
+		const int n = internal_r_io_nread_at (io, at, buf + total, chunk);
+		if (n < 0) {
+			return total > 0? total: n;
+		}
+		total += n;
+		if (n != chunk) {
+			break;
+		}
+	}
+	return total;
 }
 
 R_API bool r_io_write_at(RIO* io, ut64 addr, const ut8* buf, int len) {
@@ -470,7 +518,7 @@ R_API void r_io_bind(RIO *io, RIOBind *bnd) {
 	bnd->open = r_io_open_nomap;
 	bnd->open_at = r_io_open_at;
 	bnd->close = r_io_fd_close;
-	bnd->read_at = r_io_read_at;
+	bnd->read_at = r_io_nread_at;
 	bnd->write_at = r_io_write_at;
 	bnd->overlay_write_at = r_io_vwrite_to_overlay_at;
 	bnd->system = r_io_system;

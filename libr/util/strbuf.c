@@ -157,7 +157,7 @@ R_API bool r_strbuf_reserve(RStrBuf *sb, size_t len) {
 
 R_API bool r_strbuf_setbin(RStrBuf *sb, const ut8 *s, size_t l) {
 	R_RETURN_VAL_IF_FAIL (sb && s, false);
-	if (l > ST32_MAX) {
+	if (l >= ST32_MAX) {
 		return false;
 	}
 	if (l >= sizeof (sb->buf)) {
@@ -289,7 +289,7 @@ R_API bool r_strbuf_append(RStrBuf *sb, const char *s) {
 
 R_API bool r_strbuf_append_n(RStrBuf *sb, const char *s, size_t l) {
 	R_RETURN_VAL_IF_FAIL (sb && s, false);
-	if (l > ST32_MAX) {
+	if (l >= ST32_MAX) {
 		R_LOG_WARN ("Negative length used in r_strbuf_append_n");
 		return false;
 	}
@@ -387,7 +387,7 @@ R_API bool r_strbuf_prependf(RStrBuf *sb, const char *fmt, ...) {
 
 R_API bool r_strbuf_prepend_n(RStrBuf *sb, const char *s, size_t l) {
 	R_RETURN_VAL_IF_FAIL (sb && s, false);
-	if (l > ST32_MAX) {
+	if (l >= ST32_MAX) {
 		R_LOG_WARN ("Negative length used in r_strbuf_prepend_n");
 		return false;
 	}
@@ -447,7 +447,10 @@ R_API bool r_strbuf_pad(RStrBuf *sb, char ch, int sz) {
 	if (sz < 1) {
 		return true;
 	}
-	if (!r_strbuf_reserve (sb, sb->len + sz)) {
+	const size_t cap = sb->ptr? sb->ptrlen: sizeof (sb->buf);
+	size_t required;
+	// grow with the same slack as the append paths instead of an exact fit
+	if (r_add_overflow (sb->len, (size_t)sz + 1, &required) || !r_strbuf_reserve (sb, growlog (cap, required) - 1)) {
 		return false;
 	}
 	char *buf = sb->ptr? sb->ptr: sb->buf;

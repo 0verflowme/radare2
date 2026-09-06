@@ -146,6 +146,36 @@ EXPECT=<<EOF
 EOF
 RUN
 
+NAME=exact function type link overrides name lookup
+FILE=-
+CMDS=<<EOF
+e asm.arch=x86
+e asm.bits=64
+wx c3
+af
+afn fallback_signature
+'td int fallback_signature(int fallback);
+'td char linked_signature(char linked);
+afs
+tl linked_signature = 0
+afs
+afn renamed_signature
+afs
+tl- 0
+afs
+'td struct NotAFunction { int value; };
+tl NotAFunction = 0
+afs
+EOF
+EXPECT=<<EOF
+int fallback_signature (int fallback);
+char fallback_signature (char linked);
+char renamed_signature (char linked);
+int renamed_signature (int fallback);
+int renamed_signature (int fallback);
+EOF
+RUN
+
 NAME=List type links
 CMDS=<<EOF
 tl int = 0x4
@@ -207,11 +237,13 @@ EXPECT=<<EOF
 | 0x0000100e      d358           ldr r3, [r2, r3]                      ; JNINativeInterface.GetStringLength
 | 0x00001012      019a           ldr r2, [var_13ch]                    ; JNINativeInterface.reserved0
 | 0x00001066      d258           ldr r2, [r2, r3]                      ; JNINativeInterface.NewStringUTF
+| 0x00001078      439a           ldr r2, [var_34h]                     ; JNINativeInterface.reserved0
 | 0x00001114      d258           ldr r2, [r2, r3]                      ; JNINativeInterface.NewStringUTF
+| 0x00001128      1a68           ldr r2, [r3]                          ; JNINativeInterface.reserved0
 | 0x0000112e      d258           ldr r2, [r2, r3]                      ; JNINativeInterface.NewStringUTF
-| 0x00001144      4b9a           ldr r2, [JNINativeInterface]
+| 0x00001144      4b9a           ldr r2, [JNINativeInterface]          ; JNINativeInterface.reserved0
 | 0x00001148      9a42           cmp r2, r3                            ; JNINativeInterface.reserved0
-12
+14
 EOF
 RUN
 
@@ -233,6 +265,7 @@ long
 long long
 short
 size_t
+ssize_t
 uid_t
 uint16_t
 uint32_t
@@ -452,6 +485,7 @@ long
 long long
 short
 size_t
+ssize_t
 uid_t
 uint16_t
 uint32_t
@@ -487,6 +521,7 @@ long
 long long
 short
 size_t
+ssize_t
 uid_t
 uint16_t
 uint32_t
@@ -1762,11 +1797,11 @@ arg int argc @ r0
 arg char ** argv @ r1
 var uint32_t v5 @ sp+0x0
 var char * option @ fp-0xc
-var int32_t var_14h @ fp-0x10
+var pid_t var_14h @ fp-0x10
 var int32_t var_18h @ fp-0x14
 var char * options @ fp-0x18
 var char * s @ fp-0x1c
-var char * var_24h @ fp-0x20
+var char * c @ fp-0x20
 var int32_t var_28h @ fp-0x24
 var char * src @ fp-0x28
 var int32_t var_30h @ fp-0x2c
@@ -2004,7 +2039,7 @@ af
 afs
 EOF
 EXPECT=<<EOF
-size_t strlen (const char *s);
+size_t sym.imp.strlen (const char *s);
 EOF
 RUN
 
@@ -2252,7 +2287,7 @@ int main (int argc, char **argv, char **envp);
     }
   ]
 }
-char * strcpy (char *dest, const char *src);
+char * sym.imp.strcpy (char *dest, const char *src);
 {
   "name": "sym.imp.strcpy",
   "noreturn": false,
@@ -3491,7 +3526,7 @@ var uint8_t [256] var_20h @ rbp-0x20
 EOF
 RUN
 
-NAME=a loop body value the header never touches is also lost after the loop
+NAME=a loop body value the header never touches survives after the loop
 FILE=malloc://128
 ARGS=-a x86 -b 64 -e types.sizes=true
 CMDS=<<EOF2
@@ -3506,7 +3541,7 @@ aft
 afv~var_20h
 EOF2
 EXPECT=<<EOF2
-var int64_t var_20h @ rbp-0x20
+var uint8_t [256] var_20h @ rbp-0x20
 EOF2
 RUN
 
@@ -3526,6 +3561,228 @@ afv~var_20h
 EOF2
 EXPECT=<<EOF2
 var uint8_t [256] var_20h @ rbp-0x20
+EOF2
+RUN
+
+NAME=a header rewriting the same value still overrides the loop body
+FILE=malloc://128
+ARGS=-a x86 -b 64 -e types.sizes=true
+CMDS=<<EOF2
+wx 554889e54883ec20ba04000000ba0400000085ff7407ba00010000ebf0488d7de031f6e818000000c9c3
+wx c3 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_20h
+EOF2
+EXPECT=<<EOF2
+var int64_t var_20h @ rbp-0x20
+EOF2
+RUN
+
+NAME=loop arm state does not leak into the sibling arm
+FILE=malloc://128
+ARGS=-a x86 -b 64 -e types.sizes=true
+CMDS=<<EOF2
+wx 554889e54883ec2085ff7407ba00010000ebf5488d7de031f6e822000000ebe8
+wx c3 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv
+EOF2
+EXPECT=<<EOF2
+arg int64_t arg1 @ rdi
+arg size_t n @ rdx
+var int64_t s @ rbp-0x20
+EOF2
+RUN
+
+NAME=a restored block reads the sibling branch stack writes
+FILE=malloc://256
+ARGS=-a x86 -b 64 -e types.sizes=true -e types.bbstate=true
+CMDS=<<EOF2
+# entry sets size 0x100 in edx and at rbp-0x10; the sibling branch lowers both to 0x40 and returns; the join memsets with the register size, then with the reloaded stack size
+wx 554889e54883ec70ba0001000048c745f00001000085ff750eba4000000048c745f040000000c3488d7de031f6e84e000000488d7da031f6488b55f0e83f000000c9c3
+wx c3 @ 0x80
+af+ 0x80 memset
+afb+ 0x80 0x80 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_
+EOF2
+EXPECT=<<EOF2
+var uint8_t [256] var_20h @ rbp-0x20
+var uint8_t [64] var_60h @ rbp-0x60
+EOF2
+RUN
+
+NAME=disabling the state restore takes registers and stack from the same block
+FILE=malloc://256
+ARGS=-a x86 -b 64 -e types.sizes=true -e types.bbstate=false
+CMDS=<<EOF2
+# entry sets size 0x100 in edx and at rbp-0x10; the sibling branch lowers both to 0x40 and returns; the join memsets with the register size, then with the reloaded stack size
+wx 554889e54883ec70ba0001000048c745f00001000085ff750eba4000000048c745f040000000c3488d7de031f6e84e000000488d7da031f6488b55f0e83f000000c9c3
+wx c3 @ 0x80
+af+ 0x80 memset
+afb+ 0x80 0x80 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_
+EOF2
+EXPECT=<<EOF2
+var uint8_t [64] var_20h @ rbp-0x20
+var uint8_t [64] var_60h @ rbp-0x60
+EOF2
+RUN
+
+NAME=a header byte write keeps the rest of the body's register value
+FILE=malloc://128
+ARGS=-a x86 -b 64 -e types.sizes=true
+CMDS=<<EOF2
+wx 554889e54883ec20ba05000000b20485ff7404b601ebf6488d7de031f6e81e000000c9c3
+wx c3 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_20h
+EOF2
+EXPECT=<<EOF2
+var uint8_t [260] var_20h @ rbp-0x20
+EOF2
+RUN
+
+NAME=a loop header containing a call keeps its clobbered state at the exit
+FILE=malloc://128
+ARGS=-a x86 -b 64 -e types.sizes=true
+CMDS=<<EOF2
+wx 554889e54883ec20e83300000085c07407ba00010000ebf0488d7de031f6e825000000c9c3
+wx c3 @ 0x40
+wx c3 @ 0x48
+af+ 0x40 readfd
+afb+ 0x40 0x40 1
+af+ 0x48 memset
+afb+ 0x48 0x48 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv
+EOF2
+EXPECT=<<EOF2
+var int64_t s @ rbp-0x20
+EOF2
+RUN
+
+NAME=a foreign loop's state does not reach another loop's exit
+FILE=malloc://128
+ARGS=-a x86 -b 64 -e types.sizes=true
+CMDS=<<EOF2
+wx 554889e54883ec2085ff741485f675f885c97404c9c39090ba00010000ebf190488d7de031f6e815000000c9c3
+wx c3 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv
+EOF2
+EXPECT=<<EOF2
+arg int64_t arg1 @ rdi
+arg int64_t arg2 @ rsi
+arg size_t n @ rdx
+arg int64_t arg4 @ rcx
+var int64_t s @ rbp-0x20
+EOF2
+RUN
+
+NAME=ppc64be header carry bit is restored at the loop exit
+FILE=malloc://128
+ARGS=-a ppc -b 64 -e cfg.bigendian=true -e types.sizes=true
+CMDS=<<EOF2
+wx f821ffa138a0007f392000013529ffff4182000c300900004bfffff47ca52914f8010028386100283880000048000015382100604e800020
+wx 4e800020 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_28h
+EOF2
+EXPECT=<<EOF2
+var uint8_t [255] var_28h @ r1+0x28
+EOF2
+RUN
+
+NAME=ppc64be loop body value survives after the loop
+FILE=malloc://128
+ARGS=-a ppc -b 64 -e cfg.bigendian=true -e types.sizes=true
+CMDS=<<EOF2
+wx f821ffa138a000042f890000419e000c38a001004bfffff4f801002838610028388000004800001d382100604e800020
+wx 4e800020 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_28h
+EOF2
+EXPECT=<<EOF2
+var uint8_t [256] var_28h @ r1+0x28
+EOF2
+RUN
+
+NAME=arm64 loop body value survives after the loop
+FILE=malloc://128
+ARGS=-a arm -b 64 -e types.sizes=true
+CMDS=<<EOF2
+wx ffc300d1ff0b00f91f0000716000005402208052fdffff17e04300910100805208000094c0035fd6
+wx c0035fd6 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_10h
+EOF2
+EXPECT=<<EOF2
+var uint8_t [256] var_10h @ sp+0x10
+EOF2
+RUN
+
+NAME=an arm64 word write in the header overrides the loop body
+FILE=malloc://128
+ARGS=-a arm -b 64 -e types.sizes=true
+CMDS=<<EOF2
+wx ffc300d1ff0b00f9820080521f0000716000005402208052fcffff17e04300910100805207000094c0035fd6
+wx c0035fd6 @ 0x40
+af+ 0x40 memset
+afb+ 0x40 0x40 1
+'td void *memset(void *s, int c, size_t n);
+af @ 0
+s 0
+aft
+afv~var_10h
+EOF2
+EXPECT=<<EOF2
+var int64_t var_10h @ sp+0x10
 EOF2
 RUN
 
@@ -3565,14 +3822,19 @@ RUN
 
 NAME=td stores a void parameter list on a member as zero arguments
 FILE=-
+ARGS=-b 64
 CMDS=<<EOF
 'td struct A2 { float (*m)(void); void *x; };
 tk~func.A2
+tss A2.m
+tss A2
 EOF
 EXPECT=<<EOF
 func.A2.m.args=0
 func.A2.m.cc=cdecl
 func.A2.m.ret=float
+8
+16
 EOF
 RUN
 
@@ -3667,5 +3929,153 @@ func.N.cb.arg.1=char,c
 func.N.cb.args=2
 func.N.cb.cc=cdecl
 func.N.cb.ret=int
+EOF
+RUN
+
+NAME=reanalysis drops the stale higher arg keys of a previously wider function
+FILE=bins/elf/pltrel/add.so
+CMDS=<<EOF
+s sym.add2
+af
+tk func.sym.add2.arg.2=int,stale2
+tk func.sym.add2.arg.3=int,stale3
+tk func.sym.add2.args=4
+af-
+af
+k anal/types/func.sym.add2.args
+k anal/types/func.sym.add2.arg.1
+k anal/types/func.sym.add2.arg.2
+k anal/types/func.sym.add2.arg.3
+EOF
+EXPECT=<<EOF
+2
+int64_t,arg2
+EOF
+RUN
+
+NAME=DWARF struct member needing sdb sanitization survives the save round-trip
+FILE=bins/elf/dwarf2_many_comp_units.elf
+ARGS=-e bin.dbginfo=true
+CMDS=<<EOF
+tk struct.Bird
+tk struct.Bird._vptr_Bird
+tsc Bird
+EOF
+EXPECT=<<EOF
+_vptr_Bird
+int (**)(),2,0
+struct Bird {
+  int (**)() _vptr_Bird;
+};
+EOF
+RUN
+
+NAME=struct and union members are sized with the target pointer width
+FILE=-
+ARGS=-b 64
+CMDS=<<EOF
+'td struct VB { void *a; void *b; };
+'td struct AR { char *p[4]; int n; };
+'td union U { void *p; int n; };
+tss struct VB
+tss struct AR
+tss union U
+EOF
+EXPECT=<<EOF
+16
+36
+8
+EOF
+RUN
+
+NAME=struct size follows the target word size
+FILE=-
+ARGS=-b 16
+CMDS=<<EOF
+'td struct VB { void *a; void *b; };
+tss char *
+tss struct VB
+EOF
+EXPECT=<<EOF
+2
+4
+EOF
+RUN
+
+NAME=Windows fixed-width integer aliases resolve in CIL binaries
+FILE=bins/cil/hello.exe
+CMDS=<<EOF
+k anal/types/LONG
+k anal/types/type.LONG
+k anal/types/type.LONG.size
+k anal/types/ULONG
+k anal/types/type.ULONG
+k anal/types/type.ULONG.size
+k anal/types/ULONGLONG
+k anal/types/type.ULONGLONG
+k anal/types/type.ULONGLONG.size
+k anal/types/u_long
+k anal/types/type.u_long
+k anal/types/type.u_long.size
+tss l_timeval
+tsj l_timeval
+EOF
+EXPECT=<<EOF
+type
+d
+32
+type
+d
+32
+type
+q
+64
+type
+d
+32
+8
+{"name":"l_timeval","format":"dd tv_sec tv_usec","fields":[{"name":"tv_sec","type":"LONG","offset":0,"size":4},{"name":"tv_usec","type":"LONG","offset":4,"size":4}]}
+EOF
+RUN
+
+NAME=pd shows the instruction under a function typelink without a format
+FILE=malloc://8
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 9090c3
+'td int foo(int x);
+tl foo = 0
+pd 2
+EOF
+EXPECT=<<EOF
+            0x00000000      90             nop
+            0x00000001      90             nop
+EOF
+RUN
+
+NAME=posix and glibc prototypes
+FILE=-
+CMDS=<<EOF
+e asm.arch=x86
+e asm.bits=64
+e asm.os=linux
+tf lseek~func.lseek.ret=
+tf stat~func.stat.arg.1
+tf fdopen~ret
+tf lseek64~ret
+tf errno_location~ret
+tf ctype_b_loc~ret
+tf fprintf_chk~func.fprintf_chk.arg.3
+tf longjmp_chk~noreturn
+EOF
+EXPECT=<<EOF
+func.lseek.ret=off_t
+func.stat.arg.1=void *,buf
+func.fdopen.ret=file*
+func.lseek64.ret=off64_t
+func.errno_location.ret=int *
+func.ctype_b_loc.ret=const unsigned short **
+func.fprintf_chk.arg.3=,...
+func.longjmp_chk.noreturn=true
 EOF
 RUN

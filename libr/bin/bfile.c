@@ -982,7 +982,7 @@ R_IPI bool r_bin_file_set_obj(RBin *bin, RBinFile *bf, RBinObject * R_NULLABLE o
 			return false;
 		}
 		if (!obj->info->lang) {
-			obj->info->lang = r_bin_lang_tostring (obj->lang);
+			obj->info->lang = r_bin_lang_tostring (R_VPACK_FIRST (obj->langs));
 		}
 	}
 	return true;
@@ -1321,7 +1321,7 @@ R_API RBinClass *r_bin_class_new(const char *name, const char *super, ut64 attr)
 		}
 		RVecRBinSymbol_init (&c->methods);
 		RVecRBinField_init (&c->fields);
-		c->attr = attr;
+		c->attr.flags = attr;
 		c->origin = R_BIN_CLASS_ORIGIN_BIN;
 	}
 	return c;
@@ -1349,6 +1349,7 @@ R_API void r_bin_class_fini(RBinClass *k) {
 		r_bin_name_free (k->name);
 		r_list_free (k->super);
 		free (k->visibility_str);
+		free (k->attr.ns);
 		RVecRBinSymbol_fini (&k->methods);
 		RVecRBinField_fini (&k->fields);
 	}
@@ -1411,8 +1412,14 @@ R_API RBinSymbol *r_bin_file_add_method(RBinFile *bf, const char *rawname, const
 		R_LOG_ERROR ("Cannot allocate class %s", klass);
 		return NULL;
 	}
-	const int lang = (strstr (method, "JNI") || strstr (klass, "JNI"))? R_BIN_LANG_JNI: R_BIN_LANG_CXX;
-	c->lang = lang;
+	RBinLanguage lang = R_BIN_LANG_CXX;
+	if (strstr (method, "JNI") || strstr (klass, "JNI")) {
+		lang = R_BIN_LANG_JNI;
+	} else if (rawname && (rawname[0] == '-' || rawname[0] == '+') && rawname[1] == '[') {
+		lang = R_BIN_LANG_OBJC;
+	}
+	c->attr.lang = lang;
+	r_bin_file_add_language (bf, lang);
 	RBinSymbol *sym = __getMethod (c, method);
 	if (!sym) {
 		sym = r_bin_class_add_method (bf, klass, method, nargs);
@@ -1420,7 +1427,7 @@ R_API RBinSymbol *r_bin_file_add_method(RBinFile *bf, const char *rawname, const
 			return NULL;
 		}
 		sym->name->name = strdup (method);
-		sym->lang = lang;
+		sym->attr.lang = lang;
 	}
 	if (sym->name) {
 		free (sym->name->oname);
@@ -1454,7 +1461,7 @@ R_API ut64 r_bin_file_get_vaddr(RBinFile *bf, ut64 paddr, ut64 vaddr) {
 	return paddr;
 }
 
-R_API RList *r_bin_file_get_trycatch(RBinFile *bf) {
+R_API R_UNOWNED RVecRBinTrycatch *r_bin_file_get_trycatch(RBinFile * R_NONNULL bf) {
 	R_RETURN_VAL_IF_FAIL (bf && bf->bo && bf->bo->plugin, NULL);
 	if (bf->bo->plugin->trycatch) {
 		return bf->bo->plugin->trycatch (bf);

@@ -446,7 +446,9 @@ static char *regs(RArchSession *as) {
 			"fpu	f29 .64 524 0\n"
 			"fpu	f30 .64 532 0\n"
 			"fpu	f31 .64 540 0\n"
-			"gpr	ca .1 292 0\n";
+			"gpr	ca .1 292 0\n"
+			"gpr	ov .1 293 0\n"
+			"gpr	so .1 294 0\n";
 		return strdup (p);
 	}
 
@@ -584,7 +586,9 @@ static char *regs(RArchSession *as) {
 		"fpu	f29 .64 728 0\n"
 		"fpu	f30 .64 736 0\n"
 		"fpu	f31 .64 744 0\n"
-		"gpr	ca .1 496 0\n";
+		"gpr	ca .1 496 0\n"
+		"gpr	ov .1 497 0\n"
+		"gpr	so .1 498 0\n";
 	return strdup (p);
 }
 
@@ -885,14 +889,14 @@ static void toc_invalidate(PluginData *pd, RAnalOp *op, cs_insn *insn) {
 	}
 }
 
-// algebraic shift right: ca = sign(rs) & (low bits shifted out != 0); set ca before rd to stay alias-safe
+// ca = sign(rs) & (bits shifted out != 0); ca before rd for alias safety
 static void set_sra(RAnalOp *op, const char *rd, const char *rs, const char *cnt, bool w64, const char *mask) {
 	const char *sgn = w64? "0x8000000000000000": "0x80000000";
 	const char *lo = w64? "0xffffffffffffffff": "0xffffffff";
 	char sx[48];
 	const char *v = rs;
 	if (!w64) {
-		// the word forms shift the sign-extended low word, not the raw 64-bit register
+		// word forms shift the sign-extended low word
 		snprintf (sx, sizeof (sx), "32,%s,~", rs);
 		v = sx;
 	}
@@ -1128,19 +1132,40 @@ static void ppc_esil_stx(RAnalOp *op, PluginData *pd, struct Getarg *gop, int wi
 	}
 }
 
-// 32-bit rotate by hand (ESIL ROL is 64-bit); wrapping mask (MB>ME) also fills bits 32:63
+// 32-bit rotate by hand, because ESIL ROL is 64-bit
+static void ppc_rotl32(char *buf, size_t sz, const char *sh, const char *rs) {
+	snprintf (buf, sz, "%s,0x1f,&,%s,<<,%s,0x1f,&,32,-,%s,0xffffffff,&,>>,|,0xffffffff,&",
+		sh, rs, sh, rs);
+}
+
 static void ppc_esil_rlwnm(RAnalOp *op, PluginData *pd, struct Getarg *gop, const char *mask, bool wrap) {
 	const char *sh = getarg2 (pd, gop, 2, "");
 	const char *rs = getarg2 (pd, gop, 1, "");
 	const char *rd = getarg2 (pd, gop, 0, "");
 	char rot[128];
-	snprintf (rot, sizeof (rot), "%s,0x1f,&,%s,<<,%s,0x1f,&,32,-,%s,0xffffffff,&,>>,|,0xffffffff,&",
-		sh, rs, sh, rs);
+	ppc_rotl32 (rot, sizeof (rot), sh, rs);
 	if (wrap) {
 		esilprintf (op, "%s,%s,&,32,%s,<<,|,%s,=", rot, mask, rot, rd);
 	} else {
 		esilprintf (op, "%s,%s,&,%s,=", rot, mask, rd);
 	}
+}
+
+// rlwimi/rldimi insert: the bits the mask misses keep rA's old value
+static void ppc_esil_insert(RAnalOp *op, const char *val, ut64 mask, const char *rd) {
+	esilprintf (op, "%s,0x%"PFMT64x",&,%s,0x%"PFMT64x",&,|,%s,=", val, mask, rd, ~mask, rd);
+}
+
+static void ppc_esil_rlwimi(RAnalOp *op, PluginData *pd, struct Getarg *gop, ut64 mask) {
+	char rot[128], val[272];
+	ppc_rotl32 (rot, sizeof (rot), getarg2 (pd, gop, 2, ""), getarg2 (pd, gop, 1, ""));
+	// only a wrapping mask reaches bits 32:63; else the copy is dead
+	if (mask >> 32) {
+		snprintf (val, sizeof (val), "%s,32,%s,<<,|", rot, rot);
+	} else {
+		r_str_ncpy (val, rot, sizeof (val));
+	}
+	ppc_esil_insert (op, val, mask, getarg2 (pd, gop, 0, ""));
 }
 
 static void ppc_fpop(RAnalOp *op, PluginData *pd, struct Getarg *gop, bool single, int nsrc, const char *fop) {
@@ -1193,6 +1218,38 @@ static void ppc_cond_branch(RAnalOp *op, int bc, const char *cr, const char *pre
 	}
 }
 
+// LK onto the next insn is the get-PC idiom; typing it CALL invents a fcn
+static void ppc_always_type(RAnalOp *op, ut64 dst, ut64 next, bool lk) {
+	op->jump = dst;
+	if (lk && dst != next) {
+		op->type = R_ANAL_OP_TYPE_CALL;
+		op->fail = next;
+	} else {
+		op->type = R_ANAL_OP_TYPE_JMP;
+	}
+}
+
+// cs5 prints BO=1z1zz (branch always, bcl 20,31,$+4 = get-PC) as bdnz aliases
+static bool ppc_branch_always(RAnalOp *op, cs_insn *insn, const ut8 *buf, bool be, ut64 addr, RArchDecodeMask mask) {
+	const ut32 w = r_read_ble32 (buf, be);
+	const ut32 bo = (w >> 21) & 0x1f;
+	if ((w >> 26) != 16 || (bo & 0x14) != 0x14) {
+		return false;
+	}
+	const bool lk = w & 1;
+	const ut64 dst = IMM (0);
+	ppc_always_type (op, dst, addr + 4, lk);
+	esilprintf (op, "%s0x%" PFMT64x ",pc,=", lk? "pc,lr,=,": "", dst);
+	if (mask & R_ARCH_OP_MASK_DISASM) {
+		const ut32 bi = (w >> 16) & 0x1f;
+		const bool aa = w & 2;
+		free (op->mnemonic);
+		op->mnemonic = r_str_newf ("bc%s%s %d, %d, 0x%" PFMT64x,
+			lk? "l": "", aa? "a": "", bo, bi, dst);
+	}
+	return true;
+}
+
 #if CS_API_MAJOR >= 6
 // cs6 folds the conditional-branch aliases onto the generic bc/bcctr/bclr ids and describes the
 // condition in detail->ppc.bc. Derive it from the raw BO/BI fields rather than from bc.pred_*:
@@ -1214,7 +1271,7 @@ static int ppc6_cr_pred(cs_insn *insn) {
 	default:
 		break;
 	}
-	// the summary-overflow bit is not modelled, as in the v5 path
+	// bso/bns need CR0.SO, but the eq predicate tests the whole cr0 byte
 	return PPC_PRED_INVALID;
 }
 
@@ -1269,10 +1326,130 @@ static bool ppc6_branch(RAnalOp *op, csh handle, cs_insn *insn, const char *targ
 	return true;
 }
 
+// cs6 ids every overflow form separately, so addo misses the add case
+static unsigned int ppc6_oe_base_id(unsigned int id) {
+	switch (id) {
+	case PPC_INS_ADDO: return PPC_INS_ADD;
+	case PPC_INS_ADDCO: return PPC_INS_ADDC;
+	case PPC_INS_ADDEO: return PPC_INS_ADDE;
+	case PPC_INS_ADDMEO: return PPC_INS_ADDME;
+	case PPC_INS_ADDZEO: return PPC_INS_ADDZE;
+	case PPC_INS_SUBFO: return PPC_INS_SUBF;
+	case PPC_INS_SUBFCO: return PPC_INS_SUBFC;
+	case PPC_INS_SUBFEO: return PPC_INS_SUBFE;
+	case PPC_INS_SUBFMEO: return PPC_INS_SUBFME;
+	case PPC_INS_SUBFZEO: return PPC_INS_SUBFZE;
+	case PPC_INS_NEGO: return PPC_INS_NEG;
+	case PPC_INS_MULLWO: return PPC_INS_MULLW;
+	case PPC_INS_MULLDO: return PPC_INS_MULLD;
+	case PPC_INS_DIVWO: return PPC_INS_DIVW;
+	case PPC_INS_DIVWUO: return PPC_INS_DIVWU;
+	case PPC_INS_DIVDO: return PPC_INS_DIVD;
+	case PPC_INS_DIVDUO: return PPC_INS_DIVDU;
+	case PPC_INS_DIVWEO: return PPC_INS_DIVWE;
+	case PPC_INS_DIVWEUO: return PPC_INS_DIVWEU;
+	case PPC_INS_DIVDEO: return PPC_INS_DIVDE;
+	case PPC_INS_DIVDEUO: return PPC_INS_DIVDEU;
+	}
+	return id;
+}
+
+// x+y+c overflows when the addends agree in sign and the sum does not
+static void ppc6_ov_addsub(char *buf, size_t sz, const char *sgn,
+		const char *x, const char *y, const char *c) {
+	snprintf (buf, sz, "%s,%s,%s,^,&,!,%s,%s,%s,%s,+,%s,+,^,&,!,!,&",
+		sgn, y, x, sgn, x, y, x, c);
+}
+
+// XER.OV/SO for an OE form; false for a non-OE id or an unmodelled family
+static bool ppc6_ov_expr(char *buf, size_t sz, PluginData *pd, struct Getarg *gop) {
+	cs_insn *insn = gop->insn;
+	const unsigned int base = ppc6_oe_base_id (insn->id);
+	if (base == insn->id) {
+		return false;
+	}
+	const bool w64 = gop->bits != 32;
+	const char *sgn = w64? "0x8000000000000000": "0x80000000";
+	const char *ones = w64? "0xffffffffffffffff": "0xffffffff";
+	const char *ra = getarg2 (pd, gop, 1, "");
+	// neg/addme/addze/subfme/subfze report two operands, so there is no rB
+	const char *rb = INSOPS > 2? getarg2 (pd, gop, 2, ""): "";
+	char inv[48], body[288];
+	// subtract forms are rB + ~rA + carry, so they share the add test
+	snprintf (inv, sizeof (inv), "%s,%s,^", ones, ra);
+	switch (base) {
+	case PPC_INS_ADD:
+	case PPC_INS_ADDC:
+		ppc6_ov_addsub (body, sizeof (body), sgn, ra, rb, "0");
+		break;
+	case PPC_INS_ADDE:
+		ppc6_ov_addsub (body, sizeof (body), sgn, ra, rb, "ca");
+		break;
+	case PPC_INS_ADDME:
+		ppc6_ov_addsub (body, sizeof (body), sgn, ra, ones, "ca");
+		break;
+	case PPC_INS_ADDZE:
+		ppc6_ov_addsub (body, sizeof (body), sgn, ra, "0", "ca");
+		break;
+	case PPC_INS_SUBF:
+	case PPC_INS_SUBFC:
+		ppc6_ov_addsub (body, sizeof (body), sgn, inv, rb, "1");
+		break;
+	case PPC_INS_SUBFE:
+		ppc6_ov_addsub (body, sizeof (body), sgn, inv, rb, "ca");
+		break;
+	case PPC_INS_SUBFME:
+		ppc6_ov_addsub (body, sizeof (body), sgn, inv, ones, "ca");
+		break;
+	case PPC_INS_SUBFZE:
+	case PPC_INS_NEG:
+		ppc6_ov_addsub (body, sizeof (body), sgn, inv, "0", base == PPC_INS_NEG? "1": "ca");
+		break;
+	case PPC_INS_MULLW:
+		// overflows when the product no longer fits a signed word
+		snprintf (body, sizeof (body), "32,32,%s,~,32,%s,~,*,~,32,%s,~,32,%s,~,*,^,!,!",
+			rb, ra, rb, ra);
+		break;
+	case PPC_INS_MULLD:
+		if (!w64) {
+			// the test is 64-bit; at 32 bits ASR and >> clamp to garbage
+			return false;
+		}
+		// overflows unless the 128-bit product fits 64 signed bits
+		snprintf (body, sizeof (body),
+			"%s,%s,L*,POP,63,%s,>>,%s,*,0,-,+,63,%s,>>,%s,*,0,-,+,63,%s,%s,*,ASR,^,!,!",
+			rb, ra, ra, rb, rb, ra, rb, ra);
+		break;
+	case PPC_INS_DIVW:
+	case PPC_INS_DIVD: {
+		// division by zero, and the one quotient with no representation
+		const bool d = base == PPC_INS_DIVD;
+		// divw is a word divide even in 64-bit mode
+		char a32[48], b32[48];
+		snprintf (a32, sizeof (a32), d? "%s": "0xffffffff,%s,&", ra);
+		snprintf (b32, sizeof (b32), d? "%s": "0xffffffff,%s,&", rb);
+		snprintf (body, sizeof (body), "%s,!,%s,%s,^,!,%s,%s,^,!,&,|",
+			b32, d? "0xffffffffffffffff": "0xffffffff", b32,
+			d? "0x8000000000000000": "0x80000000", a32);
+		break;
+	}
+	case PPC_INS_DIVWU:
+		snprintf (body, sizeof (body), "0xffffffff,%s,&,!", rb);
+		break;
+	case PPC_INS_DIVDU:
+		snprintf (body, sizeof (body), "%s,!", rb);
+		break;
+	default:
+		return false;
+	}
+	snprintf (buf, sz, "%s,ov,=,ov,so,|,so,=,", body);
+	return true;
+}
+
 // cs6 reports alias-shaped operands under the parent id (li -> addi), so reroute onto the alias-id case; branch aliases stay generic
 static unsigned int ppc6_case_id(cs_insn *insn) {
 	if (!CS6_ALIAS (insn)) {
-		return insn->id;
+		return ppc6_oe_base_id (insn->id);
 	}
 	switch (insn->alias_id) {
 	case PPC_INS_ALIAS_LI:
@@ -1306,7 +1483,7 @@ static unsigned int ppc6_case_id(cs_insn *insn) {
 	case PPC_INS_ALIAS_SLDI:
 		return PPC_INS_SLDI;
 	}
-	return insn->id;
+	return ppc6_oe_base_id (insn->id);
 }
 #endif
 
@@ -2120,12 +2297,19 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 		case PPC_INS_SRAW:
 		case PPC_INS_SRAD:
 			{
-				char m[32];
 				const bool w64 = insn->id == PPC_INS_SRAD;
+				const char *cbits = w64? "0x3f": "0x1f";
+				const char *obit = w64? "0x40": "0x20";
+				const char *rb = ARG (2);
+				char cnt[64], mask[64];
 				op->sign = true;
 				op->type = R_ANAL_OP_TYPE_SAR;
-				snprintf (m, sizeof (m), "1,%s,0x3f,&,1,<<,-", ARG (2));
-				set_sra (op, ARG (0), ARG (1), ARG (2), w64, m);
+				// a count >= the width shifts every bit out
+				snprintf (cnt, sizeof (cnt), "%s,%s,&,%s,%s,&,!,!,%s,*,|",
+					rb, cbits, rb, obit, cbits);
+				snprintf (mask, sizeof (mask), "1,%s,%s,&,1,<<,-,%s,%s,&,!,!,0,-,|",
+					rb, cbits, rb, obit);
+				set_sra (op, ARG (0), ARG (1), cnt, w64, mask);
 			}
 			break;
 		case PPC_INS_SRAWI:
@@ -2142,22 +2326,63 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 		case PPC_INS_CNTLZW:
 		case PPC_INS_CNTLZD:
 			op->type = R_ANAL_OP_TYPE_MOV;
-			// type only: ESIL has no count-leading-zeros operator
+			esilprintf (op, "%d,%s,CLZ,%s,=",
+				(insn->id == PPC_INS_CNTLZD)? 64: 32, ARG (1), ARG (0));
 			break;
+		case PPC_INS_POPCNTD:
+			op->type = R_ANAL_OP_TYPE_MOV;
+			esilprintf (op, "%s,POPCNT,%s,=", ARG (1), ARG (0));
+			break;
+		case PPC_INS_POPCNTW:
+			op->type = R_ANAL_OP_TYPE_MOV;
+			esilprintf (op, "32,32,%s,>>,POPCNT,<<,0xffffffff,%s,&,POPCNT,|,%s,=",
+				ARG (1), ARG (1), ARG (0));
+			break;
+#if CS_API_MAJOR > 4
+		case PPC_INS_POPCNTB:
+			{
+				op->type = R_ANAL_OP_TYPE_MOV;
+				esilprintf (op, "0xff,%s,&,POPCNT", ARG (1));
+				int i;
+				for (i = 1; i < 8; i++) {
+					r_strbuf_appendf (&op->esil, ",%d,0xff,%d,%s,>>,&,POPCNT,<<,|",
+						i * 8, i * 8, ARG (1));
+				}
+				r_strbuf_appendf (&op->esil, ",%s,=", ARG (0));
+			}
+			break;
+#endif
 		case PPC_INS_MULLI:
 			op->sign = true;
-		case PPC_INS_MULLW:
 		case PPC_INS_MULLD:
 			op->type = R_ANAL_OP_TYPE_MUL;
 			esilprintf (op, "%s,%s,*,%s,=", ARG (2), ARG (1), ARG (0));
 			break;
+		case PPC_INS_MULLW:
+			op->type = R_ANAL_OP_TYPE_MUL;
+			// the word forms multiply the sign-extended low words
+			esilprintf (op, "32,%s,~,32,%s,~,*,%s,=", ARG (2), ARG (1), ARG (0));
+			break;
 		case PPC_INS_MULHW:
+			op->sign = true;
+			op->type = R_ANAL_OP_TYPE_MUL;
+			esilprintf (op, "32,32,%s,~,32,%s,~,*,>>,%s,=", ARG (2), ARG (1), ARG (0));
+			break;
+		case PPC_INS_MULHWU:
+			op->type = R_ANAL_OP_TYPE_MUL;
+			esilprintf (op, "32,0xffffffff,%s,&,0xffffffff,%s,&,*,>>,%s,=",
+				ARG (2), ARG (1), ARG (0));
+			break;
 		case PPC_INS_MULHD:
 			op->sign = true;
-		case PPC_INS_MULHWU:
+			op->type = R_ANAL_OP_TYPE_MUL;
+			// signed high = unsigned high - rA<0?rB:0 - rB<0?rA:0
+			esilprintf (op, "%s,%s,L*,POP,63,%s,>>,%s,*,0,-,+,63,%s,>>,%s,*,0,-,+,%s,=",
+				ARG (2), ARG (1), ARG (1), ARG (2), ARG (2), ARG (1), ARG (0));
+			break;
 		case PPC_INS_MULHDU:
 			op->type = R_ANAL_OP_TYPE_MUL;
-			// type only: ESIL has no high-half multiply operator
+			esilprintf (op, "%s,%s,L*,POP,%s,=", ARG (2), ARG (1), ARG (0));
 			break;
 		case PPC_INS_SUB:
 		case PPC_INS_SUBC:
@@ -2408,15 +2633,9 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 				if (ppc6_branch (op, handle, insn, dstbuf, link)) {
 					op->type = link? R_ANAL_OP_TYPE_CCALL: R_ANAL_OP_TYPE_CJMP;
 					op->fail = addr + op->size;
-				} else if (link) {
-					// a branch-always with LK onto the next instruction is the ppc32 pic idiom
-					// bcl 20,31,$+4: it exists for the LR write, and typing it as a call
-					// makes the analysis invent a function at the fallthrough
-					op->type = (dst == addr + op->size)? R_ANAL_OP_TYPE_JMP: R_ANAL_OP_TYPE_CALL;
-					esilprintf (op, "pc,lr,=,%s,pc,=", dstbuf);
 				} else {
-					op->type = R_ANAL_OP_TYPE_JMP;
-					esilprintf (op, "%s,pc,=", dstbuf);
+					ppc_always_type (op, dst, addr + op->size, link);
+					esilprintf (op, "%s%s,pc,=", link? "pc,lr,=,": "", dstbuf);
 				}
 				break;
 			}
@@ -2473,14 +2692,7 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 			}
 			break;
 		case PPC_INS_BDNZ:
-		case PPC_INS_BDZ: {
-			const bool zero = insn->id == PPC_INS_BDZ;
-			op->type = R_ANAL_OP_TYPE_CJMP;
-			op->jump = IMM (0);
-			op->fail = addr + op->size;
-			esilprintf (op, "1,ctr,-=,$z,%s?{,%s,pc,=,}", zero? "": "!,", ARG (0));
-			break;
-		}
+		case PPC_INS_BDZ:
 #if CS_API_MAJOR < 6
 		case PPC_INS_BDNZA:
 		case PPC_INS_BDZA:
@@ -2489,9 +2701,16 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 		case PPC_INS_BDNZLA:
 		case PPC_INS_BDZL:
 		case PPC_INS_BDZLA:
+			if (ppc_branch_always (op, insn, buf, be, addr, mask)) {
+				break;
+			}
 			op->type = R_ANAL_OP_TYPE_CJMP;
 			op->jump = IMM (0);
 			op->fail = addr + op->size;
+			const bool zero = insn->id == PPC_INS_BDZ;
+			if (zero || insn->id == PPC_INS_BDNZ) {
+				esilprintf (op, "1,ctr,-=,$z,%s?{,%s,pc,=,}", zero? "": "!,", ARG (0));
+			}
 			break;
 		case PPC_INS_BDNZLR:
 		case PPC_INS_BDNZLRL:
@@ -2726,6 +2945,14 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 			break;
 		case PPC_INS_RLWIMI:
 			op->type = R_ANAL_OP_TYPE_ROL;
+			if (INSOP (2).type == PPC_OP_IMM && INSOP (3).type == PPC_OP_IMM
+					&& INSOP (4).type == PPC_OP_IMM) {
+				const ut32 mb = getarg (&gop, 3) & 0x1f;
+				const ut32 me = getarg (&gop, 4) & 0x1f;
+				// a wrapping mask covers the whole high word
+				const ut64 hi = (mb > me)? 0xffffffff00000000ULL: 0;
+				ppc_esil_rlwimi (op, pd, &gop, mask32 (mb, me) | hi);
+			}
 			break;
 		case PPC_INS_RLDCL:
 		case PPC_INS_RLDICL:
@@ -2740,8 +2967,18 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 		case PPC_INS_RLDIC:
 		case PPC_INS_RLDIMI:
 			op->type = R_ANAL_OP_TYPE_ROL;
-			// type only: rldic masks mb..63-sh and rldimi inserts into the
-			// destination; neither is expressible via cmask64(mb,me)
+			if (INSOP (2).type == PPC_OP_IMM && INSOP (3).type == PPC_OP_IMM) {
+				// both mask mb..63-sh, rldimi also keeps rA
+				const ut64 sh = getarg (&gop, 2) & 0x3f;
+				const ut64 m = mask64 (getarg (&gop, 3) & 0x3f, 63 - sh);
+				char rot[64];
+				snprintf (rot, sizeof (rot), "%s,%s,ROL", ARG (2), ARG (1));
+				if (insn->id == PPC_INS_RLDIMI) {
+					ppc_esil_insert (op, rot, m, ARG (0));
+				} else {
+					esilprintf (op, "%s,0x%"PFMT64x",&,%s,=", rot, m, ARG (0));
+				}
+			}
 			break;
 		}
 		if (stateful) {
@@ -2763,16 +3000,29 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 				op->type = R_ANAL_OP_TYPE_MOV;
 				esilprintf (op, "%s,%s,=", ARG (1), PPCSPR (0));
 			} else if (!strcmp (insn->mnemonic, "mfxer")) {
+				// fold the split SO/OV/CA back into bits 0:2
 				op->type = R_ANAL_OP_TYPE_MOV;
-				esilprintf (op, "xer,%s,=", ARG (0));
+				esilprintf (op, "0x1fffffff,xer,&,29,ca,<<,|,30,ov,<<,|,31,so,<<,|,%s,=",
+					ARG (0));
 			} else if (!strcmp (insn->mnemonic, "mtxer")) {
+				const char *rs = ARG (0);
 				op->type = R_ANAL_OP_TYPE_MOV;
-				esilprintf (op, "%s,xer,=", ARG (0));
+				esilprintf (op, "29,%s,>>,1,&,ca,=,30,%s,>>,1,&,ov,=,31,%s,>>,1,&,so,=,0x1fffffff,%s,&,xer,=",
+					rs, rs, rs, rs);
 			} else if (CS6_ALIAS (insn) && (insn->mnemonic[1] == 'f' || insn->mnemonic[1] == 't')) {
 				// cs6 names the spr in the mnemonic instead of an operand, so only the move type is left
 				op->type = R_ANAL_OP_TYPE_MOV;
 			}
 		}
+#if CS_API_MAJOR >= 6
+		// prepended: rD is written last and may alias a source
+		if (!r_strbuf_is_empty (&op->esil)) {
+			char ov[320];
+			if (ppc6_ov_expr (ov, sizeof (ov), pd, &gop)) {
+				r_strbuf_prepend (&op->esil, ov);
+			}
+		}
+#endif
 		if (insn->detail->ppc.update_cr0 && !r_strbuf_is_empty (&op->esil)
 				&& (op->type & R_ANAL_OP_TYPE_MASK) != R_ANAL_OP_TYPE_STORE
 				&& INSOP (0).type == PPC_OP_REG

@@ -5,8 +5,10 @@ e asm.os=android
 tk jboolean
 tk jstring
 tk JNIEnv
+tk _JNIEnv
 tk JNINativeInterface
 tk JavaVM
+tk _JavaVM
 tk JNIInvokeInterface
 EOF
 EXPECT=<<EOF
@@ -14,7 +16,9 @@ typedef
 typedef
 typedef
 struct
+struct
 typedef
+struct
 struct
 EOF
 RUN
@@ -83,9 +87,9 @@ tk struct.JNINativeInterface.NewStringUTF
 tk struct.JNINativeInterface.GetObjectRefType
 EOF
 EXPECT=<<EOF
-void *,32,0
-void *,48,0
-void *,1336,0
+JNINativeInterface.GetVersion,32,0
+JNINativeInterface.FindClass,48,0
+JNINativeInterface.NewStringUTF,1336,0
 void *,1856,0
 EOF
 RUN
@@ -98,8 +102,258 @@ tk struct.JNIInvokeInterface.DestroyJavaVM
 tk struct.JNIInvokeInterface.GetEnv
 EOF
 EXPECT=<<EOF
-void *,24,0
-void *,48,0
+JNIInvokeInterface.DestroyJavaVM,24,0
+JNIInvokeInterface.GetEnv,48,0
+EOF
+RUN
+
+NAME=jni interface wrappers preserve public indirection
+FILE=bins/elf/jni/jniO0-arm64
+CMDS=<<EOF
+e asm.os=android
+tk typedef.JNIEnv
+tk struct._JNIEnv.functions
+tk typedef.JavaVM
+tk struct._JavaVM.functions
+tss JNIEnv
+tss JavaVM
+EOF
+EXPECT=<<EOF
+struct _JNIEnv
+const struct JNINativeInterface *,0,0
+struct _JavaVM
+const struct JNIInvokeInterface *,0,0
+8
+8
+EOF
+RUN
+
+NAME=jni high value slots have typed prototypes
+FILE=bins/elf/jni/jniO0-arm64
+CMDS=<<EOF
+e asm.os=android
+tk func.JNIInvokeInterface.GetEnv.ret
+tk func.JNIInvokeInterface.GetEnv.arg.0
+tk func.JNIInvokeInterface.GetEnv.arg.1
+tk func.JNIInvokeInterface.GetEnv.arg.2
+tk func.JNINativeInterface.FindClass.ret
+tk func.JNINativeInterface.FindClass.arg.1
+tk func.JNINativeInterface.GetMethodID.arg.3
+tk func.JNINativeInterface.GetStaticMethodID.ret
+tk func.JNINativeInterface.NewStringUTF.ret
+tk func.JNINativeInterface.GetStringUTFChars.ret
+tk func.JNINativeInterface.ReleaseStringUTFChars.ret
+tk func.JNINativeInterface.GetArrayLength.ret
+tk func.JNINativeInterface.RegisterNatives.arg.2
+tk func.JNINativeInterface.RegisterNatives.arg.3
+tk func.JNINativeInterface.GetDirectBufferAddress.ret
+EOF
+EXPECT=<<EOF
+jint
+JavaVM *,vm
+void **,penv
+jint,version
+jclass
+const char *,name
+const char *,signature
+jmethodID
+jstring
+const char *
+void
+jsize
+const JNINativeMethod *,methods
+jint,count
+void *
+EOF
+RUN
+
+NAME=jni slot prototypes use the target calling convention
+FILE=bins/elf/jni/jniO0-arm64
+CMDS=<<EOF
+e asm.os=android
+tfj JNINativeInterface.FindClass
+EOF
+EXPECT=<<EOF
+{"name":"JNINativeInterface.FindClass","ret":"jclass","cc":"arm64","ret_reg":"x0","args":[{"type":"JNIEnv *","name":"env","size":8,"offset":0,"loc":"x0"},{"type":"const char *","name":"name","size":8,"offset":8,"loc":"x1"}],"size":16}
+EOF
+RUN
+
+NAME=jni call method variants remain distinct
+FILE=bins/elf/jni/jniO0-arm64
+CMDS=<<EOF
+e asm.os=android
+tk func.JNINativeInterface.CallIntMethod.arg.3
+tk func.JNINativeInterface.CallIntMethodV.arg.3
+tk func.JNINativeInterface.CallIntMethodA.arg.3
+tk func.JNINativeInterface.CallNonvirtualObjectMethod.arg.2
+tk func.JNINativeInterface.CallNonvirtualObjectMethod.arg.4
+tk func.JNINativeInterface.CallStaticDoubleMethodV.ret
+tk func.JNINativeInterface.CallStaticDoubleMethodV.arg.3
+tk~^type.JNINativeInterface.Call?
+EOF
+EXPECT=<<EOF
+,...
+va_list,args
+const jvalue *,args
+jclass,clazz
+,...
+jdouble
+va_list,args
+90
+EOF
+RUN
+
+NAME=jni slot calls keep distinct prototypes through spills
+FILE=bins/elf/jni/slot-calls-O0-arm64.so
+CMDS=<<EOF
+e asm.os=android
+aaa
+tk calllink.00001860
+tk calllink.0000191c
+tk calllink.000019d8
+tk calllink.00001a34
+tk calllink.00001a78
+tk calllink.00001a90
+tk calllink.00001aa8
+ah. @ 0x1908~offset
+ah. @ 0x19b8~offset
+ah. @ 0x1a24~offset
+s sym.Java_JNISlots_variadic
+pdf~CallIntMethod
+s sym.Java_JNISlots_buffers
+pdc~^        JNI
+a:callargs-q 0x1a78
+EOF
+EXPECT=<<EOF
+JNINativeInterface.GetVersion
+JNINativeInterface.CallIntMethod
+JNINativeInterface.CallIntMethodV
+JNINativeInterface.CallIntMethodA
+JNINativeInterface.GetDirectBufferAddress
+JNINativeInterface.GetDirectBufferAddress
+JNINativeInterface.GetDirectBufferAddress
+ 0x00001908 => offset='JNINativeInterface.CallIntMethod'
+ 0x000019b8 => offset='JNINativeInterface.CallIntMethodV'
+ 0x00001a24 => offset='JNINativeInterface.CallIntMethodA'
+|           0x00001908      08c540f9       ldr x8, [x8, JNINativeInterface.CallIntMethod]
+|           0x0000191c      00013fd6       blr x8                      ; jint JNINativeInterface.CallIntMethod(JNIEnv *env, jobject object, jmethodID methodID, ...)
+        JNINativeInterface.GetDirectBufferAddress (x0, x1) // void *JNINativeInterface.GetDirectBufferAddress(0, 0)
+        JNINativeInterface.GetDirectBufferAddress (x0, x1) // void *JNINativeInterface.GetDirectBufferAddress(0, 0)
+        JNINativeInterface.GetDirectBufferAddress (x0, x1) // void *JNINativeInterface.GetDirectBufferAddress(0, 0)
+void *JNINativeInterface.GetDirectBufferAddress(?, ?)
+EOF
+RUN
+
+NAME=jni slot calls follow optimized register copies
+FILE=bins/elf/jni/jniO2-arm64
+CMDS=<<EOF
+e asm.os=android
+aaa
+tk calllink.000005bc
+tk calllink.000005d0
+ah. @ 0x5b8~offset
+ah. @ 0x5cc~offset
+s sym.Java_JNIFoo_apiTest
+pdc~^        JNI
+EOF
+EXPECT=<<EOF
+JNINativeInterface.NewStringUTF
+JNINativeInterface.GetVersion
+ 0x000005b8 => offset='JNINativeInterface.NewStringUTF'
+ 0x000005cc => offset='JNINativeInterface.GetVersion'
+        JNINativeInterface.NewStringUTF (x0, x1) // jstring JNINativeInterface.NewStringUTF(0, "test")
+        JNINativeInterface.GetVersion (x0) // jint JNINativeInterface.GetVersion(0)
+EOF
+RUN
+
+NAME=jni typed table layout keeps arm64 offsets and sizes
+FILE=bins/elf/jni/jniO0-arm64
+CMDS=<<EOF
+e asm.os=android
+tss JNIInvokeInterface
+tss JNINativeInterface
+ahts 48
+ahts 1720
+ahts 1840
+EOF
+EXPECT=<<EOF
+64
+1864
+JNIInvokeInterface.GetEnv
+JNINativeInterface.FindClass
+JNINativeInterface.RegisterNatives
+JNINativeInterface.GetDirectBufferAddress
+EOF
+RUN
+
+NAME=jni C++ fixture preserves interface indirection
+FILE=bins/elf/librsjni_androix.so
+CMDS=<<EOF
+e asm.os=android
+aa
+s sym.JNI_OnLoad
+afs
+afvt vm
+ao @ 0x238~opcode
+ao @ 0x244~opcode
+tk struct._JavaVM.functions
+tk struct.JNIInvokeInterface.GetEnv
+tk func.JNIInvokeInterface.GetEnv.arg.0
+ao @ 0x260~opcode
+ao @ 0x270~opcode
+tk struct._JNIEnv.functions
+tk struct.JNINativeInterface.FindClass
+tk func.JNINativeInterface.FindClass.arg.0
+ao @ 0x290~opcode
+ao @ 0x294~opcode
+tk struct.JNINativeInterface.RegisterNatives
+EOF
+EXPECT=<<EOF
+jint sym.JNI_OnLoad (JavaVM *vm, void *reserved);
+JavaVM *
+opcode: ldr x8, [x0]
+opcode: ldr x8, [x8, 0x30]
+const struct JNIInvokeInterface *,0,0
+JNIInvokeInterface.GetEnv,48,0
+JavaVM *,vm
+opcode: ldr x9, [x8]
+opcode: ldr x9, [x9, 0x30]
+const struct JNINativeInterface *,0,0
+JNINativeInterface.FindClass,48,0
+JNIEnv *,env
+opcode: ldr x8, [x0]
+opcode: ldr x8, [x8, 0x6b8]
+JNINativeInterface.RegisterNatives,1720,0
+EOF
+RUN
+
+NAME=jni GetEnv output feeds FindClass and RegisterNatives
+FILE=bins/elf/librsjni_androix.so
+CMDS=<<EOF
+e asm.os=android
+aaa
+tk calllink.00000248
+tk calllink.00000274
+tk calllink.00000298
+ah. @ 0x244~offset
+ah. @ 0x270~offset
+ah. @ 0x294~offset
+s sym.JNI_OnLoad
+pdc~^        JNI
+a:callargs-q 0x274
+a:callargs-q 0x298
+EOF
+EXPECT=<<EOF
+JNIInvokeInterface.GetEnv
+JNINativeInterface.FindClass
+JNINativeInterface.RegisterNatives
+ 0x00000244 => offset='JNIInvokeInterface.GetEnv'
+ 0x00000270 => offset='JNINativeInterface.FindClass'
+ 0x00000294 => offset='JNINativeInterface.RegisterNatives'
+        JNINativeInterface.FindClass (x0, x1) // jclass JNINativeInterface.FindClass(0xffffffff, "BD.\x91\xeb")
+        JNINativeInterface.RegisterNatives (x0, x1, x2, x3) // jint JNINativeInterface.RegisterNatives(0, 0xffffffff, 0xd008, 0x5d)
+jclass JNINativeInterface.FindClass(0x0, "androidx/renderscript/RenderScript")
+jint JNINativeInterface.RegisterNatives(0x0, 0x0, 0xd008, 0x5d)
 EOF
 RUN
 

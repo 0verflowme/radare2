@@ -5,6 +5,8 @@
 #define R_LOG_ORIGIN "prj"
 
 #include <r_core.h>
+#include <r_core_priv.h>
+#include <r_anal_priv.h>
 #include "newprj/newprj.h"
 #include "newprj/format.inc.c"
 #include "newprj/maps.inc.c"
@@ -58,7 +60,9 @@ static RCmdResult prj_open(RCmdContext *ctx, const char *file) {
 		R_LOG_INFO ("Aborted");
 		return (RCmdResult) { .status = 1 };
 	}
-	r_core_cmd0 (core, "o--");
+	if (r_core_cmd0 (core, "o--")) {
+		return (RCmdResult) { .status = 1 };
+	}
 	r_config_set (core->config, "prj.name", "");
 	return prj_load (ctx, file, R_CORE_NEWPRJ_MODE_LOAD | R_CORE_NEWPRJ_MODE_CMD | R_CORE_NEWPRJ_MODE_RIO);
 }
@@ -123,26 +127,6 @@ static RCmdResult prj_callback(RCmdContext *ctx) {
 	return prj_invalid (ctx);
 }
 
-static bool plugin_init(RCorePluginSession *cps) {
-	RCore *core = cps->core;
-	if (!core) {
-		return true;
-	}
-	RCmd *cmd = core->rcmd;
-	if (!r_cmd_register (cmd, "prj", prj_callback, NULL)) {
-		return false;
-	}
-	cps->data = cmd;
-	return true;
-}
-
-static bool plugin_fini(RCorePluginSession *cps) {
-	if (cps->data) {
-		r_cmd_unregister (cps->data, "prj");
-	}
-	return true;
-}
-
 RCorePlugin r_core_plugin_prj = {
 	.meta = {
 		.name = "prj",
@@ -150,8 +134,8 @@ RCorePlugin r_core_plugin_prj = {
 		.author = "pancake",
 		.license = "MIT",
 	},
-	.init = plugin_init,
-	.fini = plugin_fini,
+	.command = "prj",
+	.call_ctx = prj_callback,
 };
 
 #ifndef R2_PLUGIN_INCORE

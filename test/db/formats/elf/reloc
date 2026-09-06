@@ -200,16 +200,24 @@ EOF
 EXPECT=<<EOF
             ;-- section..init_array:
             ;-- segment.LOAD1:
-            0x00126510      .qword 0x0000000000005a6c ; reloc..datadiv_decode9958896245423089702 ; sym..datadiv_decode9958896245423089702 ; [13] -rw- section size 728 named .init_array
-            0x00126518      .qword 0x0000000000005a80 ; reloc..datadiv_decode10476194973746341988 ; sym..datadiv_decode10476194973746341988
-            0x00126520      .qword 0x00000000000efddc ; reloc..datadiv_decode16323044921667855934 ; sym..datadiv_decode16323044921667855934
-            0x00126528      .qword 0x0000000000009080 ; entry.init0
-            0x00126530      .qword 0x0000000000077d14 ; entry.init1
-            0x00126538      .qword 0x00000000000f22e0 ; reloc..datadiv_decode667225052219618748 ; sym..datadiv_decode667225052219618748
-            0x00126540      .qword 0x00000000000f22e4 ; reloc..datadiv_decode8132880250332170398 ; sym..datadiv_decode8132880250332170398
-            0x00126548      .qword 0x00000000000f22e8 ; reloc..datadiv_decode3655886617018729963 ; sym..datadiv_decode3655886617018729963
-            0x00126550      .qword 0x00000000000f22ec ; reloc..datadiv_decode16406252260792032531 ; sym..datadiv_decode16406252260792032531
-            0x00126558      .qword 0x00000000000f22f0 ; reloc..datadiv_decode13403071575248320347 ; sym..datadiv_decode13403071575248320347
+            ;-- reloc..datadiv_decode9958896245423089702:
+            0x00126510      .qword 0x0000000000005a6c ; sym..datadiv_decode9958896245423089702; RELOC 64 .datadiv_decode9958896245423089702 @ 0x00005a6c ; [13] -rw- section size 728 named .init_array
+            ;-- reloc..datadiv_decode10476194973746341988:
+            0x00126518      .qword 0x0000000000005a80 ; sym..datadiv_decode10476194973746341988; RELOC 64 .datadiv_decode10476194973746341988 @ 0x00005a80
+            ;-- reloc..datadiv_decode16323044921667855934:
+            0x00126520      .qword 0x00000000000efddc ; sym..datadiv_decode16323044921667855934; RELOC 64 .datadiv_decode16323044921667855934 @ 0x000efddc
+            0x00126528      .qword 0x0000000000009080 ; entry.init0    ; RELOC 64 
+            0x00126530      .qword 0x0000000000077d14 ; entry.init1    ; RELOC 64 
+            ;-- reloc..datadiv_decode667225052219618748:
+            0x00126538      .qword 0x00000000000f22e0 ; sym..datadiv_decode667225052219618748; RELOC 64 .datadiv_decode667225052219618748 @ 0x000f22e0
+            ;-- reloc..datadiv_decode8132880250332170398:
+            0x00126540      .qword 0x00000000000f22e4 ; sym..datadiv_decode8132880250332170398; RELOC 64 .datadiv_decode8132880250332170398 @ 0x000f22e4
+            ;-- reloc..datadiv_decode3655886617018729963:
+            0x00126548      .qword 0x00000000000f22e8 ; sym..datadiv_decode3655886617018729963; RELOC 64 .datadiv_decode3655886617018729963 @ 0x000f22e8
+            ;-- reloc..datadiv_decode16406252260792032531:
+            0x00126550      .qword 0x00000000000f22ec ; sym..datadiv_decode16406252260792032531; RELOC 64 .datadiv_decode16406252260792032531 @ 0x000f22ec
+            ;-- reloc..datadiv_decode13403071575248320347:
+            0x00126558      .qword 0x00000000000f22f0 ; sym..datadiv_decode13403071575248320347; RELOC 64 .datadiv_decode13403071575248320347 @ 0x000f22f0
             0x0800009f      ff             unaligned
 EOF
 RUN
@@ -689,5 +697,334 @@ vaddr      paddr      type   ntype name
 ;-- reloc.dcngettext:
 ;-- dcngettext:
 0x000ec0b0      sethi 0x9c, g1                                         ; RELOC 32 dcngettext
+EOF
+RUN
+
+NAME=ELF: relocs.apply keeps symbol-less relocs at their site
+FILE=bins/elf/ls
+ARGS=-e bin.relocs.apply=true
+CMDS=ir~ADD_64:0..2
+EXPECT=<<EOF
+0x00021050 0x00020050 ADD_64 8      0x00005bd0
+0x00021058 0x00020058 ADD_64 8      0x00005b80
+EOF
+RUN
+
+NAME=ELF: relr reloc type follows the machine
+FILE=malloc://0x81000
+CMDS=<<EOF
+wff bins/elf/ls-toybox
+oba 0
+ir~0x00078030
+wx 2800 @ 0x12
+oba 0
+ir~0x00078030
+wx 1500 @ 0x12
+oba 0
+ir~0x00078030
+EOF
+EXPECT=<<EOF
+0x00078030 0x00078030 SET_64 1027
+0x00078030 0x00078030 SET_32 23
+0x00078030 0x00078030 SET_64 22
+EOF
+RUN
+
+NAME=ELF: import GOT site keeps its reloc flag under bin.relocs.apply
+FILE=bins/elf/analysis/ls-linux64
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+ir~_ITM_deregisterTMCloneTable
+fd @ 0x21cf88
+pi 1 @ 0x5c6b
+EOF
+EXPECT=<<EOF
+0x0021cf88 0x0001cf88 SET_64 6     _ITM_deregisterTMCloneTable
+reloc._ITM_deregisterTMCloneTable
+mov rax, qword [reloc._ITM_deregisterTMCloneTable]
+EOF
+RUN
+
+NAME=ELF: call graph names an import called through its GOT slot under bin.relocs.apply
+FILE=bins/elf/ls
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+af @ entry0
+agcj~{[0].imports}
+EOF
+EXPECT=<<EOF
+["reloc.__libc_start_main"]
+EOF
+RUN
+
+NAME=ELF: patched ET_REL branch keeps naming its got.r2 target
+FILE=bins/elf/random_39855/random_39855.oo
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+pi 1 @ 0x0800007c
+ir~strcmp[0]
+EOF
+EXPECT=<<EOF
+bl reloc.strcmp
+0x08012678
+EOF
+RUN
+
+NAME=ELF: i386 GOT sites resolve under bin.relocs.apply
+FILE=bins/elf/libtest_32.so
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+ir~printf
+pxw 4 @ 0x200c
+pxw 4 @ 0x1fec
+EOF
+EXPECT=<<EOF
+0x0000200c 0x0000100c SET_32 7     printf
+0x0000200c  0x00002018                                   . ..
+0x00001fec  0x00002028                                   ( ..
+EOF
+RUN
+
+NAME=ELF: i386 glob_dat resolves under bin.relocs.apply (fcn_in_test)
+FILE=bins/elf/fcn_in_test.elf
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+ir~__libc_start_main
+pxw 4 @ 0x400c
+pxw 4 @ 0x3ff4
+EOF
+EXPECT=<<EOF
+0x0000400c 0x0000300c SET_32 7     __libc_start_main
+0x0000400c  0x0000401c                                   .@..
+0x00003ff4  0x00004038                                   8@..
+EOF
+RUN
+
+NAME=ELF: i386 full-relro slot resolves under bin.relocs.apply
+FILE=bins/elf/hello_world32
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+ir~free
+pxw 4 @ 0x1fd0
+pxw 4 @ 0x1fe8
+EOF
+EXPECT=<<EOF
+0x00001fd0 0x00000fd0 SET_32 7     free
+0x00001fd0  0x0000200c                                   . ..
+0x00001fe8  0x00002024                                   $ ..
+EOF
+RUN
+
+NAME=ELF: i386 relative reloc keeps the link base out
+FILE=bins/elf/i386-base10000-rel.so
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+pxw 4 @ 0x132c0
+pxw 4 @ 0x122b8
+pxw 4 @ 0x132d0
+EOF
+EXPECT=<<EOF
+0x000132c0  0x00011216                                   ....
+0x000122b8  0x000132bc                                   .2..
+0x000132d0  0x000132d4                                   .2..
+EOF
+RUN
+
+NAME=ELF: i386 rela relative materializes the addend
+FILE=bins/elf/i386-base10000-rela.so
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+pxw 4 @ 0x132d0
+pxw 4 @ 0x122c8
+EOF
+EXPECT=<<EOF
+0x000132d0  0x00011222                                   "...
+0x000122c8  0x000132cc                                   .2..
+EOF
+RUN
+
+NAME=ELF: ppc64 slot is patched at the mapped address under a custom base
+FILE=bins/elf/ppc64v1-libz.so
+ARGS=-B 0x100000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+?v [0x100030048]
+EOF
+EXPECT=<<EOF
+0x1000194dc
+EOF
+RUN
+
+NAME=ELF: ppc64 nobits plt slot is patched under a custom base
+FILE=bins/elf/ppc64v1-stub-eagerend.so
+ARGS=-B 0x100000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+?v [0x100002018]
+EOF
+EXPECT=<<EOF
+0x10000034c
+EOF
+RUN
+
+NAME=ELF: import at a code site keeps its got.r2 slot under a custom base
+FILE=bins/elf/test.ko
+ARGS=-B 0x100000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+ir~__fentry__
+EOF
+EXPECT=<<EOF
+0x100000b0f 0x0000007d ADD_32 4     __fentry__ - 0x08000081
+EOF
+RUN
+
+NAME=ELF: a reloc into an unrebased map is patched where it already is
+FILE=bins/elf/cfile_o
+ARGS=-B 0x100000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+ompg+r
+p8 8 @ 0x08004099
+EOF
+EXPECT=<<EOF
+4d3d01084147aa01
+EOF
+RUN
+
+NAME=ELF: ppc64 toc window follows its section under a custom base
+FILE=bins/elf/ppc64v1-crc32_generic.ko
+ARGS=-B 0x10000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+p8 8 @ 0x1000036c
+EOF
+EXPECT=<<EOF
+3d220000e8698000
+EOF
+RUN
+
+NAME=ELF: a tls symbol value is not an address and keeps its offset
+FILE=bins/elf/glibc-2.34-39.el9.x86_64_libc.so.6
+ARGS=-B 0x10000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+?v [0x101f9f40]
+EOF
+EXPECT=<<EOF
+0x40
+EOF
+RUN
+
+NAME=ELF: got.r2 slot address is not shifted twice
+FILE=bins/elf/ada_test_dwarf
+ARGS=-B 0x50000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+?v [0x50004ff8]
+EOF
+EXPECT=<<EOF
+0x50007bb0
+EOF
+RUN
+
+NAME=ELF: aarch64 ET_REL branch relocs are patched under a custom base
+FILE=bins/elf/analysis/arm64-relocs
+ARGS=-B 0x100000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+p8 4 @ 0x100000044
+p8 8 @ 0x10000004c
+EOF
+EXPECT=<<EOF
+06000094
+8000183660000054
+EOF
+RUN
+
+NAME=ELF: aarch64 ET_REL adrp/add pair is patched under a custom base
+FILE=bins/elf/random_39855/random_39855.oo
+ARGS=-B 0x100000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+p8 8 @ 0x100000074
+EOF
+EXPECT=<<EOF
+210000b021701f91
+EOF
+RUN
+
+NAME=ELF: overlapping PT_LOADs patch each reloc in its own segment
+FILE=bins/elf/x86-64-ovl-ptload.so
+ARGS=-B 0x40000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+p8 8 @ 0x40005800
+p8 8 @ 0x40000900
+EOF
+EXPECT=<<EOF
+0051004000000000
+0001004000000000
+EOF
+RUN
+
+NAME=ELF: ET_REL NOBITS section is laid out past the file image, not over the next section
+FILE=bins/elf/random_39855/random_39855.oo
+CMDS=<<EOF
+iS~NOBITS
+iS~PROGBITS .rodata$
+is~crc32_tab
+EOF
+EXPECT=<<EOF
+6   0x00012af8     0x0 0x08012af8   0x400 -rw- 0x3   NOBITS   .bss
+7   0x000057f8   0x168 0x080057f8   0x168 -r-- 0x2   PROGBITS .rodata
+9   0x00012af8 0x08012af8 LOCAL  OBJ    1024     crc32_tab
+EOF
+RUN
+
+NAME=ELF: ET_REL adrp/add to a .bss symbol lands in the bss map under a custom base
+FILE=bins/elf/random_39855/random_39855.oo
+ARGS=-B 0x1000 -e bin.relocs.apply=true
+CMDS=<<EOF
+pd 2 @ 0x1168
+om~mmap..bss[4,6]
+EOF
+EXPECT=<<EOF
+            0x00001168      890000d0       adrp x9, 0x13000
+            0x0000116c      29e12b91       add x9, x9, 0xaf8
+0x00013af8 0x00013ef7
+EOF
+RUN
+
+NAME=ELF: ET_REL import slots stay below the NOBITS block
+FILE=bins/elf/radare2.c.obj
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+om~.got.r2[4,6]
+iS~NOBITS
+is~rabin_cmd
+EOF
+EXPECT=<<EOF
+0x080384db 0x08040e2a
+4   0x00040e40      0x0 0x08040e40  0x618a0 -rw- 0x3   NOBITS   .bss
+8   0x00040e40 0x08040e40 LOCAL  OBJ    8          rabin_cmd
+EOF
+RUN
+
+NAME=ELF: ET_REL import slots sit below the .bss flag under a custom base
+FILE=bins/elf/test.ko
+ARGS=-B 0x100000000 -e bin.relocs.apply=true
+CMDS=<<EOF
+om~.got.r2[4,6]
+f~section..bss
+EOF
+EXPECT=<<EOF
+0x100000b0f 0x100000b5e
+0x100001050 0 section..bss
+EOF
+RUN
+
+NAME=ELF: ELF32 ET_REL NOBITS section is laid out past the import slots
+FILE=bins/elf/pngrutil_o
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+iS~NOBITS
+iS~PROGBITS .rodata$
+om~.got.r2[4,6]
+EOF
+EXPECT=<<EOF
+4   0x00009a83     0x0 0x08009a83     0x0 -rw- 0x3   NOBITS   .bss
+5   0x000055c8   0xe64 0x080055c8   0xe64 -r-- 0x2   PROGBITS .rodata
+0x08008703 0x080090be
 EOF
 RUN

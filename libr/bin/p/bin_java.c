@@ -59,10 +59,12 @@ static RList *entries(RBinFile *bf) {
 }
 
 static RList *classes(RBinFile *bf) {
+	r_bin_file_add_language (bf, R_BIN_LANG_JAVA);
 	return r_bin_java_get_classes ((RBinJavaObj *) bf->bo->bin_obj);
 }
 
 static bool symbols_vec(RBinFile *bf) {
+	r_bin_file_add_language (bf, R_BIN_LANG_JAVA);
 	r_bin_java_load_symbols ((RBinJavaObj *) bf->bo->bin_obj, &bf->bo->symbols_vec);
 	return true;
 }
@@ -106,7 +108,7 @@ static bool check(RBinFile *bf, RBuffer *b) {
 	return false;
 }
 
-static int retdemangle(const char *str) {
+static RBinLanguage retdemangle(const char *str) {
 	return R_BIN_LANG_JAVA;
 }
 
@@ -154,7 +156,7 @@ static const char *get_cc(RBinFile *bf, ut64 vaddr) {
 	if (!m || !m->arg_prefix) {
 		return NULL;
 	}
-	const bool instance = !(m->attr & R_BIN_ATTR_STATIC);
+	const bool instance = !(m->attr.flags & R_BIN_ATTR_STATIC);
 	RStrBuf *sb = r_strbuf_new ("dyncc:");
 	if (!sb) {
 		return NULL;

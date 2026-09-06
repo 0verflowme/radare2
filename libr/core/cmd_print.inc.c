@@ -320,6 +320,7 @@ static RCoreHelpMessage help_msg_pd = {
 	"pdaj", "", "disassemble all possible opcodes (byte per byte) in JSON",
 	"pdb", "[j]", "disassemble basic block (j for JSON)",
 	"pdc", "[?][c]", "pseudo disassembler output in C-like syntax",
+	"pdd", " [name|addr]", "decompile function with the best analysis provider",
 	"pdC", "", "show comments found in N instructions",
 	"pde", "[q|qq|j] N", "disassemble N instructions following execution flow from current PC",
 	"pdo", " N", "convert esil expressions of N instructions to C (pdO for bytes)",
@@ -1323,8 +1324,8 @@ static void findMethodBounds(RVecRBinSymbol *methods, ut64 *min, ut64 *max) {
 			if (sym->vaddr < at_min) {
 				at_min = sym->vaddr;
 			}
-			if (sym->vaddr + sym->size > at_max) {
-				at_max = sym->vaddr + sym->size;
+			if (sym->vaddr + sym->attr.size > at_max) {
+				at_max = sym->vaddr + sym->attr.size;
 			}
 		}
 	}
@@ -1480,6 +1481,13 @@ static char get_string_type(const ut8 *buf, ut64 len) {
 			if (!rc) {
 				needle++;
 				break;
+			}
+			if (!r) {
+				/* The classification describes the string at the start of
+				 * the buffer, so its NUL terminator ends the scan. Walking
+				 * on would reclassify the trailing zero padding as a wide
+				 * string and hide an ordinary ascii string. */
+				return str_type;
 			}
 			needle += rc;
 		}
@@ -6782,6 +6790,74 @@ static void core_print_decompile(RCore *core, const char *input) {
 	r_esil_toc_free (ec);
 }
 
+static RAnalFunction *core_decompiler_target(RCore *core, const char *input) {
+	char *arg = r_str_trim_dup (input? input: "");
+	if (!arg) {
+		return NULL;
+	}
+	ut64 addr = core->addr;
+	if (*arg) {
+		RAnalFunction *fcn = r_anal_get_function_byname (core->anal, arg);
+		if (fcn) {
+			free (arg);
+			return fcn;
+		}
+		if (!r_num_is_valid_input (core->num, arg)) {
+			R_LOG_ERROR ("Cannot resolve function '%s'", arg);
+			free (arg);
+			return NULL;
+		}
+		addr = r_num_math (core->num, arg);
+	}
+	free (arg);
+	RAnalFunction *fcn = r_anal_get_function_at (core->anal, addr);
+	if (!fcn) {
+		fcn = r_anal_get_fcn_in (core->anal, addr, R_ANAL_FCN_TYPE_ANY);
+	}
+	if (!fcn) {
+		R_LOG_ERROR ("Cannot find a function at 0x%08" PFMT64x, addr);
+	}
+	return fcn;
+}
+
+
+static bool core_print_provider_decompile_locked(RCore *core, const char *input) {
+	RAnalPlugin *provider = r_anal_decompiler_provider (core->anal);
+	if (!provider) {
+		return false;
+	}
+	RAnalFunction *fcn = core_decompiler_target (core, input);
+	if (!fcn) {
+		r_core_return_code (core, 1);
+		return true;
+	}
+	RCodeMeta *meta = provider->decompile (core->anal, fcn);
+	if (!meta) {
+		R_LOG_ERROR ("Decompiler provider failed for function '%s'", fcn->name? fcn->name: "?");
+		r_core_return_code (core, 1);
+		return true;
+	}
+	char *out = r_codemeta_print2 (meta, NULL, core->anal);
+	bool rendered = out != NULL;
+	if (rendered) {
+		r_cons_print (core->cons, out);
+	} else {
+		R_LOG_ERROR ("Cannot render decompiler output");
+	}
+	free (out);
+	r_codemeta_free (meta);
+	r_core_return_code (core, rendered? 0: 1);
+	return true;
+}
+
+static bool core_print_provider_decompile(RCore *core, const char *input) {
+	R_RETURN_VAL_IF_FAIL (core && core->lock, false);
+	r_th_lock_enter (core->lock);
+	const bool result = core_print_provider_decompile_locked (core, input);
+	r_th_lock_leave (core->lock);
+	return result;
+}
+
 static void cmd_print_pcA(RCore *core, ut64 addr, const ut8 *data, int len) {
 	RStrBuf *sb = r_strbuf_new ("");
 	if (!sb) {
@@ -6908,14 +6984,22 @@ static void bitimage(RCore *core, const ut8 *data, const int data_size) {
 	r_strbuf_free (sb);
 }
 
+static void cmd_pri_image(RCore *core, const ut8 *buf, size_t bsz, int cols, int mode, int components) {
+	char *s = r_cons_image (buf, bsz, cols, mode, components);
+	if (s) {
+		r_cons_print (core->cons, s);
+	}
+	free (s);
+}
+
 static void cmd_pri(RCore *core, const char *input, int l) {
 	int cols = r_config_get_i (core->config, "hex.cols");
 	bool has_color = r_config_get_i (core->config, "scr.color") > 0;
-	ut8 *buf = r_core_readblock (core, 0);
+	size_t bsz = core->blocksize;
+	ut8 *buf = r_core_readblock (core, bsz);
 	if (!buf) {
 		return;
 	}
-	const int data_size = core->blocksize;
 	switch (input[2]) {
 	case '?':
 		r_cons_cmd_help (core->cons, help_msg_pri);
@@ -6924,7 +7008,7 @@ static void cmd_pri(RCore *core, const char *input, int l) {
 		cmd_printmsg (core, input + 4);
 		break;
 	case '1':
-		bitimage (core, buf, data_size);
+		bitimage (core, buf, bsz);
 		break;
 	case '2': // "pri2"
 		if (l) {
@@ -6967,17 +7051,17 @@ static void cmd_pri(RCore *core, const char *input, int l) {
 		}
 		break;
 	case 'g': // gresycale
-		r_cons_image (buf, core->blocksize, cols, 'g', 3);
+		cmd_pri_image (core, buf, bsz, cols, 'g', 3);
 		break;
 	case 's': // sixel
-		r_cons_image (buf, core->blocksize, cols, 's', 3);
+		cmd_pri_image (core, buf, bsz, cols, 's', 3);
 		break;
 	case '4':
-		r_cons_image (buf, core->blocksize, cols, 'r', 4);
+		cmd_pri_image (core, buf, bsz, cols, 'r', 4);
 		break;
 	case 'r':
 	default:
-		r_cons_image (buf, core->blocksize, cols, has_color? 'r': 'a', 3);
+		cmd_pri_image (core, buf, bsz, cols, has_color? 'r': 'a', 3);
 		break;
 	}
 	free (buf);
@@ -7372,6 +7456,18 @@ static int cmd_pd(RCore *core, const char *input, int len, int l, ut8 *block) {
 	case 'z': // "pdz" // retdec
 	case 'g': // "pdg" // r2ghidra
 	{
+		if (input[1] == 'd') {
+			if (input[2] == '?') {
+				r_cons_cmd_help_match (core->cons, help_msg_pd, "pdd", 0, true);
+				r_core_return_code (core, 0);
+				processed_cmd = true;
+				break;
+			}
+			if (core_print_provider_decompile (core, input + 2)) {
+				processed_cmd = true;
+				break;
+			}
+		}
 		// Check for fallback command in SDB (fallbackcmd.* namespace)
 		char cmd_name[4] = { 'p', 'd', input[1], '\0' };
 		const char *fallback_cmd = sdb_const_getf (core->sdb, NULL, "fallbackcmd.%s", cmd_name);
@@ -8150,6 +8246,10 @@ static int cmd_print(void *data, const char *input) {
 	}
 	if (len < 0) {
 		len = -len;
+	}
+	/* pf, pm and pa don't take a length and never read the block, so don't size an allocation from their argument */
+	if (input[0] && strchr ("fma", input[0])) {
+		len = core->blocksize;
 	}
 	if (len > core->blocksize) {
 		block = calloc (1, len);

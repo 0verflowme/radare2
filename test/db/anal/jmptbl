@@ -20,10 +20,10 @@ EXPECT=<<EOF
 0x100004018      stp x29, x30, [var_70h]
 0x10000401c      add x29, sp, 0x70
 0x100004020      mov x20, x8
-0x100004024      lsr x8, x4, 0x3e                                      ; arg5
+0x100004024      lsr x8, x4, 0x3e                                      ; arg4
 0x100004028      mov x19, x21
-0x10000402c      mov x24, x6                                           ; arg7
-0x100004030      mov x26, x5                                           ; arg6
+0x10000402c      mov x24, x6                                           ; arg6
+0x100004030      mov x26, x5                                           ; arg5
 0x100004034      mov x22, x1                                           ; arg2
 0x100004038      mov x23, x0                                           ; arg1
 0x10000403c      mov x25, 0
@@ -37,13 +37,13 @@ EXPECT=<<EOF
 | // true: 0x100004058
 ;-- case 0:                                                            ; from 0x100004048
 ; CODE XREF from sym.func.100004000 @ 0x100004048(x)
-0x100004058      ubfx x25, x4, 0x30, 8                                 ; arg5
+0x100004058      ubfx x25, x4, 0x30, 8                                 ; arg4
 0x10000405c      b case.0x100004048.3
 | // true: 0x100004080
 ;-- case 1:                                                            ; from 0x100004048
 ; CODE XREF from sym.func.100004000 @ 0x100004048(x)
-0x100004060      lsr x8, x3, 0x20                                      ; arg4
-0x100004064      subs w8, w8, w3                                       ; arg4
+0x100004060      lsr x8, x3, 0x20                                      ; arg3
+0x100004064      subs w8, w8, w3                                       ; arg3
 0x100004068      b.vs 0x10000410c
 | // true: 0x10000410c  false: 0x10000406c
 0x10000406c      sxtw x25, w8
@@ -51,7 +51,7 @@ EXPECT=<<EOF
 | // true: 0x100004080
 ;-- case 2:                                                            ; from 0x100004048
 ; CODE XREF from sym.func.100004000 @ 0x100004048(x)
-0x100004074      ldp x9, x8, [x3, 0x10]                                ; arg4
+0x100004074      ldp x9, x8, [x3, 0x10]                                ; arg3
 0x100004078      subs x25, x8, x9
 0x10000407c      b.vs 0x100004110
 | // true: 0x100004110  false: 0x100004080
@@ -358,9 +358,9 @@ pd 10
 EOF
 EXPECT=<<EOF
 ;-- pc:
-0x1000040c0      mov w0, 0
-0x1000040c4      mov w1, 2
-0x1000040c8      mov w2, 1
+0x1000040c0      mov w0, 0                                             ; CCOperation op
+0x1000040c4      mov w1, 2                                             ; CCAlgorithm alg
+0x1000040c8      mov w2, 1                                             ; int32_t options
 0x1000040cc      mov x3, x23
 0x1000040d0      mov w4, 0x18
 0x1000040d4      mov x5, 0
@@ -383,7 +383,7 @@ pdr
 EOF
 EXPECT=<<EOF
 904: sym.func.100004124 (int64_t arg1, int64_t arg2);
-`- args(x0, x1) vars(25:sp[0x10..0x140])
+`- args(x0, x1) vars(29:sp[0x10..0x140])
 0x100004124      sub sp, sp, 0x140
 0x100004128      str x28, [var_e0h]
 0x10000412c      stp x27, x26, [var_f0h]
@@ -395,7 +395,7 @@ EXPECT=<<EOF
 0x100004144      adrp x8, reloc.Foundation.__DataStorage.bytes.allocator_...itcfc_ ; 0x10000c000
 0x100004148      ldr x8, [x8, 0x390]
 0x10000414c      ldr x8, [x8]
-0x100004150      stur x8, [x29, -0x60]
+0x100004150      stur x8, [var_e0h]
 0x100004154      str x1, [var_80h]                                     ; arg2
 0x100004158      lsr x25, x1, 0x3e                                     ; arg2
 0x10000415c      adrp x24, reloc.Foundation.__DataStorage.bytes.allocator_...itcfc_ ; 0x10000c000
@@ -468,7 +468,7 @@ EXPECT=<<EOF
 0x100004214      ldr x9, [var_80h]
 0x100004218      and x20, x9, 0x3fffffffffffffff
 0x10000421c      ubfx x8, x9, 0x30, 8
-0x100004220      stp x10, x8, [var_68h]
+0x100004220      stp x10, x8, [var_sp_68h]
 0x100004224      lsr x10, x22, 8
 0x100004228      lsr x8, x22, 0x10
 0x10000422c      stp x8, x10, [var_58h]
@@ -504,7 +504,7 @@ EXPECT=<<EOF
 0x100004294      cmp x23, x8
 0x100004298      b.lt 0x10000447c
 | // true: 0x10000447c  false: 0x10000429c
-0x10000429c      ldr x8, [var_68h]
+0x10000429c      ldr x8, [var_sp_68h]
 0x1000042a0      cmp x23, x8
 0x1000042a4      b.ge 0x10000447c
 | // true: 0x10000447c  false: 0x1000042a8
@@ -628,7 +628,7 @@ EXPECT=<<EOF
 | // true: 0x100004438
 ;-- case 3:                                                            ; from 0x100004170
 ; CODE XREF from sym.func.100004124 @ 0x100004170(x)
-0x100004438      ldur x8, [x29, -0x60]
+0x100004438      ldur x8, [var_e0h]
 0x10000443c      adrp x9, reloc.Foundation.__DataStorage.bytes.allocator_...itcfc_ ; 0x10000c000
 0x100004440      ldr x9, [x9, 0x390]
 0x100004444      ldr x9, [x9]
@@ -854,5 +854,37 @@ k anal/switches/0x100
 EOF
 EXPECT=<<EOF
 j=0x200,e=4,n=1,s=0,b=0x0,d=0xffffffffffffffff,v=0xffffffffffffffff,V=0,L=0,F=0x300,r=reg_abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz
+EOF
+RUN
+
+NAME=pc-relative indirect jmp is not a jump table
+FILE=malloc://0x1000
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 4839f77406ff25f5000000c3 @ 0x100
+wx c3 @ 0x300
+wx 0003000000000000000300000000000000030000000000000003000000000000 @ 0x200
+af @ 0x100
+f~case.~?
+afbj @ 0x100~switch_op~?
+afi @ 0x100~num-bbs
+EOF
+EXPECT=<<EOF
+0
+0
+num-bbs: 3
+EOF
+RUN
+
+NAME=pc-relative tail call after a scaled load is not a jump table
+FILE=bins/elf/bash
+CMDS=<<EOF
+af @ 0x43290
+f~case.~?
+pdf @ 0x43290~switch table?
+EOF
+EXPECT=<<EOF
+0
+0
 EOF
 RUN

@@ -43,6 +43,8 @@ DECLARE_GENERIC_FPRINTF_FUNC_NOGLOBALS ()
 #define ES_B(x) "0xff," x ",&"
 #define ES_H(x) "0xffff," x ",&"
 #define ES_W(x) "0xffffffff," x ",&"
+// esil '<' is signed: biasing by the sign bit makes it order values unsigned
+#define ES_U(x) "0x8000000000000000," x ",^"
 
 // Call with delay slot.
 #define ES_CALL_DR(ra, addr) "pc,4,+,"ra",=,"ES_J_D(addr)
@@ -76,6 +78,19 @@ static inline void es_sign_n_64(RArchSession *as, RAnalOp *op, const char *arg, 
 	} else {
 		r_strbuf_append (&op->esil, ",");
 	}
+}
+
+// mips64 compares the whole register; at 32 bits the 64-bit gpr profile needs the narrowing
+static inline const char *es_slt_fmt(RArchSession *as) {
+	return (as->config->bits == 64)
+		? "%s,%s,<,%s,="
+		: "32,%s,~,32,%s,~,<,%s,=";
+}
+
+static inline const char *es_sltu_fmt(RArchSession *as) {
+	return (as->config->bits == 64)
+		? ES_U ("%s") "," ES_U ("%s") ",<,%s,="
+		: ES_W ("%s") "," ES_W ("%s") ",<,%s,=";
 }
 
 static inline void es_add_ck(RAnalOp *op, const char *a1, const char *a2, const char *re, int bit) {
@@ -754,6 +769,16 @@ typedef struct gnu_insn {
 #define R_REG(x) ((const char *)insn->r_reg.x)
 #define I_REG(x) ((const char *)insn->i_reg.x)
 #define J_REG(x) ((const char *)insn->j_reg.x)
+// shift amount: the rs register for the v-forms, else the sa immediate
+#define R_SHAMT (R_REG (rs)? R_REG (rs): R_REG (sa))
+
+#define ESIL_LOAD(size) \
+	r_strbuf_appendf (&op->esil, "%s,%s,+,["size"],%s,=",\
+		I_REG (imm), I_REG (rs), I_REG (rt))
+
+#define ESIL_LOAD_SIGNED(size, sbits) \
+	r_strbuf_appendf (&op->esil, sbits",%s,%s,+,["size"],~,%s,=",\
+		I_REG (imm), I_REG (rs), I_REG (rt))
 
 /* Return a mapping from the register number i.e. $0 .. $31 to string name */
 static const char *mips_reg_decode(ut32 reg_num) {
@@ -826,8 +851,6 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 			I_REG (rt), I_REG (imm), I_REG (rs));
 		break;
 	case MIPS_INS_SW:
-	case MIPS_INS_SWL:
-	case MIPS_INS_SWR:
 		r_strbuf_appendf (&op->esil, "%s,%s,%s,+,=[4]",
 			I_REG (rt), I_REG (imm), I_REG (rs));
 		break;
@@ -855,12 +878,14 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 		break;
 	case MIPS_INS_SRA:
 		r_strbuf_appendf (&op->esil,
-			ES_W ("%s,%s") ",>>,31,%s,>>,?{,%s,32,-,0xffffffff,<<,0xffffffff,&,}{,0,},|,%s,=",
+			ES_W ("%s,%s,>>") ",31,%s,>>,?{,%s,32,-,0xffffffff,<<,0xffffffff,&,}{,0,},|,%s,=",
 			R_REG (sa), R_REG (rt), R_REG (rt), R_REG (sa), R_REG (rd));
+		ES_SIGN32_64 (R_REG (rd));
 		break;
 	case MIPS_INS_DSRA:
+		// a 64-bit shift fills from bit 63, not bit 31
 		r_strbuf_appendf (&op->esil,
-			"%s,%s,>>,31,%s,>>,?{,32,%s,32,-,0xffffffff,<<,0xffffffff,&,<<,}{,0,},|,%s,=",
+			"%s,%s,>>,63,%s,>>,?{,%s,64,-,0xffffffffffffffff,<<,}{,0,},|,%s,=",
 			R_REG (sa), R_REG (rt), R_REG (rt), R_REG (sa), R_REG (rd));
 		break;
 	case MIPS_INS_SHRL:
@@ -868,13 +893,26 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 		break;
 	case MIPS_INS_SRLV:
 	case MIPS_INS_SRL:
-		r_strbuf_appendf (&op->esil, "%s,%s,>>,%s,=",
-			R_REG (rs) ? R_REG (rs) : R_REG (sa), R_REG (rt), R_REG (rd));
+		// srl shifts the zero-extended low word, not the whole register
+		r_strbuf_appendf (&op->esil, "0x1f,%s,&," ES_W ("%s") ",>>,%s,=",
+			R_SHAMT, R_REG (rt), R_REG (rd));
+		ES_SIGN32_64 (R_REG (rd));
+		break;
+	case MIPS_INS_ROTRV:
+	case MIPS_INS_ROTR:
+		// esil ROR rotates at the register width
+		r_strbuf_appendf (&op->esil,
+			"0x1f,%s,&," ES_W ("%s") ",>>,0x1f,%s,&,32,-,"
+			ES_W ("%s") ",<<,0xffffffff,&,|,%s,=",
+			R_SHAMT, R_REG (rt), R_SHAMT, R_REG (rt), R_REG (rd));
+		ES_SIGN32_64 (R_REG (rd));
 		break;
 	case MIPS_INS_SLLV:
 	case MIPS_INS_SLL:
-		r_strbuf_appendf (&op->esil, "%s,%s,<<,%s,=",
-			R_REG (rs) ? R_REG (rs) : R_REG (sa), R_REG (rt), R_REG (rd));
+		// a 32-bit shift cannot keep high bits
+		r_strbuf_appendf (&op->esil, ES_W ("0x1f,%s,&,%s,<<") ",%s,=",
+			R_SHAMT, R_REG (rt), R_REG (rd));
+		ES_SIGN32_64 (R_REG (rd));
 		break;
 	case MIPS_INS_BALC:
 		r_strbuf_appendf (&op->esil, ES_TRAP_DS ("0x%"PFMT64x) "" ES_CALL_ND ("%s"), addr, I_REG (jump));
@@ -1062,6 +1100,9 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 	case MIPS_INS_DSUBU:
 		r_strbuf_appendf (&op->esil, "%s,%s,-,%s,=",
 			R_REG (rt), R_REG (rs), R_REG (rd));
+		if (insn->id == MIPS_INS_SUB || insn->id == MIPS_INS_SUBU) {
+			ES_SIGN32_64 (R_REG (rd));
+		}
 		break;
 	case MIPS_INS_NEG:
 	case MIPS_INS_NEGU:
@@ -1080,6 +1121,9 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 	case MIPS_INS_ADDU:
 		r_strbuf_appendf (&op->esil, "%s,%s,+,%s,=",
 			R_REG (rt), R_REG (rs), R_REG (rd));
+		if (insn->id == MIPS_INS_ADDU) {
+			ES_SIGN32_64 (R_REG (rd));
+		}
 		break;
 	case MIPS_INS_DADDI:
 		ES_ADD_CK64_OVERF (I_REG (imm), I_REG (rs), I_REG (rt));
@@ -1088,7 +1132,9 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 	case MIPS_INS_DADDIU:
 		r_strbuf_appendf (&op->esil, "%s,%s,+,%s,=",
 			I_REG (imm), I_REG (rs), I_REG (rt));
-		ES_SIGN32_64 (I_REG (rt));
+		if (insn->id == MIPS_INS_ADDIU) {
+			ES_SIGN32_64 (I_REG (rt));
+		}
 		break;
 	case MIPS_INS_LI:
 	case MIPS_INS_LDI:
@@ -1096,39 +1142,59 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 		break;
 	case MIPS_INS_LUI:
 		r_strbuf_appendf (&op->esil, "%s0000,%s,=", I_REG (imm), I_REG (rt));
+		ES_SIGN32_64 (I_REG (rt));
 		break;
 	case MIPS_INS_LB:
-		op->sign = true; // To load a byte from memory as a signed value
-		/* fallthrough */
+		op->sign = true;
+		ESIL_LOAD_SIGNED ("1", "8");
+		break;
 	case MIPS_INS_LBU:
-		// one of these is wrong
-		r_strbuf_appendf (&op->esil, "%s,%s,+,[1],%s,=",
-			I_REG (imm), I_REG (rs), I_REG (rt));
+		ESIL_LOAD ("1");
 		break;
 	case MIPS_INS_LW:
+	case MIPS_INS_LL:
+		// on mips64 the word is sign-extended; lwu is the other form
+		if (as->config->bits == 64) {
+			ESIL_LOAD_SIGNED ("4", "32");
+		} else {
+			ESIL_LOAD ("4");
+		}
+		break;
 	case MIPS_INS_LWC1:
 	case MIPS_INS_LWC2:
-	case MIPS_INS_LWL:
-	case MIPS_INS_LWR:
 	case MIPS_INS_LWU:
-	case MIPS_INS_LL:
-		r_strbuf_appendf (&op->esil, "%s,%s,+,[4],%s,=",
-			I_REG (imm), I_REG (rs), I_REG (rt));
+		ESIL_LOAD ("4");
 		break;
-	case MIPS_INS_LDL:
 	case MIPS_INS_LDC1:
 	case MIPS_INS_LDC2:
 	case MIPS_INS_LLD:
 	case MIPS_INS_LD:
-		r_strbuf_appendf (&op->esil, "%s,%s,+,[8],%s,=",
-			I_REG (imm), I_REG (rs), I_REG (rt));
+		ESIL_LOAD ("8");
+		break;
+	case MIPS_INS_LWL:
+	case MIPS_INS_LWR:
+	case MIPS_INS_LDL:
+	case MIPS_INS_LDR:
+	case MIPS_INS_SWL:
+	case MIPS_INS_SWR:
+	case MIPS_INS_SDL:
+	case MIPS_INS_SDR:
+		{
+			const int id = insn->id;
+			const bool wide = id == MIPS_INS_LDL || id == MIPS_INS_LDR || id == MIPS_INS_SDL || id == MIPS_INS_SDR;
+			const bool left = id == MIPS_INS_LWL || id == MIPS_INS_LDL || id == MIPS_INS_SWL || id == MIPS_INS_SDL;
+			const bool store = id == MIPS_INS_SWL || id == MIPS_INS_SWR || id == MIPS_INS_SDL || id == MIPS_INS_SDR;
+			char a[REG_BUF_MAX * 2 + 4];
+			snprintf (a, sizeof (a), "%s,%s,+", I_REG (imm), I_REG (rs));
+			mips_esil_unaligned (&op->esil, as->config, a, I_REG (rt), wide? 8: 4, left, store);
+		}
 		break;
 	case MIPS_INS_LH:
-		op->sign = true; // To load a byte from memory as a signed value
-		/* fallthrough */
+		op->sign = true;
+		ESIL_LOAD_SIGNED ("2", "16");
+		break;
 	case MIPS_INS_LHU:
-		r_strbuf_appendf (&op->esil, "%s,%s,+,[2],%s,=",
-			I_REG (imm), I_REG (rs), I_REG (rt));
+		ESIL_LOAD ("2");
 		break;
 	case MIPS_INS_LHX:
 	case MIPS_INS_LWX:
@@ -1152,21 +1218,20 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 		r_strbuf_appendf (&op->esil, "%s,%s,^,%s,=", I_REG (imm), I_REG (rs), I_REG (rt));
 		break;
 	case MIPS_INS_NOR:
-		r_strbuf_appendf (&op->esil, "%s,%s,|,0xffffffff,^,%s,=", R_REG (rs), R_REG (rt), R_REG (rd));
+		r_strbuf_appendf (&op->esil, "%s,%s,|,%s,^,%s,=", R_REG (rs), R_REG (rt),
+			(as->config->bits == 64)? "0xffffffffffffffff": "0xffffffff", R_REG (rd));
 		break;
 	case MIPS_INS_SLT:
-		r_strbuf_appendf (&op->esil, "32,%s,~,32,%s,~,<,%s,=", R_REG (rt), R_REG (rs), R_REG (rd));
+		r_strbuf_appendf (&op->esil, es_slt_fmt (as), R_REG (rt), R_REG (rs), R_REG (rd));
 		break;
 	case MIPS_INS_SLTI:
-		r_strbuf_appendf (&op->esil, "32,%s,~,32,%s,~,<,%s,=", I_REG (imm), I_REG (rs), I_REG (rt));
+		r_strbuf_appendf (&op->esil, es_slt_fmt (as), I_REG (imm), I_REG (rs), I_REG (rt));
 		break;
 	case MIPS_INS_SLTU:
-		r_strbuf_appendf (&op->esil, "%s,0xffffffff,&,%s,0xffffffff,&,<,%s,=",
-			R_REG (rt), R_REG (rs), R_REG (rd));
+		r_strbuf_appendf (&op->esil, es_sltu_fmt (as), R_REG (rt), R_REG (rs), R_REG (rd));
 		break;
 	case MIPS_INS_SLTIU:
-		r_strbuf_appendf (&op->esil, "%s,0xffffffff,&,%s,0xffffffff,&,<,%s,=",
-			I_REG (imm), I_REG (rs), I_REG (rt));
+		r_strbuf_appendf (&op->esil, es_sltu_fmt (as), I_REG (imm), I_REG (rs), I_REG (rt));
 		break;
 	case MIPS_INS_MUL:
 		r_strbuf_appendf (&op->esil, ES_W ("%s,%s,*") ",%s,=", R_REG (rs), R_REG (rt), R_REG (rd));
@@ -1180,9 +1245,12 @@ static int analop_esil(RArchSession *as, RAnalOp *op, ut64 addr, gnu_insn *insn)
 		ES_SIGN32_64 ("hi");
 		break;
 	case MIPS_INS_MULTU:
-		r_strbuf_appendf (&op->esil, ES_W ("%s,%s,*") ",lo,=", R_REG (rs), R_REG (rt));
+		// the low words are the operands: masking the product is not enough
+		r_strbuf_appendf (&op->esil, ES_W (ES_W ("%s") "," ES_W ("%s") ",*") ",lo,=",
+			R_REG (rs), R_REG (rt));
 		ES_SIGN32_64 ("lo");
-		r_strbuf_appendf (&op->esil, ES_W ("32,%s,%s,*,>>") ",hi,=", R_REG (rs), R_REG (rt));
+		r_strbuf_appendf (&op->esil, "32," ES_W ("%s") "," ES_W ("%s") ",*,>>,hi,=",
+			R_REG (rs), R_REG (rt));
 		ES_SIGN32_64 ("hi");
 		break;
 	case MIPS_INS_MFLO:
@@ -1387,17 +1455,21 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 			insn.id = MIPS_INS_SLL;
 			insn.r_reg.rs = NULL;
 			op->val = sa;
+			op->type = R_ANAL_OP_TYPE_SHL;
+			break;
 		case 4: // sllv
 			insn.id = MIPS_INS_SLLV;
 			op->type = R_ANAL_OP_TYPE_SHL;
 			break;
-		case 2: // srl
-			insn.id = MIPS_INS_SRL;
+		case 2: // srl, or rotr when the rs field selects the rotate
+			insn.id = (rs == 1)? MIPS_INS_ROTR: MIPS_INS_SRL;
 			insn.r_reg.rs = NULL;
 			op->val = sa;
-		case 6: // srlv
-			insn.id = MIPS_INS_SRLV;
-			op->type = R_ANAL_OP_TYPE_SHR;
+			op->type = (rs == 1)? R_ANAL_OP_TYPE_ROR: R_ANAL_OP_TYPE_SHR;
+			break;
+		case 6: // srlv, or rotrv when the sa field selects the rotate
+			insn.id = (sa == 1)? MIPS_INS_ROTRV: MIPS_INS_SRLV;
+			op->type = (sa == 1)? R_ANAL_OP_TYPE_ROR: R_ANAL_OP_TYPE_SHR;
 			break;
 		case 3: // sra
 			insn.id = MIPS_INS_SRA;
@@ -1493,16 +1565,19 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 			insn.id = MIPS_INS_DADDU;
 			break;
 		case 34: // sub
-		case 35: // subu
 			insn.id = MIPS_INS_SUB;
+			op->type = R_ANAL_OP_TYPE_SUB;
+			break;
+		case 35: // subu
+			insn.id = MIPS_INS_SUBU;
 			op->type = R_ANAL_OP_TYPE_SUB;
 			break;
 		case 46: // dsub
-			insn.id = MIPS_INS_SUB;
+			insn.id = MIPS_INS_DSUB;
 			op->type = R_ANAL_OP_TYPE_SUB;
 			break;
 		case 47: // dsubu
-			insn.id = MIPS_INS_SUB;
+			insn.id = MIPS_INS_DSUBU;
 			op->type = R_ANAL_OP_TYPE_SUB;
 			break;
 		case 36: // and
@@ -1789,6 +1864,30 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 				snprintf ((char *)insn.i_reg.imm, REG_BUF_MAX, "0x%" PFMT32x, imm);
 			}
 			break;
+		case 26: // ldl
+		case 27: // ldr
+			insn.id = (optype == 26)? MIPS_INS_LDL: MIPS_INS_LDR;
+			op->refptr = 8;
+			op->type = R_ANAL_OP_TYPE_LOAD;
+			break;
+		case 34: // lwl
+		case 38: // lwr
+			insn.id = (optype == 34)? MIPS_INS_LWL: MIPS_INS_LWR;
+			op->refptr = 4;
+			op->type = R_ANAL_OP_TYPE_LOAD;
+			break;
+		case 42: // swl
+		case 46: // swr
+			insn.id = (optype == 42)? MIPS_INS_SWL: MIPS_INS_SWR;
+			op->refptr = 4;
+			op->type = R_ANAL_OP_TYPE_STORE;
+			break;
+		case 44: // sdl
+		case 45: // sdr
+			insn.id = (optype == 44)? MIPS_INS_SDL: MIPS_INS_SDR;
+			op->refptr = 8;
+			op->type = R_ANAL_OP_TYPE_STORE;
+			break;
 		case 32: // lb
 			op->refptr = 1;
 			insn.id = MIPS_INS_LB;
@@ -1796,7 +1895,7 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 		case 33: // lh
 			if (!op->refptr) {
 				op->refptr = 2;
-				insn.id = MIPS_INS_LB;
+				insn.id = MIPS_INS_LH;
 			}
 			/* fallthrough */
 		case 35: // lw
@@ -2117,7 +2216,7 @@ const RArchPlugin r_arch_plugin_mips_gnu = {
 	},
 	.cpus = "micro,mips1,mips2,mips3,mips4,mips5,mips64r2,mips32r2,mips64,mips32,loongson3a,gs464,gs464e,gs264e,loongson2e,loongson2f,mips32/64",
 	.arch = "mips",
-	.bits = R_SYS_BITS_PACK1 (32),
+	.bits = R_SYS_BITS_PACK2 (32, 64),
 	.info = archinfo,
 	.decode = decode,
 	.regs = regs,

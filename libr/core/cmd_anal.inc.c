@@ -84,7 +84,7 @@ static RCoreHelpMessage help_msg_aav = {
 	"aav", "", "find absolute reference values (see aav0)",
 	"aavq", "", "same as aav, but in quiet mode",
 	"aav0", "", "find absolute reference values (accept maps at address zero)",
-	"aavr", "[0]", "find relative reference values (address + 4 byte signed int)",
+	"aavr", "[q0]", "find relative reference values (address + 4 byte signed int, q for quiet)",
 	NULL
 };
 
@@ -170,7 +170,7 @@ static RCoreHelpMessage help_msg_aaf = {
 static RCoreHelpMessage help_msg_aaa = {
 	"Usage:", "aaa[a[a]]", " # automatically analyze the whole program",
 	"aaa", "", "perform deeper analysis, most common use",
-	"aaaa", "", "same as aaa but adds a bunch of experimental iterations",
+	"aaaa", "", "same as aaa plus aggressive plugin/native analysis",
 	"aaaaa", "", "refine the analysis to find more functions after aaaa",
 	NULL
 };
@@ -324,7 +324,7 @@ static RCoreHelpMessage help_msg_ac = {
 	"acb", " [class name]", "list bases of class",
 	"acb", " [class name] [base class name] ([offset])", "add base class",
 	"acb-", " [class name] [base class id]", "delete base by id (from acb [class name])",
-	"acm", " [class name] [method name] [offset] ([vtable offset])", "add/edit method",
+	"acm", " [class name] [method name] [offset] ([vtable offset]) ([vtable addr])", "add/edit method",
 	"acm-", " [class name] [method name]", "delete method",
 	"acmn", " [class name] [method name] [new name]", "rename method",
 	"acg", "", "print inheritance ascii graph",
@@ -441,6 +441,8 @@ static RCoreHelpMessage help_detail_ae = {
 	"ASR", "", "a asr b => b,a,ASR  # arithmetic shift right",
 	"ROR", "", "a ror b => b,a,ROR  # rotate right",
 	"ROL", "", "a rol b => b,a,ROL  # rotate left",
+	"CLZ", "", "leading zeros of b in a bits => a,b,CLZ  # a when b is 0",
+	"POPCNT", "", "count the set bits => a,POPCNT",
 	"?{", "", "if popped value != 0 run the block until }",
 	"}{", "", "else block",
 	"}", "", "end of conditional block",
@@ -459,6 +461,7 @@ static RCoreHelpMessage help_detail_ae = {
 	"DUP", "", "duplicate last value in stack",
 	"NUM", "", "evaluate last item in stack to number",
 	"SWAP", "", "swap last two values in stack",
+	"ROT", "", "rotate the third element in the stack to the top",
 	"TRAP", "", "stop execution",
 	"BITS", "", "16,BITS  # change bits, useful for arm/thumb",
 	"TODO", "", "the instruction is not yet esilized",
@@ -573,6 +576,8 @@ static RCoreHelpMessage help_msg_af = {
 	"af+", " addr name [type] [diff]", "hand craft a function (requires afb+)",
 	"af-", " [addr]", "clean all function analysis data (or function at addr)",
 	"afa", "", "analyze function arguments in a call (afal honors dbg.funcarg)",
+	"afAj", " [json-array]", "get/set user-owned function analysis assumptions",
+	"afA-", "", "clear user-owned function analysis assumptions",
 	"afB", " 16", "set current function as thumb (change asm.bits)",
 	"afb", "[?] [addr]", "List basic blocks of given function",
 	"afc", "[?] type @[addr]", "set calling convention for function",
@@ -1371,6 +1376,15 @@ static ut64 faddr(RCore *core, ut64 addr, bool *nr) {
 
 // function argument types and names into anal/types
 static void __add_vars_sdb(RCore *core, RAnalFunction *fcn) {
+	char *linked_type = r_type_link_at (core->anal->sdb_types, fcn->addr);
+	if (linked_type) {
+		const bool has_signature = r_type_kind (core->anal->sdb_types,
+			linked_type) == R_TYPE_FUNCTION;
+		free (linked_type);
+		if (has_signature) {
+			return;
+		}
+	}
 	RAnalFcnVarsCache cache;
 	r_anal_function_vars_cache_init (core->anal, &cache, fcn);
 	size_t arg_count = 0;
@@ -1420,10 +1434,22 @@ static void __add_vars_sdb(RCore *core, RAnalFunction *fcn) {
 		free (k);
 		arg_count++;
 	}
-	//	sdb_num_set (core->anal->sdb_types, args, (int)arg_count, 0);
 	if (arg_count > 0) {
+		Sdb *TDB = core->anal->sdb_types;
 		r_strf_buffer (16);
-		sdb_setf (core->anal->sdb_types, r_strf ("%d", (int)arg_count), 0, "func.%s.args", fcn->name);
+		const int oargs = (int)sdb_num_getf (TDB, NULL, "func.%s.args", fcn->name);
+		sdb_setf (TDB, r_strf ("%d", (int)arg_count), 0, "func.%s.args", fcn->name);
+		// a previous wider recovery leaves stale higher keys behind
+		int i;
+		for (i = (int)arg_count; i < oargs; i++) {
+			char *k = r_str_newf ("func.%s.arg.%d", fcn->name, i);
+			const int ok = sdb_unset (TDB, k, 0);
+			free (k);
+			if (!ok) {
+				// an unset only fails when sdb cannot take writes, so the rest would too
+				break;
+			}
+		}
 	}
 	r_anal_function_vars_cache_fini (&cache);
 }
@@ -1458,6 +1484,8 @@ static bool cmd_anal_aaft(RCore *core) {
 		}
 		r_reg_arena_poke (core->anal->reg, saved_arena, saved_arena_size);
 		r_esil_set_pc (core->anal->esil, fcn->addr);
+		// type propagation reads arg types from the sdb signature, so retyped vars (afvt) must land there first
+		__add_vars_sdb (core, fcn);
 		r_core_cmd0 (core, "a:tp");
 		if (r_cons_is_breaked (core->cons)) {
 			break;
@@ -2235,6 +2263,7 @@ static int cmd_afv(RCore *core, const char *str) {
 	default:
 		if (str[0]) {
 			r_core_return_invalid_command (core, "afv", str[0]);
+			free (ostr);
 			return false;
 		}
 	}
@@ -2845,11 +2874,14 @@ static void core_anal_bytes(RCore *core, const ut8 *buf, int len, int nops, int 
 				pj_ks (pj, "mask", maskstr);
 				free (maskstr);
 			} else {
-				ut8 *mask = r_anal_mask (core->anal, len - idx, buf + idx, core->addr + idx);
-				char *maskstr = r_hex_bin2strdup (mask, size);
-				pj_ks (pj, "mask", maskstr);
-				free (mask);
-				free (maskstr);
+				const int instlen = R_MIN (size, len - idx);
+				ut8 *mask = r_anal_mask (core->anal, instlen, buf + idx, core->addr + idx);
+				if (mask) {
+					char *maskstr = r_hex_bin2strdup (mask, instlen);
+					pj_ks (pj, "mask", maskstr);
+					free (mask);
+					free (maskstr);
+				}
 			}
 			if (hint && hint->opcode) {
 				pj_ks (pj, "ophint", hint->opcode);
@@ -3187,6 +3219,13 @@ static ut64 caseval(const void* _a) {
 	return a->addr;
 }
 
+// borrowed copy: afb/afbi only print the cases, the analysis keeps them
+static RList *uniq_cases(const RAnalSwitchOp *op) {
+	RList *list = r_list_uniq (op->cases, caseval);
+	list->free = NULL;
+	return list;
+}
+
 static ut64 __opaddr(const RAnalBlock *b, ut64 addr) {
 	int i;
 	if (addr >= b->addr && addr < (b->addr + b->size)) {
@@ -3262,7 +3301,10 @@ static RList *get_calls(RAnalBlock *block) {
 	RAnalOp op;
 	ut8 *data = malloc (block->size);
 	if (data) {
-		block->anal->iob.read_at (block->anal->iob.io, block->addr, data, block->size);
+		if (block->anal->iob.read_at (block->anal->iob.io, block->addr, data, block->size) != block->size) {
+			free (data);
+			return NULL;
+		}
 		size_t i;
 		for (i = 0; i < block->size; i++) {
 			int ret = r_anal_op (block->anal, &op, block->addr + i, data + i, block->size - i, R_ARCH_OP_MASK_HINT);
@@ -3485,6 +3527,18 @@ static void print_bb(RCore *core, PJ *pj, const RAnalBlock *b, const RAnalFuncti
 			pj_kn (pj, "min_val", b->switch_op->min_val);
 			pj_kn (pj, "def_val", b->switch_op->def_val);
 			pj_kn (pj, "max_val", b->switch_op->max_val);
+			if (b->switch_op->daddr && b->switch_op->daddr != UT64_MAX) {
+				pj_kn (pj, "daddr", b->switch_op->daddr);
+			}
+			if (b->switch_op->baddr) {
+				pj_kn (pj, "baddr", b->switch_op->baddr);
+			}
+			if (b->switch_op->dsize > 0) {
+				pj_ki (pj, "dsize", b->switch_op->dsize);
+			}
+			if (b->switch_op->amount > 0) {
+				pj_ki (pj, "amount", b->switch_op->amount);
+			}
 			if (b->switch_op->deps_count > 0) {
 				pj_ka (pj, "deps");
 				int i;
@@ -3538,8 +3592,9 @@ static void print_bb(RCore *core, PJ *pj, const RAnalBlock *b, const RAnalFuncti
 		pj_end (pj);
 	} else {
 		if (b->switch_op) {
-			r_list_uniq_inplace (b->switch_op->cases, caseval);
-			outputs += r_list_length (b->switch_op->cases);
+			RList *cases = uniq_cases (b->switch_op);
+			outputs += r_list_length (cases);
+			r_list_free (cases);
 		}
 		if (b->jump != UT64_MAX) {
 			r_cons_printf (core->cons, "jump: 0x%08"PFMT64x"\n", b->jump);
@@ -3735,10 +3790,11 @@ static bool anal_fcn_list_bb(RCore *core, const char *input, bool one) {
 			if (b->switch_op) {
 				RAnalCaseOp *cop;
 				RListIter *iter;
-				r_list_uniq_inplace (b->switch_op->cases, caseval);
-				r_list_foreach (b->switch_op->cases, iter, cop) {
+				RList *cases = uniq_cases (b->switch_op);
+				r_list_foreach (cases, iter, cop) {
 					r_cons_printf (core->cons, " s 0x%08" PFMT64x, cop->jump);
 				}
+				r_list_free (cases);
 			}
 			r_cons_newline (core->cons);
 			break;
@@ -4573,7 +4629,17 @@ static void cmd_anal_fcn_sig(RCore *core, const char *input) {
 		}
 		pj_free (j);
 	} else {
-		char *sig = r_anal_function_format_sig (core->anal, fcn, fcn_name, NULL, NULL, NULL);
+		char *sig = NULL;
+		RAnalFunctionSignature *signature = r_anal_function_get_signature (fcn);
+		if (signature) {
+			if (R_STR_ISNOTEMPTY (signature->ret_type) && signature->signature) {
+				sig = strdup (signature->signature);
+			}
+			r_anal_function_signature_free (signature);
+		}
+		if (!sig) {
+			sig = r_anal_function_format_sig (core->anal, fcn, fcn_name, NULL, NULL, NULL);
+		}
 		if (sig) {
 			r_cons_printf (core->cons, "%s\n", sig);
 			free (sig);
@@ -5071,11 +5137,9 @@ static void printfcnjson(RCore *core, RAnalFunction *fcn) {
 	const bool no_return = r_anal_noreturn_at_addr (a, fcn->addr);
 	pj_kb (pj, "noreturn", no_return);
 	pj_ks (pj, "ret", r_str_get_fail (ret_type, "void"));
-	{
-		const char *fcncc = r_anal_function_cc (fcn);
-		if (fcncc) {
-			pj_ks (pj, "callconv", fcncc);
-		}
+	const char *fcncc = r_anal_function_cc (fcn);
+	if (fcncc) {
+		pj_ks (pj, "callconv", fcncc);
 	}
 	pj_kn (pj, "argc", argc);
 	pj_k (pj, "args");
@@ -5092,7 +5156,10 @@ static void printfcnjson(RCore *core, RAnalFunction *fcn) {
 			*comma = 0;
 			pj_ks (pj, "name", comma + 1);
 			pj_ks (pj, "type", arg_i);
-			const char *rn = r_reg_alias_getname (a->reg, R_REG_ALIAS_A0 + i);
+			const char *rn = fcncc? r_anal_cc_argloc (a, fcncc, i, 0, -1): NULL;
+			if (!rn) {
+				rn = r_reg_alias_getname (a->reg, R_REG_ALIAS_A0 + i);
+			}
 			if (rn) {
 				pj_ks (pj, "cc", rn);
 			}
@@ -6154,9 +6221,50 @@ static void cmd_afla(RCore *core, const char *input) {
 	ht_up_free (ht);
 }
 
+static void cmd_af_assumptions(RCore *core, const char *input) {
+	RAnalFunction *fcn = r_anal_get_fcn_in (core->anal, core->addr, 0);
+	if (!fcn) {
+		R_LOG_ERROR ("No function at current address");
+		return;
+	}
+	if (input[2] == '?') {
+		r_cons_cmd_help_match (core->cons, help_msg_af, "afA", 0, true);
+		return;
+	}
+	if (input[2] == '-') {
+		if (!r_anal_function_clear_assumptions (core->anal, fcn)) {
+			R_LOG_ERROR ("Failed to clear function assumptions");
+		}
+		return;
+	}
+	if (input[2] != 'j') {
+		r_cons_cmd_help_match (core->cons, help_msg_af, "afA", 0, true);
+		return;
+	}
+	const char *arg = r_str_trim_head_ro (input + 3);
+	if (R_STR_ISEMPTY (arg)) {
+		char *assumptions = r_anal_function_get_assumptions_json (core->anal, fcn);
+		r_cons_println (core->cons, assumptions? assumptions: "[]");
+		free (assumptions);
+		return;
+	}
+	char *json = strdup (arg);
+	if (!json) {
+		R_LOG_ERROR ("Failed to allocate assumptions payload");
+		return;
+	}
+	if (!r_anal_function_set_assumptions_json (core->anal, fcn, json)) {
+		R_LOG_ERROR ("Invalid function assumptions; expected a JSON array");
+	}
+	free (json);
+}
+
 static int cmd_af(RCore *core, const char *input) {
 	r_cons_break_timeout (core->cons, r_config_get_i (core->config, "anal.timeout"));
 	switch (input[1]) {
+	case 'A': // "afA"
+		cmd_af_assumptions (core, input);
+		break;
 	case '-': // "af-"
 		if (!input[2]) { // "af-"
 			cmd_af (core, "f-$$");
@@ -6823,15 +6931,13 @@ static int cmd_af(RCore *core, const char *input) {
 			r_cons_println (core->cons, r_anal_function_cc (fcn));
 			break;
 		case ' ': { // "afc "
-				  char *cc = r_str_trim_dup (input + 3);
-				  if (!r_anal_cc_exist (core->anal, cc)) {
-					  const char *asmOs = r_config_get (core->config, "asm.os");
-					  R_LOG_ERROR ("afc: Unknown calling convention '%s' for '%s'. See afcl for available types", cc, asmOs);
-				  } else {
-					  fcn->callconv = r_str_constpool_get (&core->anal->constpool, cc);
-				  }
-				  free (cc);
-			  }
+			char *cc = r_str_trim_dup (input + 3);
+			if (!r_anal_function_set_callconv (core->anal, fcn, cc)) {
+				const char *asmOs = r_config_get (core->config, "asm.os");
+				R_LOG_ERROR ("afc: Unknown calling convention '%s' for '%s'. See afcl for available types", cc, asmOs);
+			}
+			free (cc);
+		}
 			break;
 		case 'i':
 			if (input[3] == 'j') {
@@ -6980,6 +7086,7 @@ static int cmd_af(RCore *core, const char *input) {
 			if (fcn) { // bits = 0 means unset
 				int nbits = atoi (input + 3);
 				int obits = core->anal->config->bits;
+				int oldbits = fcn->bits;
 				if (nbits > 0) {
 					r_anal_hint_set_bits (core->anal, r_anal_function_min_addr (fcn), nbits);
 					r_anal_hint_set_bits (core->anal, r_anal_function_max_addr (fcn), obits);
@@ -6987,6 +7094,9 @@ static int cmd_af(RCore *core, const char *input) {
 				} else {
 					r_anal_hint_unset_bits (core->anal, r_anal_function_min_addr (fcn));
 					fcn->bits = 0;
+				}
+				if (oldbits != fcn->bits) {
+					r_anal_function_bump_dirty_epoch (fcn);
 				}
 			} else {
 				R_LOG_ERROR ("afB: Cannot find function to set bits at 0x%08"PFMT64x, core->addr);
@@ -7083,7 +7193,11 @@ static int cmd_af(RCore *core, const char *input) {
 		{
 			RAnalFunction *fcn = r_anal_get_fcn_in (core->anal, core->addr, -1);
 			if (fcn) {
-				fcn->maxstack = r_num_math (core->num, input + 3);
+				st64 maxstack = r_num_math (core->num, input + 3);
+				if (fcn->maxstack != maxstack) {
+					fcn->maxstack = maxstack;
+					r_anal_function_bump_dirty_epoch (fcn);
+				}
 			} else {
 				R_LOG_ERROR ("Cannot find function at 0x%08"PFMT64x, core->addr);
 			}
@@ -10835,6 +10949,7 @@ static void cmd_anal_opcode(RCore *core, const char *input) {
 			} else {
 				R_LOG_WARN ("Unable to analyze instruction");
 			}
+			r_anal_op_fini (&aop);
 		}
 		break;
 	case '?':
@@ -12669,7 +12784,7 @@ static void cmd_anal_hint(RCore *core, const char *input) {
 						// TODO: I don't think we should silently error, it is confusing
 						if (!strcmp (type, otype)) {
 							//eprintf ("Adding type offset %s\n", type);
-							r_type_link_offset (a->sdb_types, type, addr);
+							r_anal_types_set_link_offset (a, type, addr);
 							r_anal_hint_set_offset (a, addr, otype);
 							break;
 						}
@@ -13721,7 +13836,8 @@ static inline bool mermaid_add_node_asm(RAnal *a, RAnalBlock *bb, RStrBuf *nodes
 	if (!bb_buf) {
 		return false;
 	}
-	if (!a->iob.read_at (a->iob.io, bb->addr, (ut8 *)bb_buf, bb->size)) {
+	if (a->iob.read_at (a->iob.io, bb->addr, (ut8 *)bb_buf, bb->size) != bb->size) {
+		free (bb_buf);
 		return false;
 	}
 	RAnalOpMask mask = R_ARCH_OP_MASK_BASIC | R_ARCH_OP_MASK_DISASM | R_ANAL_OP_HINT_MASK;
@@ -14529,7 +14645,7 @@ static void cmd_anal_aaw(RCore *core, const char *input) {
 static void cmd_anal_aav(RCore *core, const char *input) {
 	R_RETURN_IF_FAIL (*input == 'v');
 	const bool relative = input[1] == 'r'; // "aavr"
-	const bool verbose = input[1] != 'q';
+	const bool verbose = !strchr (input, 'q'); // "aavq" "aavrq"
 	const bool forcemode = input[1] == '0' || (input[1] && input[2] == '0'); // "aav0" "aavr0"
 	ut64 o_align = r_config_get_i (core->config, "search.align");
 	const char *analin = r_config_get (core->config, "anal.in");
@@ -14583,6 +14699,10 @@ static void cmd_anal_aav(RCore *core, const char *input) {
 			// TODO: Reduce multiple hits for same addr
 			from = r_itv_begin (map2->itv);
 			to = r_itv_end (map2->itv);
+			if (from >= to) {
+				// skip empty sections (eg. zero-sized __llvm_prf_vnds)
+				continue;
+			}
 			if ((to - from) > MAX_SCAN_SIZE) {
 				R_LOG_WARN ("Skipping large region");
 				continue;
@@ -14592,6 +14712,9 @@ static void cmd_anal_aav(RCore *core, const char *input) {
 				ut64 end = r_io_map_end (map);
 				if (r_cons_is_breaked (core->cons)) {
 					break;
+				}
+				if (begin >= end) {
+					continue;
 				}
 				if (end - begin > UT32_MAX) {
 					char *unit = r_num_units (NULL, 0, end - begin);
@@ -15112,6 +15235,16 @@ static int cmpfn_bw(const void *a, const void *b) {
 	return 0;
 }
 
+static void r_core_anal_plugin_post_analysis_depth(RCore *core, RAnalPluginAnalysisDepth depth) {
+	if (!core || !core->anal) {
+		return;
+	}
+	RAnalPluginAnalysisDepth saved_depth = core->anal->plugin_analysis_depth;
+	core->anal->plugin_analysis_depth = depth;
+	r_anal_plugin_action (core->anal, R_ANAL_PLUGIN_ACTION_POST_ANALYSIS, NULL);
+	core->anal->plugin_analysis_depth = saved_depth;
+}
+
 static bool cmd_aa(RCore *core, bool aaa) {
 	const RList *list;
 	RListIter *iter;
@@ -15122,8 +15255,17 @@ static bool cmd_aa(RCore *core, bool aaa) {
 	const bool anal_vars = r_config_get_b (core->config, "anal.vars");
 	const bool anal_calls = r_config_get_b (core->config, "anal.calls");
 	const int anal_symsort = r_config_get_i (core->config, "anal.symsort");
+	// best-practice hints are helpful for a manual command but just noise when
+	// analysis sweeps hundreds of data symbols (af@@@s), silence them here
+	const bool log_hints = r_config_get_b (core->config, "log.hints");
+	r_config_set_b (core->config, "log.hints", false);
 	r_cons_break_push (core->cons, NULL, NULL);
 	r_cons_break_timeout (core->cons, r_config_get_i (core->config, "anal.timeout"));
+
+	if (r_config_get_b (core->config, "anal.plt")) {
+		logline (core, 8, "Name local plt stubs from their got relocs (anal.plt)");
+		r_core_anal_plt_stubs (core);
+	}
 
 	// required for noreturn
 	if (r_config_get_b (core->config, "anal.imports")) {
@@ -15231,7 +15373,12 @@ static bool cmd_aa(RCore *core, bool aaa) {
 				}
 			}
 		}
+		if (!r_cons_is_breaked (core->cons)) {
+			logline (core, 24, "Running basic analysis plugin post-analysis hooks");
+			r_core_anal_plugin_post_analysis_depth (core, R_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC);
+		}
 	}
+	r_config_set_b (core->config, "log.hints", log_hints);
 	r_cons_break_pop (core->cons);
 	return true;
 }
@@ -15243,6 +15390,20 @@ static bool is_swift(RCore *core) {
 		return !strcmp (lang, "swift");
 	}
 	return false;
+}
+
+static void recover_function_vars_for_analysis(RCore *core, RAnalFunction *fcn) {
+	if (!core || !core->anal || !fcn) {
+		return;
+	}
+	char *type = r_str_newf ("func.%s.ret", fcn->name);
+	if (type && sdb_exists (core->anal->sdb_types, type)) {
+		free (type);
+		return;
+	}
+	free (type);
+	r_anal_function_delete_all_vars (fcn);
+	r_core_recover_vars (core, fcn, false);
 }
 
 static void cmd_aaa(RCore *core, const char *input) {
@@ -15301,8 +15462,15 @@ static void cmd_aaa(RCore *core, const char *input) {
 	// Run afvn in all fcns
 	if (r_config_get_b (core->config, "anal.vars")) {
 		logline (core, 15, "Analyze all functions arguments/locals (afva@@F)");
-		// r_core_cmd0 (core, "afva@@f");
-		r_core_cmd0 (core, "afva@@F");
+		RAnalFunction *fcni;
+		RListIter *iter;
+		r_list_foreach (core->anal->fcns, iter, fcni) {
+			if (r_cons_is_breaked (core->cons)) {
+				break;
+			}
+			recover_function_vars_for_analysis (core, fcni);
+			r_core_task_yield (&core->tasks);
+		}
 	}
 #endif
 	// Run pending analysis immediately after analysis
@@ -15366,9 +15534,6 @@ static void cmd_aaa(RCore *core, const char *input) {
 
 		logline (core, 40, "Analyze len bytes of instructions for references (aar)");
 		(void)r_core_anal_refs (core, ""); // "aar"
-		r_core_task_yield (&core->tasks);
-		// Add plugin-provided data flow refs
-		r_core_anal_plugin_data_refs (core);
 		r_core_task_yield (&core->tasks);
 		if (r_cons_is_breaked (core->cons)) {
 			goto jacuzzi;
@@ -15472,15 +15637,13 @@ static void cmd_aaa(RCore *core, const char *input) {
 		r_core_anal_propagate_noreturn (core, UT64_MAX);
 		r_core_task_yield (&core->tasks);
 
-		// Ensure DWARF metadata is loaded before integration.
+		// Apply the debug information the bin layer loaded. Analysis does not
+		// import it itself: bin load already does that when bin.dbginfo is set,
+		// and it deliberately declines for binaries past its size limit, so
+		// re-importing here would defeat that limit on exactly the binaries it
+		// protects.
 		Sdb *dwarf_sdb = sdb_ns (core->anal->sdb, "dwarf", 0);
-		if (!dwarf_sdb || sdb_isempty (dwarf_sdb)) {
-			int io_va = r_config_get_b (core->config, "io.va");
-			(void)r_core_bin_info (core, R_CORE_BIN_ACC_ADDRLINE, NULL, R_MODE_SET, io_va, NULL, NULL);
-			dwarf_sdb = sdb_ns (core->anal->sdb, "dwarf", 0);
-		}
-		// apply dwarf function information
-		if (dwarf_sdb) {
+		if (dwarf_sdb && !sdb_isempty (dwarf_sdb)) {
 			logline (core, 95, "Integrate dwarf function information");
 			r_anal_dwarf_integrate_functions (core->anal, core->flags, dwarf_sdb);
 		}
@@ -15497,8 +15660,7 @@ static void cmd_aaa(RCore *core, const char *input) {
 			logline (core, 96, "Enable types.constraint for experimental type propagation");
 			r_config_set_b (core->config, "types.constraint", true);
 			// Plugin post-analysis hooks (for advanced analysis like taint, symbolic)
-			logline (core, 97, "Running plugin post-analysis hooks");
-			r_anal_plugin_action (core->anal, R_ANAL_PLUGIN_ACTION_POST_ANALYSIS, NULL);
+			r_core_anal_plugin_post_analysis_depth (core, R_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE);
 			if (input[2] == 'a') { // "aaaaa"
 				logline (core, 97, "Reanalyzing graph references to adjust functions count (aarr)");
 				r_core_call (core, "aarr");
@@ -15507,6 +15669,7 @@ static void cmd_aaa(RCore *core, const char *input) {
 				r_core_cmd0 (core, ".afna@@c:afla");
 			}
 		} else {
+			r_core_anal_plugin_post_analysis_depth (core, R_ANAL_PLUGIN_ANALYSIS_DEPTH_BALANCED);
 			R_LOG_INFO ("Use -AA or aaaa to perform additional experimental analysis");
 		}
 		if (!r_str_startswith (asm_arch, "x86") && !r_str_startswith (asm_arch, "hex")) {
@@ -15518,7 +15681,7 @@ static void cmd_aaa(RCore *core, const char *input) {
 			r_core_task_yield (&core->tasks);
 		}
 		if (is_swift (core)) {
-			r_core_cmd0 (core, "aavr@e:anal.in=bin.sections.rw");
+			r_core_cmd0 (core, "aavrq@e:anal.in=bin.sections.rw");
 		}
 		r_core_call (core, "s-");
 		if (dh_orig) {
@@ -15855,9 +16018,6 @@ static int cmd_anal_all(RCore *core, const char *input) {
 		case 0:
 		case ' ':
 			(void)r_core_anal_refs (core, input + 1);
-			// Keep aar behavior consistent with aa* pipelines by inserting
-			// plugin-provided data-flow refs after reference analysis.
-			r_core_anal_plugin_data_refs (core);
 			break;
 		case '*':
 		case 'j':
@@ -16099,8 +16259,15 @@ static void cmd_anal_class_method(RCore *core, const char *input) {
 			meth.name = name_str;
 			meth.addr = r_num_get (core->num, addr_str);
 			meth.vtable_offset = -1;
+			meth.vtable_addr = UT64_MAX;
 			if (end) {
-				meth.vtable_offset = (int)r_num_get (core->num, end + 1);
+				char *vtable_offset_str = end + 1;
+				char *vtable_addr_str = strchr (vtable_offset_str, ' ');
+				if (vtable_addr_str) {
+					*vtable_addr_str++ = '\0';
+					meth.vtable_addr = r_num_get (core->num, vtable_addr_str);
+				}
+				meth.vtable_offset = (int)r_num_get (core->num, vtable_offset_str);
 			}
 			err = r_anal_class_method_set (core->anal, cstr, &meth);
 		} else if (c == 'n') {

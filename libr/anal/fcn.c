@@ -2565,23 +2565,24 @@ static const char *function_signature_lookup_name(RAnal *anal, RAnalFunction *fc
 
 static char *function_signature_try_type_name(Sdb *types, const char *candidate) {
 	R_RETURN_VAL_IF_FAIL (types && candidate && *candidate, NULL);
-	// The prototype namespace decides; the kind key shares its name with
-	// struct tags, and `struct stat` overwrites `stat=func`.
+	// The prototype namespace decides. The kind key shares its name with
+	// struct tags, so `struct stat` overwrites `stat=func` and a lookup
+	// through the kind key loses a prototype that is still recorded.
 	char *name = r_type_func_key (types, candidate);
 	if (name) {
-		if (r_type_func_exist (types, name)) {
+		if (r_type_func_prototype_exist (types, name)) {
 			return name;
 		}
 		free (name);
 	}
 	name = r_type_func_guess (types, candidate);
 	if (name) {
-		if (r_type_func_exist (types, name)) {
+		if (r_type_func_prototype_exist (types, name)) {
 			return name;
 		}
 		free (name);
 	}
-	return r_type_func_exist (types, candidate)? strdup (candidate): NULL;
+	return r_type_func_prototype_exist (types, candidate)? strdup (candidate): NULL;
 }
 
 R_IPI const char *r_anal_function_type_link_at(RAnal *anal, ut64 addr) {
@@ -3033,7 +3034,7 @@ R_API bool r_anal_function_has_address_linked_signature_current(RAnalFunction *f
 		&& r_anal_dwarf_function_link_is_current (anal, function->addr, linked)
 		? function_signature_address_type_name (anal, function): NULL;
 	bool exists = R_STR_ISNOTEMPTY (type_name)
-		&& r_type_func_exist (anal->sdb_types, type_name);
+		&& r_type_func_prototype_exist (anal->sdb_types, type_name);
 	free (type_name);
 	r_th_lock_leave (anal->lock);
 	return exists;

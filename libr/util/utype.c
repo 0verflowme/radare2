@@ -959,18 +959,25 @@ static inline const char *trim_lodashes(Sdb *TDB, const char *name) {
 
 // Function prototypes api
 R_API int r_type_func_exist(Sdb *TDB, const char *func_name) {
-	// A prototype lives in its own namespace, `func.NAME.*`. The kind key
-	// `NAME=func` shares its name with struct, union and enum tags, which C
-	// keeps apart from ordinary identifiers: a program that both declares
-	// `struct stat` and calls `stat()` -- every program that calls stat --
-	// writes `stat=struct` over `stat=func` once its DWARF is read, and the
-	// prototype that is still there under `func.stat.*` went unfound.
-	const char *name = trim_lodashes (TDB, func_name);
-	if (sdb_const_getf (TDB, NULL, "func.%s.ret", name)) {
-		return true;
-	}
-	const char *fcn = sdb_const_get (TDB, name, 0);
+	const char *fcn = sdb_const_get (TDB, trim_lodashes (TDB, func_name), 0);
 	return fcn && !strcmp (fcn, "func");
+}
+
+R_API bool r_type_func_prototype_exist(Sdb *TDB, const char *func_name) {
+	R_RETURN_VAL_IF_FAIL (TDB && func_name, false);
+	// A prototype lives in its own namespace, `func.NAME.*`, and every
+	// writer of one sets its return type. The kind key `NAME=func` shares
+	// its name with struct, union and enum tags, which C keeps apart from
+	// ordinary identifiers: a program that both declares `struct stat` and
+	// calls `stat()` -- every program that calls stat -- writes
+	// `stat=struct` over `stat=func` once its DWARF is read, and the
+	// prototype still recorded under `func.stat.*` goes unfound.
+	//
+	// This is deliberately a second question rather than a change to
+	// `r_type_func_exist`, which answers whether the name is taken in the
+	// kind namespace. The DWARF importer needs that one to notice a
+	// collision and move a function's typed name off a struct tag.
+	return sdb_const_getf (TDB, NULL, "func.%s.ret", trim_lodashes (TDB, func_name)) != NULL;
 }
 
 R_API const char *r_type_func_ret(Sdb *TDB, const char *func_name) {
@@ -1153,14 +1160,18 @@ R_API R_OWNED char *r_type_func_guess(Sdb *TDB, const char *R_NONNULL func_name)
 static char *type_func_lookup(Sdb *types, const char *fname, bool key) {
 	const char *str = fname;
 	const char *name = fname;
-	if (r_type_func_exist (types, fname)) {
+	// Whether a prototype is recorded, not whether the kind key is free:
+	// `sym.imp.stat` resolves to the prototype under `func.stat.*` even in a
+	// program that also declares `struct stat` and has therefore overwritten
+	// `stat=func` with `stat=struct`.
+	if (r_type_func_prototype_exist (types, fname)) {
 		return strdup (key? trim_lodashes (types, fname): fname);
 	}
 	while ( (str = strchr (str, '.'))) {
 		str++;
 		name = str;
 	}
-	if (r_type_func_exist (types, name)) {
+	if (r_type_func_prototype_exist (types, name)) {
 		return strdup (key? trim_lodashes (types, name): name);
 	}
 	return r_type_func_guess (types, fname);

@@ -3219,3 +3219,53 @@ func.fflush_unlocked.ret=int
 func=type
 type.func=p
 type.func.size=8
+
+lseek=func
+func.lseek.args=3
+func.lseek.arg.0=int,fd
+func.lseek.arg.1=off_t,offset
+func.lseek.arg.2=int,whence
+func.lseek.ret=off_t
+
+fseeko=func
+func.fseeko.args=3
+func.fseeko.arg.0=FILE *,stream
+func.fseeko.arg.1=off_t,offset
+func.fseeko.arg.2=int,whence
+func.fseeko.ret=int
+
+ftello=func
+func.ftello.args=1
+func.ftello.arg.0=FILE *,stream
+func.ftello.ret=off_t
+
+stat=func
+func.stat.args=2
+func.stat.arg.0=const char *,path
+func.stat.arg.1=void *,buf
+func.stat.ret=int
+
+fdopen=func
+func.fdopen.args=2
+func.fdopen.arg.0=int,fd
+func.fdopen.arg.1=const char *,mode
+func.fdopen.ret=file*
+
+fchown=func
+func.fchown.args=3
+func.fchown.arg.0=int,fd
+func.fchown.arg.1=uid_t,owner
+func.fchown.arg.2=gid_t,group
+func.fchown.ret=int
+
+utime=func
+func.utime.args=2
+func.utime.arg.0=const char *,filename
+func.utime.arg.1=const void *,times
+func.utime.ret=int
+
+utimes=func
+func.utimes.args=2
+func.utimes.arg.0=const char *,filename
+func.utimes.arg.1=const void *,times
+func.utimes.ret=int

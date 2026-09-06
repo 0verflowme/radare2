@@ -3831,3 +3831,35 @@ EXPECT=<<EOF
 public: void * __ptr64 __cdecl boost::asio::detail::executor_function::impl<class boost::asio::detail::binder2<class boost::asio::ssl::detail::io_op<class boost::asio::basic_stream_socket<class boost::asio::ip::tcp, class boost::asio::execution::any_executor<struct boost::asio::execution::context_as_t<class boost::asio::execution_context & __ptr64>, struct boost::asio::execution::detail::blocking::never_t<0>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::blocking::possibly_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::outstanding_work::tracked_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::outstanding_work::untracked_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::relationship::fork_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::relationship::continuation_t<0>>>>, class boost::asio::ssl::detail::read_op<class boost::asio::mutable_buffers_1>, class boost::asio::detail::read_op<class boost::asio::ssl::stream<class boost::asio::basic_stream_socket<class boost::asio::ip::tcp, class boost::asio::execution::any_executor<struct boost::asio::execution::context_as_t<class boost::asio::execution_context & __ptr64>, struct boost::asio::execution::detail::blocking::never_t<0>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::blocking::possibly_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::outstanding_work::tracked_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::outstanding_work::untracked_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::relationship::fork_t<0>>, struct boost::asio::execution::prefer_only<struct boost::asio::execution::detail::relationship::continuation_t<0>>>>>, class boost::asio::mutable_buffers_1, class boost::asio::mutable_buffer const * __ptr64, class boost::asio::detail::transfer_at_least_t, class boost::asio::detail::wrapped_handler<class boost::asio::io_context::strand, class websocketpp::transport::asio::custom_alloc_handler<class std::_Binder<struct std::_Unforced, void & (__thiscall websocketpp::transport::asio::connection<struct websocketpp::config::asio_tls::transport_config>::*)(class std::function<void (__cdecl *)(class std::error_code const & __ptr64, unsigned long long(unsigned __int64))>, class boost::system::error_code const & __ptr64, unsigned long long(unsigned __int64)), class std::shared_ptr<class websocketpp::transport::asio::connection<struct websocketpp::config::asio_tls::transport_config>>, class std::function<void (__cdecl *)(class std::error_code const & __ptr64, unsigned long long(unsigned __int64))> & __ptr64, struct std::_Ph<1> const & __ptr64, struct std::_Ph<2> const & __ptr64>>, struct boost::asio::detail::is_continuation_if_running>>>, class boost::system::error_code, unsigned long long(unsigned __int64)>, class std::allocator<void>>::scalar_dtor(unsigned int) __ptr64
 EOF
 RUN
+
+NAME=msvc single letter variable name
+FILE=-
+CMDS="!rabin2 -D msvc ?a@@3HA"
+EXPECT=<<EOF
+int a
+EOF
+RUN
+
+NAME=msvc single letter names in a namespace
+FILE=-
+CMDS="!rabin2 -D msvc ?a@b@cd@@3HA"
+EXPECT=<<EOF
+int cd::b::a
+EOF
+RUN
+
+NAME=msvc single letter function taking nullptr_t
+FILE=-
+CMDS="!rabin2 -D msvc ?f@@YAX\$\$T@Z"
+EXPECT=<<EOF
+void __cdecl f(std::nullptr_t)
+EOF
+RUN
+
+NAME=msvc single letter class constructor
+FILE=-
+CMDS="!rabin2 -D msvc ??0a@@QEAA@XZ"
+EXPECT=<<EOF
+public: void __cdecl a::constructor(void) __ptr64
+EOF
+RUN

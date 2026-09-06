@@ -7,8 +7,8 @@
 
 #include "../bin/format/pdb/pdb_downloader.h"
 
-R_IPI bool bin_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count);
-R_IPI bool bin_raw_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count);
+R_IPI bool bin_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count, int type_filter);
+R_IPI bool bin_raw_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count, int type_filter);
 
 // clang-format off
 static RCoreHelpMessage help_msg_ih = {
@@ -141,20 +141,22 @@ static RCoreHelpMessage help_msg_iy = {
 };
 
 static RCoreHelpMessage help_msg_iz = {
-	"Usage: iz", "[?jq*] ([skip] [count])", "List strings",
+	"Usage: iz", "[?jq*auwWb] ([skip] [count])", "List strings",
 	"iz", " ([skip]) ([count])", "strings in data sections (skip N strings, show count)",
 	"iz.", "", "show string at current address",
 	"iz,", "[:help]", "perform a table query on strings listing",
 	"iz-", " ([addr]) ([len]) ([type])", "delete string at address (uses current seek if addr not specified, len/type for matching)",
 	"iz+", " [addr] ([len]) ([type])", "add string manually (len=auto, type=auto-detect)",
 	"iz*", "", "print flags and comments r2 commands for all the strings",
+	"iz[auwWb]", "", "filter by string type (ascii, utf8, utf16, utf32, base64)",
 	"izc", "", "count the strings in data sections",
 	"izj", "", "strings in data sections in JSON format",
 	"izj.", "", "show string at current address in JSON",
 	"izjq", "", "strings in data sections in quiet JSON (just vaddr and string)",
 	"izq", "[q]", "strings in data sections in quiet (and quieter) mode",
 	"izq.", "", "show string at current address (quiet)",
-	"izz", "[jq*] ([skip]) ([count])", "search for strings in the whole binary",
+	"izz", "[jq*auwWb] ([skip]) ([count])", "search for strings in the whole binary",
+	"izz[auwWb]", "", "filter by string type (ascii, utf8, utf16, utf32, base64)",
 	"izzc", "", "count the strings in the whole binary",
 	"izzz", "[jq]", "dump strings from whole binary to r2 shell (for huge files)",
 	"izzzc", "", "count the strings dumped from the whole binary",
@@ -1942,12 +1944,13 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 		r_cons_printf (core->cons, "%" PFMT64u "\n", total);
 		return;
 	}
-	// Parse command: iz[z][z][jq*] [skip] [count]
+	// Parse command: iz[z][z][jq*auwWb] [skip] [count]
 	const char *p = input + 1;
 	bool raw = false; // izz = raw strings from whole binary
 	bool rdump = false; // izzz = dump mode
 	ut64 skip = 0;
 	ut64 count = 0;
+	int type_filter = 0; // 0 = no filter, 'a'=ascii, 'u'=utf8, 'w'=wide, 'W'=wide32, 'b'=base64
 	// Count 'z' characters
 	while (*p == 'z') {
 		if (!raw) {
@@ -1966,6 +1969,25 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 			RVecRBinString_free (strings);
 		}
 		return;
+	}
+	// Parse type filter suffix (a, u, w, W, b) — not supported in izzz dump mode
+	if (!rdump) {
+		if (*p == 'a') {
+			type_filter = R_STRING_TYPE_ASCII;
+			p++;
+		} else if (*p == 'u') {
+			type_filter = R_STRING_TYPE_UTF8;
+			p++;
+		} else if (*p == 'w') {
+			type_filter = R_STRING_TYPE_WIDE;
+			p++;
+		} else if (*p == 'W') {
+			type_filter = R_STRING_TYPE_WIDE32;
+			p++;
+		} else if (*p == 'b') {
+			type_filter = R_STRING_TYPE_BASE64;
+			p++;
+		}
 	}
 	// Parse suffix (j, jq, qj, q, qq, *, ,)
 	bool local_pj = false;
@@ -2015,9 +2037,12 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 		if (list) {
 			ut64 addr = core->addr;
 			RBinString *string;
-			R_VEC_FOREACH (list, string) {
-				ut64 vaddr = va? string->vaddr: string->paddr;
-				if (vaddr == addr || string->paddr == addr) {
+		R_VEC_FOREACH (list, string) {
+			ut64 vaddr = va? string->vaddr: string->paddr;
+			if (type_filter && string->type != type_filter) {
+				continue;
+			}
+			if (vaddr == addr || string->paddr == addr) {
 					if (mode & R_MODE_JSON) {
 						PJ *lpj = r_core_pj_new (core);
 						pj_o (lpj);
@@ -2070,7 +2095,7 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 			RVecRBinString_free (res);
 		}
 	} else if (raw) {
-		bin_raw_strings (core, pj, mode, va, skip, count);
+		bin_raw_strings (core, pj, mode, va, skip, count, type_filter);
 	} else {
 		RList *bfiles = r_core_bin_files (core);
 		RListIter *iter;
@@ -2078,7 +2103,7 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 		RBinFile *cur = core->bin->cur;
 		r_list_foreach (bfiles, iter, bf) {
 			core->bin->cur = bf;
-			bin_strings (core, pj, mode, va, skip, count);
+			bin_strings (core, pj, mode, va, skip, count, type_filter);
 		}
 		core->bin->cur = cur;
 		r_list_free (bfiles);

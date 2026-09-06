@@ -2563,19 +2563,17 @@ static const char *function_signature_lookup_name(RAnal *anal, RAnalFunction *fc
 
 static char *function_signature_try_type_name(Sdb *types, const char *candidate) {
 	R_RETURN_VAL_IF_FAIL (types && candidate && *candidate, NULL);
+	// The prototype namespace decides. The kind key shares its name with
+	// struct tags, so `struct stat` overwrites `stat=func` and a lookup
+	// through the kind key loses a prototype that is still recorded.
 	char *name = r_type_func_key (types, candidate);
 	if (name) {
-		const char *kind = sdb_const_get (types, name, 0);
-		if (kind && !strcmp (kind, "func")) {
+		if (r_type_func_prototype_exist (types, name)) {
 			return name;
 		}
 		free (name);
 	}
-	const char *kind = sdb_const_get (types, candidate, 0);
-	if (kind && !strcmp (kind, "func")) {
-		return strdup (candidate);
-	}
-	return NULL;
+	return r_type_func_prototype_exist (types, candidate)? strdup (candidate): NULL;
 }
 
 static char *function_signature_address_type_name(Sdb *types, ut64 addr) {

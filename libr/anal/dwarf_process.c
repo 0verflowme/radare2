@@ -770,8 +770,17 @@ static void parse_typedef(Context *ctx, ut64 idx) {
 			break;
 		}
 	}
-	if (!name || !type) { // type has to have a name for now
+	if (!name) { // type has to have a name for now
 		goto cleanup;
+	}
+	if (!type) {
+		// DWARF spells `void` by omission: a named typedef with no DW_AT_type
+		// is `typedef void NAME;`, which is a complete type, not a record to
+		// drop. `BZFILE` is one, and every bzip2 stream call names it.
+		type = strdup ("void");
+		if (!type) {
+			goto cleanup;
+		}
 	}
 	RAnalBaseType *base_type = r_anal_base_type_new (R_ANAL_BASE_TYPE_KIND_TYPEDEF);
 	if (!base_type) {

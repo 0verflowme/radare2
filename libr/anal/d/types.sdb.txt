@@ -271,12 +271,6 @@ func.setlocale.arg.0=int,category
 func.setlocale.arg.1=const char *,locale
 func.setlocale.ret=char *
 
-bindtextdomain=func
-func.bindtextdomain.args=2
-func.bindtextdomain.arg.0=const char *,domainname
-func.bindtextdomain.arg.1=const char *,dirname
-func.bindtextdomain.ret=char *
-func.bindtextdomain.include=libintl.h
 
 dcgettext=func
 func.dcgettext.args=3
@@ -325,12 +319,6 @@ func.ngettext.arg.1=const char *,msgid2
 func.ngettext.arg.2=unsigned long int,n
 func.ngettext.ret=char *
 func.ngettext.include=libintl.h
-
-textdomain=func
-func.textdomain.args=1
-func.textdomain.arg.0=const char *,domainname
-func.textdomain.ret=char *
-func.textdomain.include=libintl.h
 
 strcpy=func
 func.strcpy.args=2

@@ -271,6 +271,67 @@ func.setlocale.arg.0=int,category
 func.setlocale.arg.1=const char *,locale
 func.setlocale.ret=char *
 
+bindtextdomain=func
+func.bindtextdomain.args=2
+func.bindtextdomain.arg.0=const char *,domainname
+func.bindtextdomain.arg.1=const char *,dirname
+func.bindtextdomain.ret=char *
+func.bindtextdomain.include=libintl.h
+
+dcgettext=func
+func.dcgettext.args=3
+func.dcgettext.arg.0=const char *,domainname
+func.dcgettext.arg.1=const char *,msgid
+func.dcgettext.arg.2=int,category
+func.dcgettext.ret=char *
+func.dcgettext.include=libintl.h
+
+dcngettext=func
+func.dcngettext.args=5
+func.dcngettext.arg.0=const char *,domainname
+func.dcngettext.arg.1=const char *,msgid1
+func.dcngettext.arg.2=const char *,msgid2
+func.dcngettext.arg.3=unsigned long int,n
+func.dcngettext.arg.4=int,category
+func.dcngettext.ret=char *
+func.dcngettext.include=libintl.h
+
+dgettext=func
+func.dgettext.args=2
+func.dgettext.arg.0=const char *,domainname
+func.dgettext.arg.1=const char *,msgid
+func.dgettext.ret=char *
+func.dgettext.include=libintl.h
+
+dngettext=func
+func.dngettext.args=4
+func.dngettext.arg.0=const char *,domainname
+func.dngettext.arg.1=const char *,msgid1
+func.dngettext.arg.2=const char *,msgid2
+func.dngettext.arg.3=unsigned long int,n
+func.dngettext.ret=char *
+func.dngettext.include=libintl.h
+
+gettext=func
+func.gettext.args=1
+func.gettext.arg.0=const char *,msgid
+func.gettext.ret=char *
+func.gettext.include=libintl.h
+
+ngettext=func
+func.ngettext.args=3
+func.ngettext.arg.0=const char *,msgid1
+func.ngettext.arg.1=const char *,msgid2
+func.ngettext.arg.2=unsigned long int,n
+func.ngettext.ret=char *
+func.ngettext.include=libintl.h
+
+textdomain=func
+func.textdomain.args=1
+func.textdomain.arg.0=const char *,domainname
+func.textdomain.ret=char *
+func.textdomain.include=libintl.h
+
 strcpy=func
 func.strcpy.args=2
 func.strcpy.arg.0=char *,dest

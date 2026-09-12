@@ -1323,8 +1323,8 @@ static void findMethodBounds(RVecRBinSymbol *methods, ut64 *min, ut64 *max) {
 			if (sym->vaddr < at_min) {
 				at_min = sym->vaddr;
 			}
-			if (sym->vaddr + sym->size > at_max) {
-				at_max = sym->vaddr + sym->size;
+			if (sym->vaddr + sym->attr.size > at_max) {
+				at_max = sym->vaddr + sym->attr.size;
 			}
 		}
 	}
@@ -1480,6 +1480,13 @@ static char get_string_type(const ut8 *buf, ut64 len) {
 			if (!rc) {
 				needle++;
 				break;
+			}
+			if (!r) {
+				/* The classification describes the string at the start of
+				 * the buffer, so its NUL terminator ends the scan. Walking
+				 * on would reclassify the trailing zero padding as a wide
+				 * string and hide an ordinary ascii string. */
+				return str_type;
 			}
 			needle += rc;
 		}
@@ -2969,15 +2976,15 @@ static void annotated_hexdump(RCore *core, const char *str, int len) {
 					r_cons_printf (core->cons, "/fcn.%s\n", fcn->name);
 				}
 			}
-			const RList *list = r_flag_get_list (core->flags, addr + j);
-			RListIter *iter;
+			const RVecFlagItemPtr *list = r_flag_get_vec (core->flags, addr + j);
+			RFlagItem **iter;
 			RFlagItem *fi;
 			ut64 flagsize = 0;
 			ut64 flagaddr = 0;
 			bool found = false;
 			char *flagname = NULL;
 			ut64 at = addr + j;
-			if (r_list_empty (list)) {
+			if (!list || RVecFlagItemPtr_empty (list)) {
 				// get flag fnear and check for size
 				RFlagItem *fnear = r_flag_get_at (core->flags, at, true);
 				if (fnear) {
@@ -2999,7 +3006,7 @@ static void annotated_hexdump(RCore *core, const char *str, int len) {
 					}
 				}
 			} else {
-				r_list_foreach (list, iter, fi) {
+				r_flag_item_vec_foreach (list, iter, fi) {
 					flagsize = R_MAX (flagsize, fi->size);
 					const char *fi_color = r_flag_item_set_color (core->flags, fi, NULL);
 					if (fi_color) {
@@ -6908,14 +6915,22 @@ static void bitimage(RCore *core, const ut8 *data, const int data_size) {
 	r_strbuf_free (sb);
 }
 
+static void cmd_pri_image(RCore *core, const ut8 *buf, size_t bsz, int cols, int mode, int components) {
+	char *s = r_cons_image (buf, bsz, cols, mode, components);
+	if (s) {
+		r_cons_print (core->cons, s);
+	}
+	free (s);
+}
+
 static void cmd_pri(RCore *core, const char *input, int l) {
 	int cols = r_config_get_i (core->config, "hex.cols");
 	bool has_color = r_config_get_i (core->config, "scr.color") > 0;
-	ut8 *buf = r_core_readblock (core, 0);
+	size_t bsz = core->blocksize;
+	ut8 *buf = r_core_readblock (core, bsz);
 	if (!buf) {
 		return;
 	}
-	const int data_size = core->blocksize;
 	switch (input[2]) {
 	case '?':
 		r_cons_cmd_help (core->cons, help_msg_pri);
@@ -6924,7 +6939,7 @@ static void cmd_pri(RCore *core, const char *input, int l) {
 		cmd_printmsg (core, input + 4);
 		break;
 	case '1':
-		bitimage (core, buf, data_size);
+		bitimage (core, buf, bsz);
 		break;
 	case '2': // "pri2"
 		if (l) {
@@ -6967,17 +6982,17 @@ static void cmd_pri(RCore *core, const char *input, int l) {
 		}
 		break;
 	case 'g': // gresycale
-		r_cons_image (buf, core->blocksize, cols, 'g', 3);
+		cmd_pri_image (core, buf, bsz, cols, 'g', 3);
 		break;
 	case 's': // sixel
-		r_cons_image (buf, core->blocksize, cols, 's', 3);
+		cmd_pri_image (core, buf, bsz, cols, 's', 3);
 		break;
 	case '4':
-		r_cons_image (buf, core->blocksize, cols, 'r', 4);
+		cmd_pri_image (core, buf, bsz, cols, 'r', 4);
 		break;
 	case 'r':
 	default:
-		r_cons_image (buf, core->blocksize, cols, has_color? 'r': 'a', 3);
+		cmd_pri_image (core, buf, bsz, cols, has_color? 'r': 'a', 3);
 		break;
 	}
 	free (buf);
@@ -8150,6 +8165,10 @@ static int cmd_print(void *data, const char *input) {
 	}
 	if (len < 0) {
 		len = -len;
+	}
+	/* pf, pm and pa don't take a length and never read the block, so don't size an allocation from their argument */
+	if (input[0] && strchr ("fma", input[0])) {
+		len = core->blocksize;
 	}
 	if (len > core->blocksize) {
 		block = calloc (1, len);

@@ -96,6 +96,8 @@ r_bin_sources = [
   'format/dmp/dmp64.c',
   'format/elf/elf.c',
   'format/elf/elf64.c',
+  'format/elf/plt.c',
+  'format/elf/plt64.c',
   'format/elf/elf64_write.c',
   'format/elf/elf_write.c',
   'format/mach0/coresymbolication.c',
@@ -103,6 +105,7 @@ r_bin_sources = [
   'format/mach0/fatmach0.c',
   'format/mach0/mach0.c',
   'format/mach0/mach064.c',
+  'format/swift/swift.c',
   'format/xnu/r_cf_dict.c',
   'format/mdmp/mdmp.c',
   'format/mdmp/mdmp_pe.c',
@@ -134,7 +137,8 @@ r_bin_sources = [
   'format/pdb/stream_pe.c',
   'format/pdb/tpi.c',
 # language detection
-  'mangling/swift.c'
+  'mangling/swift.c',
+  'mangling/java.c',
 ]
 
 demangle_c_args = []
@@ -170,7 +174,7 @@ if bin_demangle_plugins.contains('ibmxl')
 endif
 if bin_demangle_plugins.contains('java')
   demangle_c_args += ['-DR_BIN_DEMANGLE_JAVA=1']
-  r_bin_sources += ['p/bin_demangle_java.c', 'mangling/java.c']
+  r_bin_sources += ['p/bin_demangle_java.c']
 endif
 if bin_demangle_plugins.contains('msvc')
   demangle_c_args += ['-DR_BIN_DEMANGLE_MSVC=1']

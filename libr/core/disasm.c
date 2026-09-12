@@ -1237,6 +1237,45 @@ static const char *get_reg_at(RAnalFunction *fcn, st64 delta, ut64 addr) {
 	return r_anal_function_get_var_reg_at (fcn, delta, addr);
 }
 
+static const char *ds_call_type_at(RAnal *anal, ut64 addr) {
+	return sdb_const_getf (anal->sdb_types, NULL,
+		"calllink.%08" PFMT64x, addr);
+}
+
+static char *ds_typed_call_pseudo(RDisasmState *ds) {
+	const char *name = ds_call_type_at (ds->core->anal, ds->at);
+	if (!name) {
+		return NULL;
+	}
+	const ut32 type = ds->analop.type & R_ANAL_OP_TYPE_MASK;
+	if (type != R_ANAL_OP_TYPE_UCALL
+			&& type != R_ANAL_OP_TYPE_UCCALL) {
+		return NULL;
+	}
+	Sdb *TDB = ds->core->anal->sdb_types;
+	const char *cc = r_anal_cc_func (ds->core->anal, name);
+	const int argc = r_type_func_args_count (TDB, name);
+	if (!cc || argc < 0) {
+		return NULL;
+	}
+	RStrBuf *sb = r_strbuf_new (name);
+	r_strbuf_append (sb, " (");
+	int i;
+	for (i = 0; i < argc; i++) {
+		const char *loc = r_anal_cc_argloc (ds->core->anal,
+			cc, i, 0, argc);
+		if (!loc) {
+			loc = r_type_func_args_name (TDB, name, i);
+		}
+		if (i > 0) {
+			r_strbuf_append (sb, ", ");
+		}
+		r_strbuf_append (sb, r_str_get (loc));
+	}
+	r_strbuf_append (sb, ")");
+	return r_strbuf_drain (sb);
+}
+
 static void ds_build_op_str(RDisasmState *ds, bool print_color) {
 	RCore *core = ds->core;
 	const bool be = R_ARCH_CONFIG_IS_BIG_ENDIAN (ds->core->rasm->config);
@@ -1289,6 +1328,11 @@ static void ds_build_op_str(RDisasmState *ds, bool print_color) {
 		if (res) {
 			free (ds->opstr);
 			ds->opstr = res;
+		}
+		char *call = ds_typed_call_pseudo (ds);
+		if (call) {
+			free (ds->opstr);
+			ds->opstr = call;
 		}
 	}
 	/* initialize */
@@ -1406,10 +1450,10 @@ static void ds_build_op_str(RDisasmState *ds, bool print_color) {
 				e = strdup (e);
 				ut64 addr = r_num_get (NULL, ox);
 				if (addr > ds->min_ref_addr) {
-					const RList *ls = r_flag_get_list (ds->core->flags, addr);
+					const RVecFlagItemPtr *ls = r_flag_get_vec (ds->core->flags, addr);
 					RFlagItem *fi;
-					RListIter *iter;
-					r_list_foreach (ls, iter, fi) {
+					RFlagItem **iter;
+					r_flag_item_vec_foreach (ls, iter, fi) {
 						const char *fsname = R_UNWRAP3 (fi, space, name);
 						if (fsname && (!strcmp (fsname, "format") || !strcmp (fsname, "segments") || !strcmp (fsname, "sections"))) {
 							// ignore
@@ -1597,10 +1641,10 @@ static void ds_show_refs(RDisasmState *ds) {
 	RAnalRef *ref;
 	R_VEC_FOREACH (refs, ref) {
 		const char *cmt = r_meta_get_string (ds->core->anal, R_META_TYPE_COMMENT, ref->addr);
-		const RList *fls = r_flag_get_list (ds->core->flags, ref->addr);
-		RListIter *iter2;
+		const RVecFlagItemPtr *fls = r_flag_get_vec (ds->core->flags, ref->addr);
+		RFlagItem **iter2;
 		RFlagItem *fis;
-		r_list_foreach (fls, iter2, fis) {
+		r_flag_item_vec_foreach (fls, iter2, fis) {
 			ds_begin_comment (ds);
 			ds_comment (ds, true, "%s (%s)", ds->cmtoken, fis->name);
 		}
@@ -1638,6 +1682,15 @@ static void ds_show_anos(RDisasmState *ds) {
 	if (ds->show_anos) {
 		r_core_call_at (ds->core, ds->at, "anol");
 	}
+}
+
+// exception region markers describe a range, they don't name the code they cover
+static RFlagItem *closest_named_flag(RCore *core, ut64 addr) {
+	RFlagItem *f = r_flag_get_at (core->flags, addr, true);
+	while (f && f->addr > 0 && f->space && !strcmp (f->space->name, R_FLAGS_FS_TRYCATCH)) {
+		f = r_flag_get_at (core->flags, f->addr - 1, true);
+	}
+	return f;
 }
 
 static void ds_show_xrefs(RDisasmState *ds) {
@@ -1747,7 +1800,7 @@ static void ds_show_xrefs(RDisasmState *ds) {
 					}
 				}
 				if (ds->asm_demangle) {
-					f = r_flag_get_by_spaces (core->flags, false, fun->addr, R_FLAGS_FS_SYMBOLS, NULL);
+					f = r_flag_get_by_spaces (core->flags, false, fun->addr, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 					if (f && f->demangled && f->realname) {
 						realname = strdup (f->realname);
 					}
@@ -1758,12 +1811,12 @@ static void ds_show_xrefs(RDisasmState *ds) {
 				}
 				r_list_append (addrs, r_num_dup (refi->addr));
 			} else {
-				f = r_flag_get_at (core->flags, refi->addr, true);
+				f = closest_named_flag (core, refi->addr);
 				if (f) {
 					if (!is_at_second_last) {
 						const RAnalRef *next = RVecAnalRef_at (xrefs, i + 1);
 						ut64 next_addr = next->addr;
-						next_f = r_flag_get_at (core->flags, next_addr, true);
+						next_f = closest_named_flag (core, next_addr);
 						if (next_f && f->addr == next_f->addr) {
 							if (xci < 32) {
 								xrefs_char[xci++] = r_anal_ref_perm_tochar (refi);
@@ -1777,7 +1830,7 @@ static void ds_show_xrefs(RDisasmState *ds) {
 						RFlagItem *f_sym = f;
 						if (!r_str_startswith (f_sym->name, "sym.")) {
 							f_sym = r_flag_get_by_spaces (core->flags, false, f->addr,
-									R_FLAGS_FS_SYMBOLS, NULL);
+									R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 						}
 						if (f_sym && f_sym->demangled && f_sym->realname) {
 							f = f_sym;
@@ -2750,8 +2803,7 @@ static void ds_show_comments_right(RDisasmState *ds) {
 	ds->show_cmt_right = scr;
 }
 
-static ut64 flagVal(const void *a) {
-	const RFlagItem *fa = a;
+static ut64 flagVal(const RFlagItem *fa) {
 	return r_str_hash64 (fa->realname? fa->realname: fa->name);
 }
 
@@ -2811,39 +2863,55 @@ static bool is_first(const char *fs) {
 	return false;
 }
 
-static RList *custom_sorted_flags(const RList *flaglist) {
+static bool flag_vec_has_name(const RVecFlagItemPtr *list, const RFlagItem *flag) {
+	const ut64 hash = flagVal (flag);
+	RFlagItem **iter;
+	RFlagItem *fi;
+	r_flag_item_vec_foreach (list, iter, fi) {
+		if (hash == flagVal (fi)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static RVecFlagItemPtr *custom_sorted_flags(const RVecFlagItemPtr *flaglist) {
 	if (!flaglist) {
 		return NULL;
 	}
-	RListIter *iter;
+	RVecFlagItemPtr *res = RVecFlagItemPtr_new ();
+	if (!res) {
+		return NULL;
+	}
+	RVecFlagItemPtr rest;
+	RVecFlagItemPtr tail;
+	RVecFlagItemPtr_init (&rest);
+	RVecFlagItemPtr_init (&tail);
+	RFlagItem **iter;
 	RFlagItem *fi;
-	RList *list = r_list_uniq (flaglist, flagVal);
-	RList *res = r_list_newf (NULL);
-	RList *rest = r_list_newf (NULL);
-	RList *tail = r_list_newf (NULL);
-	r_list_foreach (list, iter, fi) {
+	r_flag_item_vec_foreach (flaglist, iter, fi) {
+		if (flag_vec_has_name (res, fi) || flag_vec_has_name (&rest, fi)) {
+			continue;
+		}
 		const char *fs = fi->space? fi->space->name: NULL;
 		if (is_first (fs)) {
-			r_list_append (res, fi);
+			RVecFlagItemPtr_push_back (res, &fi);
 		} else {
-			r_list_append (rest, fi);
+			RVecFlagItemPtr_push_back (&rest, &fi);
 		}
 	}
-	r_list_foreach (rest, iter, fi) {
+	R_VEC_FOREACH (&rest, iter) {
+		fi = *iter;
 		const char *fs = R_UNWRAP3 (fi, space, name);
 		if (fs && !strcmp (fs, "registers")) {
-			r_list_append (tail, fi);
+			RVecFlagItemPtr_push_back (&tail, &fi);
 		} else {
-			r_list_append (res, fi);
+			RVecFlagItemPtr_push_back (res, &fi);
 		}
 	}
-	r_list_foreach (tail, iter, fi) {
-		r_list_append (res, fi);
-	}
-	r_list_free (tail);
-	r_list_free (rest);
-	list->free = NULL;
-	r_list_free (list);
+	RVecFlagItemPtr_append (res, &tail, NULL);
+	RVecFlagItemPtr_fini (&tail);
+	RVecFlagItemPtr_fini (&rest);
 	return res;
 }
 
@@ -2851,7 +2919,6 @@ static RList *custom_sorted_flags(const RList *flaglist) {
 static bool ds_show_flags(RDisasmState *ds, bool overlapped) {
 	RCons *cons = ds->core->cons;
 	RFlagItem *flag;
-	RListIter *iter;
 
 	if (ds->asm_flags_right || !ds->show_flags) {
 		return false;
@@ -2861,8 +2928,8 @@ static bool ds_show_flags(RDisasmState *ds, bool overlapped) {
 	ut64 switch_addr = UT64_MAX;
 	int case_start = -1, case_prev = 0, case_current = 0;
 	RAnalFunction *f = r_anal_get_function_at (ds->core->anal, ds->at);
-	const RList *flaglist = r_flag_get_list (core->flags, ds->at);
-	RList *uniqlist = custom_sorted_flags (flaglist);
+	const RVecFlagItemPtr *flaglist = r_flag_get_vec (core->flags, ds->at);
+	RVecFlagItemPtr *uniqlist = custom_sorted_flags (flaglist);
 	const char *ellipsis = r_print_ellipsis (core->print, NULL, NULL);
 	int count = 0;
 	bool outline = !ds->flags_inline;
@@ -2871,7 +2938,10 @@ static bool ds_show_flags(RDisasmState *ds, bool overlapped) {
 	bool docolon = true;
 	int nth = 0;
 	bool any = false;
-	r_list_foreach (uniqlist, iter, flag) {
+	size_t i;
+	for (i = 0; i < r_flag_item_vec_length (uniqlist); i++) {
+		flag = *RVecFlagItemPtr_at (uniqlist, i);
+		bool last = i + 1 == r_flag_item_vec_length (uniqlist);
 		if (!overlapped && f && f->addr == flag->addr && !strcmp (flag->name, f->name)) {
 			// do not show non-overlapped flags that have the same name as the function
 			// do not show flags that have the same name as the function
@@ -2904,13 +2974,13 @@ static bool ds_show_flags(RDisasmState *ds, bool overlapped) {
 					switch_addr = saddr;
 					case_prev = case_current;
 					case_start = case_current;
-					if (iter != uniqlist->tail) {
+					if (!last) {
 						continue;
 					}
 				}
 				if (case_current == case_prev + 1 && switch_addr == saddr) {
 					case_prev = case_current;
-					if (iter != uniqlist->tail) {
+					if (!last) {
 						continue;
 					}
 				}
@@ -2971,8 +3041,8 @@ static bool ds_show_flags(RDisasmState *ds, bool overlapped) {
 					nth = 0;
 				} else if (case_prev != case_start) {
 					ds_printf_font (ds, ds->font_flag, "case %d...%d:", case_start, case_prev);
-					if (iter != uniqlist->head && iter != uniqlist->tail) {
-						iter = iter->p;
+					if (i > 0 && !last) {
+						i--;
 					}
 					case_start = case_current;
 				} else {
@@ -3038,7 +3108,7 @@ static bool ds_show_flags(RDisasmState *ds, bool overlapped) {
 		}
 		ds_newline (ds);
 	}
-	r_list_free (uniqlist);
+	RVecFlagItemPtr_free (uniqlist);
 	return any;
 }
 
@@ -3804,10 +3874,10 @@ static bool ds_print_data_type(RDisasmState *ds, const ut8 *obuf, int ib, int si
 			}
 		}
 		if (n >= ds->min_ref_addr) {
-			const RList *flags = r_flag_get_list (core->flags, n);
-			RListIter *iter;
+			const RVecFlagItemPtr *flags = r_flag_get_vec (core->flags, n);
+			RFlagItem **iter;
 			RFlagItem *fi;
-			r_list_foreach (flags, iter, fi) {
+			r_flag_item_vec_foreach (flags, iter, fi) {
 				r_cons_printf (cons, " %s %s", ds->cmtoken, fi->name);
 			}
 		}
@@ -4225,20 +4295,24 @@ static void ds_print_bytes(RDisasmState *ds) {
 						}
 					}
 				}
-				char *p = (char *)r_str_ansi_chrn (nstr, nb);
-				if (p) {
-					off = true;
-					if (!core->print->bytespace) {
-						p--;
+				const char *cp = r_str_ansi_chrn (nstr, nb);
+				if (cp) {
+					if (cp > nstr && !core->print->bytespace) {
+						cp--;
 					}
-				//	eprintf ("PP(%s)=(%s) %d\n", nstr, p, r_str_ansi_len (p));
-					p[0] = '.';
-					p[1] = '.';
-					if (ds->show_bytes_align) {
-						p[2] = '\0';
-					} else {
-						if (core->print->bytespace) {
-							int pos = ds->nbytes + 2;
+					const size_t cut = cp - nstr;
+					// the ellipsis and padding land after the cut
+					char *tmp = realloc (nstr, cut + ds->nbytes + 4);
+					if (tmp) {
+						off = true;
+						nstr = tmp;
+						char *p = nstr + cut;
+						p[0] = '.';
+						p[1] = '.';
+						if (ds->show_bytes_align) {
+							p[2] = '\0';
+						} else if (core->print->bytespace) {
+							const int pos = ds->nbytes + 2;
 							memset (p + 2, ' ', pos - 2);
 							p[pos] = 0;
 						} else {
@@ -4540,7 +4614,7 @@ static void ds_print_fcn_name(RDisasmState *ds) {
 	if (!f && ds->core->flags && (!ds->core->vmode || (!ds->subjmp && !ds->subnames))) {
 		const char *arch;
 		RFlagItem *flag = r_flag_get_by_spaces (ds->core->flags, false, ds->analop.jump,
-				R_FLAGS_FS_CLASSES, R_FLAGS_FS_SYMBOLS, NULL);
+				R_FLAGS_FS_CLASSES, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 		if (flag && flag->name
 				&& ds->opstr && !strstr (ds->opstr, flag->name)
 				&& (r_str_startswith (flag->name, "sym.")
@@ -4551,7 +4625,7 @@ static void ds_print_fcn_name(RDisasmState *ds) {
 			if (flag_sym->demangled && ds->core->vmode && ds->asm_demangle
 					&& (r_str_startswith (flag->name, "sym.")
 						|| (flag_sym = r_flag_get_by_spaces (ds->core->flags, false,
-							ds->analop.jump, R_FLAGS_FS_SYMBOLS, NULL)))) {
+							ds->analop.jump, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL)))) {
 				return;
 			}
 			ds_begin_comment (ds);
@@ -4586,7 +4660,7 @@ static void ds_print_fcn_name(RDisasmState *ds) {
 					&& ds->asm_demangle
 					&& (flag_sym = r_flag_get_by_spaces (ds->core->flags, false,
 						ds->analop.jump,
-						R_FLAGS_FS_SYMBOLS, NULL))
+						R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL))
 					&& flag_sym->demangled) {
 				return;
 			}
@@ -4881,8 +4955,6 @@ static void ds_print_dwarf(RDisasmState *ds) {
 static void ds_print_asmop_payload(RDisasmState *ds, const ut8 *buf) {
 	if (ds->show_varaccess) {
 		RCons *cons = ds->core->cons;
-		// XXX assume analop is filled
-		//r_anal_op (core->anal, &ds->analop, ds->at, core->block+i, core->blocksize-i);
 		int v = ds->analop.ptr;
 		switch (ds->analop.stackop) {
 		case R_ANAL_STACK_GET:
@@ -5035,16 +5107,14 @@ static RFlagItem *ds_sized_str_flag(RDisasmState *ds, ut64 addr) {
 	}
 	RFlagItem *match = NULL;
 	int count = 0;
-	const RList *list = r_flag_get_list (flags, addr);
-	if (list) {
-		RFlagItem *fi;
-		RListIter *iter;
-		r_list_foreach (list, iter, fi) {
-			if (fi->addr == addr && fi->name && r_str_startswith (fi->name, "str.")) {
-				count++;
-				if ((int)fi->size == size) {
-					match = fi;
-				}
+	const RVecFlagItemPtr *list = r_flag_get_vec (flags, addr);
+	RFlagItem **iter;
+	RFlagItem *fi;
+	r_flag_item_vec_foreach (list, iter, fi) {
+		if (fi->addr == addr && fi->name && r_str_startswith (fi->name, "str.")) {
+			count++;
+			if ((int)fi->size == size) {
+				match = fi;
 			}
 		}
 	}
@@ -5138,6 +5208,12 @@ static inline bool is_filtered_flag(RDisasmState *ds, const char *name) {
 
 static bool flag_name_in_opstr(RFlagItem *f, const char *opstr) {
 	return f && opstr && (strstr (opstr, f->name) || (f->realname && strstr (opstr, f->realname)));
+}
+
+// a reloc here means the slot holds an address, not text
+static bool ds_is_ptr_slot(RDisasmState *ds, ut64 addr) {
+	return r_core_getreloc (ds->core, addr, 1)
+		&& !r_meta_get_in (ds->core->anal, addr, R_META_TYPE_STRING);
 }
 
 /* convert numeric value in opcode to ascii char or number */
@@ -5278,7 +5354,9 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 					r_io_read_at (ds->core->io, ds->analop.ptr,
 						      (ut8 *)str, sizeof (str) - 1);
 					str[sizeof (str) - 1] = 0;
-					if (!string_printed && str[0] && r_str_is_printable_incl_newlines (str)) {
+					if (!string_printed && str[0]
+						&& r_str_is_printable_incl_newlines (str)
+						&& !ds_is_ptr_slot (ds, ds->analop.ptr)) {
 						ds_print_str (ds, str, sizeof (str), ds->analop.ptr);
 						string_printed = true;
 					}
@@ -5392,7 +5470,7 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 				}
 			}
 			if (print_msg) {
-				if (!string_printed) {
+				if (!string_printed && !ds_is_ptr_slot (ds, refaddr)) {
 					ds_print_str (ds, msg, len, refaddr);
 					string_printed = true;
 				}
@@ -5435,7 +5513,7 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 					}
 				} else {
 					if (r_core_anal_address (core, refaddr) & R_ANAL_ADDR_TYPE_ASCII) {
-						if (!string_printed && print_msg) {
+						if (!string_printed && print_msg && !ds_is_ptr_slot (ds, refaddr)) {
 							ds_print_str (ds, msg, len, refaddr);
 							string_printed = true;
 						}
@@ -5446,7 +5524,7 @@ static void ds_print_ptr(RDisasmState *ds, int len, int idx) {
 			kind = r_anal_data_kind (core->anal, refaddr, (const ut8*)msg, len - 1);
 			if (kind) {
 				if (!strcmp (kind, "text")) {
-					if (!string_printed && print_msg) {
+					if (!string_printed && print_msg && !ds_is_ptr_slot (ds, refaddr)) {
 						ds_print_str (ds, msg, len, refaddr);
 						string_printed = true;
 					}
@@ -5503,7 +5581,7 @@ static void ds_print_demangled(RDisasmState *ds) {
 	case R_ANAL_OP_TYPE_JMP:
 	case R_ANAL_OP_TYPE_UJMP:
 	case R_ANAL_OP_TYPE_CALL:
-		f = r_flag_get_by_spaces (core->flags, false, ds->analop.jump, R_FLAGS_FS_SYMBOLS, NULL);
+		f = r_flag_get_by_spaces (core->flags, false, ds->analop.jump, R_FLAGS_FS_SYMBOLS, R_FLAGS_FS_IMPORTS, NULL);
 		if (f && f->demangled && f->realname && ds->opstr && !strstr (ds->opstr, f->realname)) {
 			ds_begin_nl_comment (ds);
 			ds_comment (ds, true, "%s %s", ds->cmtoken, f->realname);
@@ -5838,7 +5916,7 @@ static void ds_pre_emulation(RDisasmState *ds) {
 	if (!ds->pre_emu) {
 		return;
 	}
-	RFlagItem *f = r_flag_get_at (ds->core->flags, ds->core->addr, true);
+	RFlagItem *f = closest_named_flag (ds->core, ds->core->addr);
 	if (!f) {
 		return;
 	}
@@ -6105,7 +6183,7 @@ static void ds_comment_call(RDisasmState *ds) {
 	RAnalFuncArg *arg;
 	RListIter *iter;
 	RListIter *nextele;
-	const char *fcn_name = NULL;
+	const char *fcn_name = ds_call_type_at (core->anal, ds->at);
 	char *key = NULL;
 	ut64 pcv = ds->analop.jump;
 	if (ds->analop.type == R_ANAL_OP_TYPE_RCALL) {
@@ -6121,12 +6199,14 @@ static void ds_comment_call(RDisasmState *ds) {
 		}
 	}
 	RAnalFunction *fcn = r_anal_get_function_at (core->anal, pcv);
-	if (fcn) {
-		fcn_name = fcn->name;
-	} else {
-		RFlagItem *item = r_flag_get_in (core->flags, pcv);
-		if (item) {
-			fcn_name = item->name;
+	if (!fcn_name) {
+		if (fcn) {
+			fcn_name = fcn->name;
+		} else {
+			RFlagItem *item = r_flag_get_in (core->flags, pcv);
+			if (item) {
+				fcn_name = item->name;
+			}
 		}
 	}
 	if (fcn_name) {
@@ -6178,6 +6258,13 @@ static void ds_comment_call(RDisasmState *ds) {
 	if (fcn) {
 		// @TODO: fcn->nargs should be updated somewhere and used here instead
 		nargs = r_anal_var_count_args (fcn);
+		if (nargs < 1) {
+			// arg vars may not be recovered yet, but a dyncc carries the argcount
+			const char *fcncc = r_anal_function_cc (fcn);
+			if (fcncc && r_str_startswith (fcncc, "dyncc:")) {
+				nargs = r_anal_cc_max_arg (core->anal, fcncc);
+			}
+		}
 	}
 	if (nargs > 0) {
 		ds_comment_esil (ds, true, false, "%s", ds->show_color? ds->pal_comment : "");
@@ -6316,8 +6403,11 @@ static void ds_print_calls_hints(RDisasmState *ds) {
 	RAnal *anal = ds->core->anal;
 	Sdb *TDB = anal->sdb_types;
 	char *name;
-	char *full_name = NULL;
-	if (ds->analop.type == R_ANAL_OP_TYPE_CALL) {
+	const char *full_name = NULL;
+	const char *call_type = ds_call_type_at (anal, ds->at);
+	if (call_type) {
+		full_name = call_type;
+	} else if (ds->analop.type == R_ANAL_OP_TYPE_CALL) {
 		// RAnalFunction *fcn = r_anal_get_fcn_in (anal, ds->analop.jump, -1);
 		RAnalFunction *fcn = r_anal_get_function_at (anal, ds->analop.jump);
 		if (!fcn) {
@@ -6412,17 +6502,18 @@ static void ds_print_comments_right(RDisasmState *ds) {
 		mi = NULL;
 	}
 	if (ds->asm_flags_right) {
-		const RList *flaglist = r_flag_get_list (core->flags, ds->at);
+		const RVecFlagItemPtr *flaglist = r_flag_get_vec (core->flags, ds->at);
 		RFlagItem *fi;
-		RListIter *iter;
-		if (!r_list_empty (flaglist)) {
+		RFlagItem **iter;
+		if (flaglist && !RVecFlagItemPtr_empty (flaglist)) {
 			ds_align_comment (ds);
 			if (ds->show_color) {
 				r_cons_print (core->cons, ds->color_comment);
 			}
 			r_cons_print (core->cons, ";-- ");
-			r_list_foreach (flaglist, iter, fi) {
-				ds_printf_font (ds, ds->font_flag, "%s%s", fi->name, iter->n? ", ": " ");
+			r_flag_item_vec_foreach (flaglist, iter, fi) {
+				ds_printf_font (ds, ds->font_flag, "%s%s", fi->name,
+					iter + 1 != R_VEC_END_ITER (flaglist)? ", ": " ");
 			}
 		}
 		return;
@@ -7126,28 +7217,27 @@ toro:
 				free (fmt);
 				continue;
 			}
+		}
+		int left = ds_left (ds);
+		R_LOG_DEBUG ("BEFORE: ds->index=%#x len=%#x left=%#x ds->addr=%#" PFMT64x " ds->at=%#" PFMT64x " ds->count=%#x ds->lines=%#x",
+			ds->index, len, left, ds->addr, ds->at, ds->count, ds->lines);
+		if (left < max_op_size && !count_bytes) {
+			R_LOG_DEBUG ("Not enough bytes to disassemble, going to retry");
+			goto retry;
+		}
+		const int real_oplen = ds->oplen;
+		int disasm_ret = ds_disassemble (ds, (ut8 *)ds_bufat (ds), left);
+		// hack over hack, this tracks metadata size vs instruction size vs padding
+		if (disasm_ret == ds->oplen) {
+			ds->oplen = disasm_ret;
 		} else {
-			int left = ds_left (ds);
-			R_LOG_DEBUG ("BEFORE: ds->index=%#x len=%#x left=%#x ds->addr=%#" PFMT64x " ds->at=%#" PFMT64x " ds->count=%#x ds->lines=%#x",
-				ds->index, len, left, ds->addr, ds->at, ds->count, ds->lines);
-			if (left < max_op_size && !count_bytes) {
-				R_LOG_DEBUG ("Not enough bytes to disassemble, going to retry");
-				goto retry;
-			}
-			const int real_oplen = ds->oplen;
-			int ret = ds_disassemble (ds, (ut8 *)ds_bufat (ds), left);
-			// hack over hack, this tracks metadata size vs instruction size vs padding
-			if (ret == ds->oplen) {
-				ds->oplen = ret;
-			} else {
-				ds->oplen = real_oplen; // overwritten by ds_disassemble
-			}
-			R_LOG_DEBUG ("AFTER: ret=%d len=%#x left=%#x ds->addr=%#" PFMT64x " ds->at=%#" PFMT64x " ds->count=%#x ds->lines=%#x",
-				ret, len, left, ds->addr, ds->at, ds->count, ds->lines);
-			if (ret == -31337) {
-				inc = ds->oplen; // minopsz maybe? or we should add invopsz
-				continue;
-			}
+			ds->oplen = real_oplen; // overwritten by ds_disassemble
+		}
+		R_LOG_DEBUG ("AFTER: ret=%d len=%#x left=%#x ds->addr=%#" PFMT64x " ds->at=%#" PFMT64x " ds->count=%#x ds->lines=%#x",
+			disasm_ret, len, left, ds->addr, ds->at, ds->count, ds->lines);
+		if (disasm_ret == -31337) {
+			inc = ds->oplen; // minopsz maybe? or we should add invopsz
+			continue;
 		}
 
 		ds_atabs_option (ds);
@@ -7876,8 +7966,8 @@ R_IPI int r_core_print_disasm_json_ipi(RCore *core, ut64 addr, ut8 *buf, int nb_
 		}
 	}
 	core->addr = addr;
+	r_core_seek_arch_bits (core, addr);
 
-	// TODO: add support for anal hints
 	// If using #bytes i = j
 	// If using #opcodes, j is the offset from start address. i is the
 	// offset in current disassembly buffer (256 by default)
@@ -7887,7 +7977,6 @@ R_IPI int r_core_print_disasm_json_ipi(RCore *core, ut64 addr, ut8 *buf, int nb_
 	// k = delta from addr
 	ds = ds_init (core, true);
 	bool result = false;
-	const bool be = R_ARCH_CONFIG_IS_BIG_ENDIAN (core->rasm->config);
 
 	r_cons_break_push (core->cons, NULL, NULL);
 	for (;;) {
@@ -7899,7 +7988,10 @@ R_IPI int r_core_print_disasm_json_ipi(RCore *core, ut64 addr, ut8 *buf, int nb_
 		int skip_bytes_flag = 0, skip_bytes_bb = 0;
 
 		at = addr + k;
-		ds_hint_begin (ds, ds->at);
+		r_core_seek_arch_bits (core, at);
+		ds->at = at;
+		ds_hint_begin (ds, at);
+		const bool be = R_ARCH_CONFIG_IS_BIG_ENDIAN (core->rasm->config);
 		r_asm_set_pc (core->rasm, at);
 		// 32 is the biggest opcode length in intel
 		// Make sure we have room for it
@@ -7967,7 +8059,6 @@ R_IPI int r_core_print_disasm_json_ipi(RCore *core, ut64 addr, ut8 *buf, int nb_
 			}
 		}
 		ds->oplen = asmop.size;
-		ds->at = at;
 		skip_bytes_flag = handleMidFlags (core, ds, false);
 		if (ds->midbb) {
 			skip_bytes_bb = handleMidBB (core, ds);
@@ -8066,13 +8157,13 @@ R_IPI int r_core_print_disasm_json_ipi(RCore *core, ut64 addr, ut8 *buf, int nb_
 		}
 		/* add flags */
 		{
-			const RList *flags = r_flag_get_list (core->flags, at);
+			const RVecFlagItemPtr *flags = r_flag_get_vec (core->flags, at);
 			RFlagItem *flag;
-			RListIter *iter;
-			if (flags && !r_list_empty (flags)) {
+			RFlagItem **iter;
+			if (flags && !RVecFlagItemPtr_empty (flags)) {
 				pj_k (pj, "flags");
 				pj_a (pj);
-				r_list_foreach (flags, iter, flag) {
+				r_flag_item_vec_foreach (flags, iter, flag) {
 					pj_s (pj, flag->name);
 				}
 				pj_end (pj);
@@ -8508,6 +8599,7 @@ toro:
 					r_cons_println (core->cons, opstr);
 				}
 				free (tmpopstr);
+				r_anal_op_fini (&analop);
 			} else {
 				char *asm_str = strdup (asmop.mnemonic);
 				if (asm_ucase) {
@@ -8547,6 +8639,7 @@ toro:
 				}
 			}
 		}
+		r_anal_op_fini (&asmop);
 		i += ret;
 	}
 	r_anal_op_fini (&asmop);

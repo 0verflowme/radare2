@@ -7,8 +7,8 @@
 
 #include "../bin/format/pdb/pdb_downloader.h"
 
-R_IPI bool bin_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count);
-R_IPI bool bin_raw_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count);
+R_IPI bool bin_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count, int type_filter);
+R_IPI bool bin_raw_strings(RCore *core, PJ *pj, int mode, int va, ut64 skip, ut64 count, int type_filter);
 
 // clang-format off
 static RCoreHelpMessage help_msg_ih = {
@@ -46,11 +46,13 @@ static RCoreHelpMessage help_msg_ic = {
 	"ic-", "[klass.method]", "delete method",
 	"ic-", "[klass..field]", "delete field",
 	"ic-", "[klass:base]", "delete inheritance relation",
-	"ic+", "[klass]", "add new class at current seek",
+	"ic+", "[klass]", "add new class at current seek (see ic+?)",
 	"ic+", "[klass.method]", "add new method at current seek",
 	"ic+", "[klass..field] [type]", "add new field at current seek",
 	"ic+", "[klass:base]", "add inheritance relation",
-	"icc", " [lang]", "List classes, methods and fields in Header Format (see bin.lang=swift,java,objc,cxx)",
+	"icc", " [lang]", "List classes, methods and fields in Header Format",
+	"iccj", "", "List classes, methods and fields in JSON format",
+	"iccl", "[j]", "List supported icc languages",
 	"icg", " [str]", "List classes hirearchy graph with agn/age (match str if provided)",
 	"icq", "", "List classes, in quiet mode (just the classname)",
 	"icqq", "", "List classes, in quieter mode (only show non-system classnames)",
@@ -58,6 +60,66 @@ static RCoreHelpMessage help_msg_ic = {
 	"ics", "", "Show class symbols in an easy to parse format",
 	NULL
 };
+
+static RCoreHelpMessage help_msg_icplus = {
+	"Usage: ic+", "[klass](.method|..field) ([attr ..])", "Add classes, methods and fields",
+	"ic+", "[klass] ([attr ..])", "add new class at current seek",
+	"ic+", "[klass.method] ([attr ..])", "add new method at current seek",
+	"ic+", "[klass..field] [type] ([attr ..])", "add new field at current seek",
+	"ic+", "[klass:base]", "add inheritance relation",
+	"ic+??", "", "show usage examples",
+	"", "[attr]", "attribute words: getter, static, final, ..",
+	"", "key=value", "numeric or string keys: size=, offset=, ns=, lang=",
+	NULL
+};
+
+static RCoreHelpMessage help_msg_icplus_examples = {
+	"Examples:", "", "",
+	"ic+Foo", " size=32 abstract", "class Foo with 32 byte instances, abstract",
+	"ic+Foo:Bar", "", "class Foo extends Bar",
+	"ic+Foo.get_x", " getter @ 0x1234", "getter method at the given address",
+	"ic+Foo._new", " factory", "factory method (static constructor)",
+	"ic+Foo..count", " int offset=0x10 final", "final int field at struct offset 0x10",
+	"ic+Foo..name", " property static", "static property",
+	NULL
+};
+
+static const char *classdump_langs[] = {
+	"c",
+	"objc",
+	"java",
+	"kotlin",
+	"swift",
+	"cxx",
+	"c++",
+	"dart",
+	"cil",
+	"dotnet",
+	"csharp",
+	NULL
+};
+
+static void icc_langs(RCore *core, bool json) {
+	const char **lang = classdump_langs;
+	if (json) {
+		PJ *pj = pj_new ();
+		if (!pj) {
+			return;
+		}
+		pj_a (pj);
+		for (; *lang; lang++) {
+			pj_s (pj, *lang);
+		}
+		pj_end (pj);
+		char *s = pj_drain (pj);
+		r_cons_print (core->cons, s);
+		free (s);
+	} else {
+		for (; *lang; lang++) {
+			r_cons_println (core->cons, *lang);
+		}
+	}
+}
 
 static RCoreHelpMessage help_msg_ii = {
 	"Usage: ii", "[+-?cj*,]", "List/edit imports (volatile, does not modify the binary)",
@@ -79,20 +141,22 @@ static RCoreHelpMessage help_msg_iy = {
 };
 
 static RCoreHelpMessage help_msg_iz = {
-	"Usage: iz", "[?jq*] ([skip] [count])", "List strings",
+	"Usage: iz", "[?jq*auwWb] ([skip] [count])", "List strings",
 	"iz", " ([skip]) ([count])", "strings in data sections (skip N strings, show count)",
 	"iz.", "", "show string at current address",
 	"iz,", "[:help]", "perform a table query on strings listing",
 	"iz-", " ([addr]) ([len]) ([type])", "delete string at address (uses current seek if addr not specified, len/type for matching)",
 	"iz+", " [addr] ([len]) ([type])", "add string manually (len=auto, type=auto-detect)",
 	"iz*", "", "print flags and comments r2 commands for all the strings",
+	"iz[auwWb]", "", "filter by string type (ascii, utf8, utf16, utf32, base64)",
 	"izc", "", "count the strings in data sections",
 	"izj", "", "strings in data sections in JSON format",
 	"izj.", "", "show string at current address in JSON",
 	"izjq", "", "strings in data sections in quiet JSON (just vaddr and string)",
 	"izq", "[q]", "strings in data sections in quiet (and quieter) mode",
 	"izq.", "", "show string at current address (quiet)",
-	"izz", "[jq*] ([skip]) ([count])", "search for strings in the whole binary",
+	"izz", "[jq*auwWb] ([skip]) ([count])", "search for strings in the whole binary",
+	"izz[auwWb]", "", "filter by string type (ascii, utf8, utf16, utf32, base64)",
 	"izzc", "", "count the strings in the whole binary",
 	"izzz", "[jq]", "dump strings from whole binary to r2 shell (for huge files)",
 	"izzzc", "", "count the strings dumped from the whole binary",
@@ -262,7 +326,7 @@ static void classdump_keys(RCore *core, RBinObject *bo) {
 			r_cons_printf (core->cons, "klass.%s.field.%s.%s=0x%" PFMT64x "\n", kname, kind, fname, addr);
 		}
 		R_VEC_FOREACH (&k->methods, m) {
-			char *attr = r_bin_attr_tostring (m->attr, true);
+			char *attr = r_bin_attr_tostring (m->attr.flags, true);
 			const char *mname = r_bin_name_tostring2 (m->name, 'f');
 			const ut64 addr = iova? m->vaddr: m->paddr;
 			r_cons_printf (core->cons, "klass.%s.method.%s.%s=0x%" PFMT64x "\n", kname, r_str_get (attr), mname, addr);
@@ -300,7 +364,7 @@ static void cmd_info_demangle(RCore *core, const char *input, PJ *pj, int mode) 
 		}
 		text = args;
 	}
-	int lang_type = r_bin_demangle_type (lang);
+	RBinLanguage lang_type = r_bin_demangle_type (lang);
 	if (lang_type == R_BIN_LANG_NONE) {
 		if (!pj) {
 			r_bin_demangle_list (core->bin);
@@ -981,6 +1045,14 @@ static RBinClass *cmd_ic_find_class(RList *klasses, const char *klass_name) {
 	return NULL;
 }
 
+static void cmd_ic_set_default_lang(RCore *core, RBinAttr *attr) {
+	const char *name = r_config_get (core->config, "bin.lang");
+	RBinLanguage lang = r_bin_lang_fromstring (name);
+	if (lang) {
+		attr->lang = lang;
+	}
+}
+
 static RBinClass *cmd_ic_get_or_add_class(RCore *core, RList *klasses, const char *klass_name) {
 	RBinClass *klass = cmd_ic_find_class (klasses, klass_name);
 	if (klass) {
@@ -993,6 +1065,7 @@ static RBinClass *cmd_ic_get_or_add_class(RCore *core, RList *klasses, const cha
 	klass = r_bin_file_add_class (bf, klass_name, NULL, 0);
 	if (klass) {
 		klass->origin = R_BIN_CLASS_ORIGIN_USER;
+		cmd_ic_set_default_lang (core, &klass->attr);
 	}
 	return klass;
 }
@@ -1146,10 +1219,23 @@ static void cmd_ic_sub(RCore *core, const char *input) {
 	free (klass_name);
 }
 
+static void cmd_ic_field_update(RBinField *f, const char *s) {
+	char *type = r_bin_attr_update (&f->attr, s);
+	if (type) {
+		r_bin_name_free (f->type);
+		f->type = r_bin_name_new (type);
+		free (type);
+	}
+}
+
 void cmd_ic_add(RCore *core, const char *input) {
 	const char ch0 = *input;
 	if (ch0 == 0 || ch0 == '?') {
-		r_cons_cmd_help_match (core->cons, help_msg_ic, "ic+", 0, true);
+		if (ch0 == '?' && input[1] == '?') {
+			r_cons_cmd_help (core->cons, help_msg_icplus_examples);
+		} else {
+			r_cons_cmd_help (core->cons, help_msg_icplus);
+		}
 		return;
 	}
 	RList *klasses = r_bin_get_classes (core->bin);
@@ -1182,18 +1268,19 @@ void cmd_ic_add(RCore *core, const char *input) {
 		R_VEC_FOREACH (&klass->fields, f) {
 			const char *fname = r_bin_name_tostring (f->name);
 			if (fname && !strcmp (fname, field_name)) {
+				cmd_ic_field_update (f, tail);
 				free (klass_name);
 				return;
 			}
 		}
 		f = RVecRBinField_emplace_back (&klass->fields);
+		memset (f, 0, sizeof (*f));
 		f->name = r_bin_name_new (field_name);
-		if (R_STR_ISNOTEMPTY (tail)) {
-			f->type = r_bin_name_new (tail);
-		}
 		f->paddr = core->addr;
 		f->vaddr = core->addr;
-		f->kind = R_BIN_FIELD_KIND_FIELD;
+		f->attr.kind = R_BIN_FIELD_KIND_FIELD;
+		cmd_ic_set_default_lang (core, &f->attr);
+		cmd_ic_field_update (f, tail);
 		free (klass_name);
 		return;
 	}
@@ -1224,8 +1311,10 @@ void cmd_ic_add(RCore *core, const char *input) {
 		free (klass_name);
 		return;
 	}
+	char *rest = NULL;
 	if (method_name == NULL) {
 		klass->addr = core->addr;
+		rest = r_bin_attr_update (&klass->attr, tail);
 	} else {
 		ut64 pa = core->addr; // XXX
 		ut64 va = core->addr;
@@ -1239,13 +1328,20 @@ void cmd_ic_add(RCore *core, const char *input) {
 			}
 		}
 		if (!found) {
-			RBinSymbol *sym = RVecRBinSymbol_emplace_back (&klass->methods);
-			sym->name = r_bin_name_new (method_name);
-			sym->paddr = pa;
-			sym->vaddr = va;
+			m = RVecRBinSymbol_emplace_back (&klass->methods);
+			memset (m, 0, sizeof (*m));
+			m->name = r_bin_name_new (method_name);
+			m->paddr = pa;
+			m->vaddr = va;
+			cmd_ic_set_default_lang (core, &m->attr);
 			cmd_ic_invalidate_method_cache (core);
 		}
+		rest = r_bin_attr_update (&m->attr, tail);
 	}
+	if (R_STR_ISNOTEMPTY (rest)) {
+		R_LOG_WARN ("Ignored unknown tokens: %s", rest);
+	}
+	free (rest);
 	free (klass_name);
 }
 
@@ -1453,7 +1549,7 @@ static void cmd_ic0(RCore *core, RBinObject *obj, int mode, PJ *pj, bool is_arra
 				r_cons_printf (core->cons, "class %s\n", kname);
 				if (!names_only) {
 					R_VEC_FOREACH (&cls->methods, sym) {
-						char *flags = r_core_bin_attr_tostring (core, sym->attr, true);
+						char *flags = r_core_bin_attr_tostring (core, sym->attr.flags, true);
 						const char *name = r_bin_name_tostring (sym->name);
 						r_cons_printf (core->cons, "0x%08" PFMT64x " method %s %-4s %s\n", iova? sym->vaddr: sym->paddr, kname, flags, name);
 						free (flags);
@@ -1473,7 +1569,7 @@ static void cmd_ic0(RCore *core, RBinObject *obj, int mode, PJ *pj, bool is_arra
 			r_cons_printf (core->cons, "class %s\n", kname);
 			if (!names_only) {
 				R_VEC_FOREACH (&cls->methods, sym) {
-					char *flags = r_core_bin_attr_tostring (core, sym->attr, true);
+					char *flags = r_core_bin_attr_tostring (core, sym->attr.flags, true);
 					const char *name = r_bin_name_tostring (sym->name);
 					r_cons_printf (core->cons, "0x%08" PFMT64x " method %s %-4s %s\n", iova? sym->vaddr: sym->paddr, kname, flags, name);
 					free (flags);
@@ -1560,6 +1656,10 @@ static void cmd_ic(RCore *core, const char *input, PJ *pj, bool is_array, bool v
 					char kcmd[] = { 'i', 'c', cmd, 0};
 					r_cons_cmd_help_match (core->cons, help_msg_ic, kcmd, 0, false);
 				}
+				break;
+			}
+			if (cmd == 'c' && input[1] == 'l') { // "iccl"
+				icc_langs (core, input[2] == 'j');
 				break;
 			}
 			const bool is_jvm = isjvm (core);
@@ -1668,10 +1768,10 @@ static void cmd_ic(RCore *core, const char *input, PJ *pj, bool is_array, bool v
 								if (at < min) {
 									min = at;
 								}
-								if (at + sym->size > max) {
-									max = at + sym->size;
+								if (at + sym->attr.size > max) {
+									max = at + sym->attr.size;
 								}
-								if (addr >= at && addr <= at + sym->size) {
+								if (addr >= at && addr <= at + sym->attr.size) {
 									method = r_bin_name_tostring (sym->name);
 								}
 							}
@@ -1689,6 +1789,11 @@ static void cmd_ic(RCore *core, const char *input, PJ *pj, bool is_array, bool v
 					}
 					break;
 				case 'c': // "icc"
+					if (input[1] == 'j') { // "iccj"
+						mode = R_MODE_JSON;
+						RBININFO ("classes", R_CORE_BIN_ACC_CLASSES, NULL, r_list_length (bo->classes));
+						break;
+					}
 					mode = R_MODE_CLASSDUMP;
 					if (mode == '*') {
 						mode |= R_MODE_RADARE;
@@ -1839,12 +1944,13 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 		r_cons_printf (core->cons, "%" PFMT64u "\n", total);
 		return;
 	}
-	// Parse command: iz[z][z][jq*] [skip] [count]
+	// Parse command: iz[z][z][jq*auwWb] [skip] [count]
 	const char *p = input + 1;
 	bool raw = false; // izz = raw strings from whole binary
 	bool rdump = false; // izzz = dump mode
 	ut64 skip = 0;
 	ut64 count = 0;
+	int type_filter = 0; // 0 = no filter, 'a'=ascii, 'u'=utf8, 'w'=wide, 'W'=wide32, 'b'=base64
 	// Count 'z' characters
 	while (*p == 'z') {
 		if (!raw) {
@@ -1863,6 +1969,25 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 			RVecRBinString_free (strings);
 		}
 		return;
+	}
+	// Parse type filter suffix (a, u, w, W, b) — not supported in izzz dump mode
+	if (!rdump) {
+		if (*p == 'a') {
+			type_filter = R_STRING_TYPE_ASCII;
+			p++;
+		} else if (*p == 'u') {
+			type_filter = R_STRING_TYPE_UTF8;
+			p++;
+		} else if (*p == 'w') {
+			type_filter = R_STRING_TYPE_WIDE;
+			p++;
+		} else if (*p == 'W') {
+			type_filter = R_STRING_TYPE_WIDE32;
+			p++;
+		} else if (*p == 'b') {
+			type_filter = R_STRING_TYPE_BASE64;
+			p++;
+		}
 	}
 	// Parse suffix (j, jq, qj, q, qq, *, ,)
 	bool local_pj = false;
@@ -1912,9 +2037,12 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 		if (list) {
 			ut64 addr = core->addr;
 			RBinString *string;
-			R_VEC_FOREACH (list, string) {
-				ut64 vaddr = va? string->vaddr: string->paddr;
-				if (vaddr == addr || string->paddr == addr) {
+		R_VEC_FOREACH (list, string) {
+			ut64 vaddr = va? string->vaddr: string->paddr;
+			if (type_filter && string->type != type_filter) {
+				continue;
+			}
+			if (vaddr == addr || string->paddr == addr) {
 					if (mode & R_MODE_JSON) {
 						PJ *lpj = r_core_pj_new (core);
 						pj_o (lpj);
@@ -1967,7 +2095,7 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 			RVecRBinString_free (res);
 		}
 	} else if (raw) {
-		bin_raw_strings (core, pj, mode, va, skip, count);
+		bin_raw_strings (core, pj, mode, va, skip, count, type_filter);
 	} else {
 		RList *bfiles = r_core_bin_files (core);
 		RListIter *iter;
@@ -1975,7 +2103,7 @@ static void cmd_iz(RCore *core, PJ *pj, int mode, int is_array, bool va, const c
 		RBinFile *cur = core->bin->cur;
 		r_list_foreach (bfiles, iter, bf) {
 			core->bin->cur = bf;
-			bin_strings (core, pj, mode, va, skip, count);
+			bin_strings (core, pj, mode, va, skip, count, type_filter);
 		}
 		core->bin->cur = cur;
 		r_list_free (bfiles);
@@ -2018,9 +2146,9 @@ static void cmd_iSm(RCore *core, const char *input, PJ **_pj, int mode, const bo
 				if (inrange (sec, sym)) {
 					pj_o (pj);
 					pj_ks (pj, "name", r_bin_name_tostring (sym->name));
-					if (sym->size > 0) {
-						pj_ki (pj, "size", sym->size);
-						pj_kd (pj, "percent", (sym->size * 100) / vsize);
+					if (sym->attr.size > 0) {
+						pj_ki (pj, "size", sym->attr.size);
+						pj_kd (pj, "percent", (sym->attr.size * 100) / vsize);
 					}
 					pj_end (pj);
 				}
@@ -2043,7 +2171,7 @@ static void cmd_iSm(RCore *core, const char *input, PJ **_pj, int mode, const bo
 				r_cons_newline (core->cons);
 				R_VEC_FOREACH (symbols, sym) {
 					if (inrange (sec, sym)) {
-						r_cons_printf (core->cons, "    - %8d %s\n", sym->size, r_bin_name_tostring (sym->name));
+						r_cons_printf (core->cons, "    - %8u %s\n", sym->attr.size, r_bin_name_tostring (sym->name));
 					}
 				}
 			}
@@ -2922,7 +3050,7 @@ static int idd_symbol_size(RCore *core, const char *name) {
 		R_VEC_FOREACH (symbols, sym) {
 			const char *sname = r_bin_name_tostring2 (sym->name, 'o');
 			if (!strcmp (sname, name) || (r_str_startswith (sname, "sym.") && !strcmp (sname + 4, name))) {
-				return sym->size;
+				return sym->attr.size;
 			}
 		}
 	}
@@ -2958,7 +3086,7 @@ static void cmd_iddlg(RCore *core) {
 	Sdb *seen = sdb_new0 ();
 	RBinSymbol *sym;
 	R_VEC_FOREACH (symbols, sym) {
-		if (sym->is_imported || !sym->type || strcmp (sym->type, R_BIN_TYPE_OBJECT_STR) || sym->size < 1) {
+		if (sym->is_imported || !sym->type || strcmp (sym->type, R_BIN_TYPE_OBJECT_STR) || sym->attr.size < 1) {
 			continue;
 		}
 		if (!sym->bind || strcmp (sym->bind, "GLOBAL")) {
@@ -2972,7 +3100,7 @@ static void cmd_iddlg(RCore *core) {
 			continue;
 		}
 		sdb_set (seen, name, "1", 0);
-		r_cons_printf (core->cons, "f sym.%s %u @ 0x%" PFMT64x "\n", name, sym->size, sym->vaddr);
+		r_cons_printf (core->cons, "f sym.%s %u @ 0x%" PFMT64x "\n", name, sym->attr.size, sym->vaddr);
 	}
 	sdb_free (seen);
 }
@@ -3515,6 +3643,11 @@ static int cmd_info(void *data, const char *input) {
 		case 'e': // "ie?"
 			r_cons_cmd_help (core->cons, help_msg_ie);
 			break;
+		case ':': // "i:?"
+			if (r_bin_cmd (core->bin, "?")) {
+				break;
+			}
+			// fallthrough
 		default:
 			r_cons_cmd_help_match (core->cons, help_msg_i, cmd, 0, false);
 			break;
@@ -3834,7 +3967,7 @@ static int cmd_info(void *data, const char *input) {
 		cmd_info_demangle (core, input, pj, mode);
 		break;
 	case ':': // "i:"
-		if (!r_bin_cmd (core->bin, input)) {
+		if (!r_bin_cmd (core->bin, input + 1)) {
 			R_LOG_ERROR ("Unhandled RBinPlugin.cmd");
 		}
 		break;

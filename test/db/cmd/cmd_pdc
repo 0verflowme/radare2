@@ -7,9 +7,23 @@ pdc @ main~250382
 pdc @ main~strcmp
 EOF
 EXPECT=<<EOF
-        dword [s2] = str.250382 // [0x804858f:4]=0x33303532 // "250382" // const char *s2
-        sym.imp.strcmp () // int strcmp("", "250382")
-        sym.imp.strcmp () // int strcmp("", "250382")
+    dword [s2] = str.250382 // [0x804858f:4]=0x33303532 // "250382" // const char *s2
+    sym.imp.strcmp () // int strcmp("", "250382")
+    sym.imp.strcmp () // int strcmp("", "250382")
+EOF
+RUN
+
+NAME=pdc dedup dalvik call comments
+FILE=bins/dex/HelloWorld.dex
+CMDS=<<EOF
+e scr.color=0
+af
+pdc~println
+pdc~LHello.foo
+EOF
+EXPECT=<<EOF
+    call Ljava/io/PrintStream.println(Ljava/lang/String;)V // 0x5 {v0, v1} // sym.imp.Ljava_io_PrintStream.method.println_Ljava_lang_String__V(0x0, 0x0, 0x0, 0x0)
+    call LHello.foo(I)V // 0x1 {v0, v1} // method.public.LHello.LHello.method.foo_I_V(0x0, 0x0)
 EOF
 RUN
 
@@ -103,9 +117,8 @@ EXPECT=<<EOF
 \           0x00402076      ff1584304000   call dword [ExitProcess]    ; 0x403084 ; VOID ExitProcess(UINT uExitCode)
 // callconv: eax cdecl (stack);
 void entry0 (void) {
-        si = 3
-        fcn.00402000 ()
-        
+    si = 3
+    fcn.00402000 ()
     do {
         push (0)
         push ("LABEL") // 0x40100e // (pstr 0x0040100e) "LABEL"
@@ -118,55 +131,54 @@ void entry0 (void) {
         si--
         v = si - 0
     } while (si > 0);
-    loc_0x00402042:
-        eax = dword [puts] // [0x4030dc:4]=0x30e8 reloc.crtdll.dll_puts // reloc.crtdll.dll_puts
-        push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
-        eax ()        // (pstr 0x0040100e) "LABEL" // reloc.crtdll.dll_puts // int puts("Hello, World!")
-        dword [GetProcessHeap] () // 0x403088 // (pstr 0x00401000) "Hello, World!" // reloc.kernel32.dll_GetProcessHeap // HANDLE GetProcessHeap(void)
-        push (eax)
-        push (">%p\\n") // 0x401014 // (pstr 0x00401014) ">%p\n"
-        dword [printf] () // 0x4030e0 // (pstr 0x0040100e) "LABEL" // reloc.crtdll.dll_printf // int printf(">%p\n", 0x30e8)
-        push (0)
-        push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
-        push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
-        push (0)
-        dword [MessageBoxA] () // 0x4030b8 // reloc.user32.dll_MessageBoxA // int MessageBoxA(0, 0x401000, 0x401000, 0)
-        push (0)
-        dword [ExitProcess] () // 0x403084 // reloc.kernel32.dll_ExitProcess // VOID ExitProcess(0)
+    eax = dword [puts] // [0x4030dc:4]=0x30e8 reloc.crtdll.dll_puts // reloc.crtdll.dll_puts
+    push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
+    eax ()        // reloc.crtdll.dll_puts // int puts("Hello, World!")
+    dword [GetProcessHeap] () // 0x403088 // reloc.kernel32.dll_GetProcessHeap // HANDLE GetProcessHeap(void)
+    push (eax)
+    push (">%p\\n") // 0x401014 // (pstr 0x00401014) ">%p\n"
+    dword [printf] () // 0x4030e0 // reloc.crtdll.dll_printf // int printf(">%p\n", 0x30e8)
+    push (0)
+    push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
+    push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
+    push (0)
+    dword [MessageBoxA] () // 0x4030b8 // reloc.user32.dll_MessageBoxA // int MessageBoxA(0, 0x401000, 0x401000, 0)
+    push (0)
+    dword [ExitProcess] () // 0x403084 // reloc.kernel32.dll_ExitProcess // VOID ExitProcess(0)
+    return eax;
 }
 
  0x0040200f |                                | // callconv: eax cdecl (stack);
  0x0040200f |                                | void entry0 (void) {
- 0x0040200f |         si = 3
- 0x00402013 |         fcn.00402000 ()
- 0x00402018 |         
+ 0x0040200f |     si = 3
+ 0x00402013 |     fcn.00402000 ()
  0x00402018 |     do {
  0x00402018 |         push (0)
  0x0040201a |         push ("LABEL") // 0x40100e // (pstr 0x0040100e) "LABEL"
  0x0040201f |         push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
  0x00402024 |         push (0)
- 0x00402026 |         dword [MessageBoxA] () // 0x4030b8 // (pstr 0x00401014) ">%p\n" // reloc.user32.dll_MessageBoxA // int MessageBoxA(0, 0x401000, 0x40100e, 0)
+ 0x00402026 |         dword [MessageBoxA] () // 0x4030b8 // reloc.user32.dll_MessageBoxA // int MessageBoxA(0, 0x401000, 0x40100e, 0)
  0x0040202c |         push ("LABEL") // 0x40100e // (pstr 0x0040100e) "LABEL"
  0x00402031 |         dword [puts] () // 0x4030dc // reloc.crtdll.dll_puts // int puts("LABEL")
  0x00402037 |         esp += 4      // (pstr 0x0040100e) "LABEL"
  0x0040203a |         si--
  0x0040203c |         v = si - 0
- 0x00402018 |     } while (si > 0);
- 0x00402042 |     loc_0x00402042:
- 0x00402042 |         eax = dword [puts] // [0x4030dc:4]=0x30e8 reloc.crtdll.dll_puts // reloc.crtdll.dll_puts
- 0x00402047 |         push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
- 0x0040204c |         eax ()        // (pstr 0x0040100e) "LABEL" // reloc.crtdll.dll_puts // int puts("Hello, World!")
- 0x0040204e |         dword [GetProcessHeap] () // 0x403088 // (pstr 0x00401000) "Hello, World!" // reloc.kernel32.dll_GetProcessHeap // HANDLE GetProcessHeap(void)
- 0x00402054 |         push (eax)
- 0x00402055 |         push (">%p\\n") // 0x401014 // (pstr 0x00401014) ">%p\n"
- 0x0040205a |         dword [printf] () // 0x4030e0 // (pstr 0x0040100e) "LABEL" // reloc.crtdll.dll_printf // int printf(">%p\n", 0x30e8)
- 0x00402060 |         push (0)
- 0x00402062 |         push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
- 0x00402067 |         push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
- 0x0040206c |         push (0)
- 0x0040206e |         dword [MessageBoxA] () // 0x4030b8 // (pstr 0x00402074) "j" // reloc.user32.dll_MessageBoxA // int MessageBoxA(0, 0x401000, 0x401000, 0)
- 0x00402074 |         push (0)
- 0x00402076 |         dword [ExitProcess] () // 0x403084 // reloc.kernel32.dll_ExitProcess // VOID ExitProcess(0)
+ 0x00402040 |     } while (si > 0);
+ 0x00402042 |     eax = dword [puts] // [0x4030dc:4]=0x30e8 reloc.crtdll.dll_puts // reloc.crtdll.dll_puts
+ 0x00402047 |     push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
+ 0x0040204c |     eax ()        // reloc.crtdll.dll_puts // int puts("Hello, World!")
+ 0x0040204e |     dword [GetProcessHeap] () // 0x403088 // reloc.kernel32.dll_GetProcessHeap // HANDLE GetProcessHeap(void)
+ 0x00402054 |     push (eax)
+ 0x00402055 |     push (">%p\\n") // 0x401014 // (pstr 0x00401014) ">%p\n"
+ 0x0040205a |     dword [printf] () // 0x4030e0 // reloc.crtdll.dll_printf // int printf(">%p\n", 0x30e8)
+ 0x00402060 |     push (0)
+ 0x00402062 |     push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
+ 0x00402067 |     push ("Hello, World!") // section..data // 0x401000 // (pstr 0x00401000) "Hello, World!"
+ 0x0040206c |     push (0)
+ 0x0040206e |     dword [MessageBoxA] () // 0x4030b8 // reloc.user32.dll_MessageBoxA // int MessageBoxA(0, 0x401000, 0x401000, 0)
+ 0x00402074 |     push (0)
+ 0x00402076 |     dword [ExitProcess] () // 0x403084 // reloc.kernel32.dll_ExitProcess // VOID ExitProcess(0)
+ 0x00402076 |     return eax;
  0x00402076 | }
 
 EOF
@@ -183,27 +195,23 @@ EOF
 EXPECT=<<EOF
 // callconv: x0 arm64 (x0, x1, x2, x3, x4, x5, x6, x7, stack);
 void sym.func.100003a54 (int64_t arg1, int64_t arg2) {
-        x8 = [x0 + 0x60] // arg1
-        x8 = [x8 + 0x60]
-        x9 = [x1 + 0x60] // arg2
-        x9 = [x9 + 0x60]
-        (a, b) = compare (x8, x9)
-        if (a <= b) goto 0x100003a74 // likely
-        return x0;
-    loc_0x100003a74:
-        if (a >= b) goto 0x100003a80 // likely
-        return x0;
-    loc_0x100003a80:
-        x8 = x1 + 0x68 // arg2
-        x1 = x0 + 0x68 // arg1
-        x0 = x8
-        goto sym.imp.strcoll // int strcoll("", "")
-    loc_0x100003a78: // orphan
-         w0 = -1
-
-    loc_0x100003a6c: // orphan
-         w0 = 1
-
+    x8 = [x0 + 0x60] // arg1
+    x8 = [x8 + 0x60]
+    x9 = [x1 + 0x60] // arg2
+    x9 = [x9 + 0x60]
+    v = x8 - x9
+    if (x8 > x9) {
+        w0 = 1
+    } else {
+        if (v < 0) {
+            w0 = -1
+        } else {
+            x8 = x1 + 0x68 // arg2
+            x1 = x0 + 0x68 // arg1
+            x0 = x8
+            goto sym.imp.strcoll // int strcoll("", "")
+        }
+    }
 }
 
 EOF
@@ -262,27 +270,23 @@ EOF
 EXPECT=<<EOF
  0x100003a54 |                                | // callconv: x0 arm64 (x0, x1, x2, x3, x4, x5, x6, x7, stack);
  0x100003a54 |                                | void sym.func.100003a54 (int64_t arg1, int64_t arg2) {
- 0x100003a54 |         x8 = [x0 + 0x60] // arg1
- 0x100003a58 |         x8 = [x8 + 0x60]
- 0x100003a5c |         x9 = [x1 + 0x60] // arg2
- 0x100003a60 |         x9 = [x9 + 0x60]
- 0x100003a64 |         (a, b) = compare (x8, x9)
- 0x100003a68 |         if (a <= b) goto 0x100003a74 // likely
- 0x100003a54 |         return x0;
- 0x100003a74 |     loc_0x100003a74:
- 0x100003a74 |         if (a >= b) goto 0x100003a80 // likely
- 0x100003a74 |         return x0;
- 0x100003a80 |     loc_0x100003a80:
- 0x100003a80 |         x8 = x1 + 0x68 // arg2
- 0x100003a84 |         x1 = x0 + 0x68 // arg1
- 0x100003a88 |         x0 = x8
- 0x100003a8c |         goto sym.imp.strcoll // int strcoll("", "")
- 0x100003a78 | loc_0x100003a78: // orphan
- 0x100003a78 |      w0 = -1
-
- 0x100003a6c | loc_0x100003a6c: // orphan
- 0x100003a6c |      w0 = 1
-
+ 0x100003a54 |     x8 = [x0 + 0x60] // arg1
+ 0x100003a58 |     x8 = [x8 + 0x60]
+ 0x100003a5c |     x9 = [x1 + 0x60] // arg2
+ 0x100003a60 |     x9 = [x9 + 0x60]
+ 0x100003a64 |     v = x8 - x9
+ 0x100003a68 |     if (x8 > x9) {
+ 0x100003a6c |         w0 = 1
+ 0x100003a68 |     } else {
+ 0x100003a74 |         if (v < 0) {
+ 0x100003a78 |             w0 = -1
+ 0x100003a74 |         } else {
+ 0x100003a80 |             x8 = x1 + 0x68 // arg2
+ 0x100003a84 |             x1 = x0 + 0x68 // arg1
+ 0x100003a88 |             x0 = x8
+ 0x100003a8c |             goto sym.imp.strcoll // int strcoll("", "")
+ 0x100003a74 |         }
+ 0x100003a68 |     }
  0x100003a8c | }
 
 EOF
@@ -301,16 +305,14 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (int64_t arg1) {
-        cr0 = (r3 == 0) // arg1
-        if (cr0 & FLG_EQ) goto 0x10 // likely
-        return r3;
-    loc_0x00000010:
+    cr0 = (r3 == 0) // arg1
+    if (!(cr0 & FLG_EQ)) {
+        r3 = 1        // "#"
+        return
+    } else {
         r3 = 0
         return
-    loc_0x00000008: // orphan
-         r3 = 1                   // "#"
-         return
-
+    }
 }
 
 EOF
@@ -332,9 +334,9 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        // ICOD XREF from fcn.00000000 @ 0x4(x)
-        r3 = [obj.myglobal]
-        return
+    // ICOD XREF from fcn.00000000 @ 0x4(x)
+    r3 = [obj.myglobal]
+    return
 }
 
 EOF
@@ -358,8 +360,8 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        r3 = "hello"
-        return
+    r3 = "hello"
+    return
 }
 
 EOF
@@ -380,8 +382,8 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (int64_t arg1) {
-        [obj.myglobal] = r5
-        return
+    [obj.myglobal] = r5
+    return
 }
 
 EOF
@@ -402,11 +404,11 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        // ICOD XREF from fcn.00000000 @ 0x4(x)
-        r9 = r2 + (0 << 16)
-        r3 = [obj.myglobal]
-        r4 = r9 + r9
-        return
+    // ICOD XREF from fcn.00000000 @ 0x4(x)
+    r9 = r2 + (0 << 16)
+    r3 = [obj.myglobal]
+    r4 = r9 + r9
+    return
 }
 
 EOF
@@ -426,10 +428,10 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        // ICOD XREF from fcn.00000000 @ 0x4(x)
-        r9 = r2 + (0 << 16)
-        r3 = [r9 - 0x7ff8] // 0x8008
-        return
+    // ICOD XREF from fcn.00000000 @ 0x4(x)
+    r9 = r2 + (0 << 16)
+    r3 = [r9 - 0x7ff8] // 0x8008
+    return
 }
 
 EOF
@@ -450,10 +452,10 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        // ICOD XREF from fcn.00000000 @ 0x4(x)
-        r3 = [obj.myglobal]
-        r9 = 0
-        return
+    // ICOD XREF from fcn.00000000 @ 0x4(x)
+    r3 = [obj.myglobal]
+    r9 = 0
+    return
 }
 
 EOF
@@ -475,10 +477,10 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        // ICOD XREFS from fcn.00000000 @ 0x4(x), 0x8(x)
-        r3 = [obj.first]
-        r4 = [obj.second]
-        return
+    // ICOD XREFS from fcn.00000000 @ 0x4(x), 0x8(x)
+    r3 = [obj.first]
+    r4 = [obj.second]
+    return
 }
 
 EOF
@@ -499,9 +501,9 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        // ICOD XREF from fcn.00000000 @ 0x4(x)
-        r9 = [obj.myglobal]
-        return
+    // ICOD XREF from fcn.00000000 @ 0x4(x)
+    r9 = [obj.myglobal]
+    return
 }
 
 EOF
@@ -522,10 +524,10 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        // ICOD XREF from fcn.00000000 @ 0x4(x)
-        r3 = [obj.myglobal]
-        r4 = r19 + r19
-        return
+    // ICOD XREF from fcn.00000000 @ 0x4(x)
+    r3 = [obj.myglobal]
+    r4 = r19 + r19
+    return
 }
 
 EOF
@@ -546,16 +548,17 @@ EOF
 EXPECT=<<EOF
  0x00000000 |                                | // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
  0x00000000 |                                | void fcn.00000000 (void) {
- 0x00000000 |         // ICOD XREF from fcn.00000000 @ 0x4(x)
- 0x00000004 |         r3 = [obj.myglobal]
- 0x00000008 |         return
+ 0x00000000 |     // ICOD XREF from fcn.00000000 @ 0x4(x)
+ 0x00000004 |     r3 = [obj.myglobal]
+ 0x00000008 |     return
  0x00000008 | }
 
 EOF
 RUN
 
-NAME=pdc emits goto on its own line
+NAME=pdc linear emits goto on its own line
 FILE=malloc://0x20
+ARGS=-e pdc.structured=0
 CMDS=<<EOF
 e asm.arch=ppc
 e asm.bits=64
@@ -593,7 +596,7 @@ pdc~return
 e asm.addr.relto
 EOF
 EXPECT=<<EOF
-        return
+    return
 func
 EOF
 RUN
@@ -607,8 +610,7 @@ af
 pdc*
 EOF
 EXPECT=<<EOF
-CCu base64:dm9pZCBmY24uMDAwMDAwMDAgKHZvaWQpIHs= @ 0x00000000
-CCu base64:ZWF4ID0gMA== @ 0x00000000
+CCu base64:dm9pZCBmY24uMDAwMDAwMDAgKHZvaWQpIHsKZWF4ID0gMA== @ 0x00000000
 CCu base64:cmV0dXJuIGVheA== @ 0x00000002
 EOF
 RUN
@@ -624,9 +626,9 @@ EOF
 EXPECT=<<EOF
 // callconv: v0 n32 (a0, a1, a2, a3, a4, a5, a6, a7, stack);
 void fcn.00000000 (int32_t arg1, int32_t arg2, int32_t arg3) {
-        v0 = a0 + a1  // arg2
-        v0 += a2      // arg3
-        ret
+    v0 = a0 + a1  // arg2
+    v0 += a2      // arg3
+    ret
 }
 
 EOF
@@ -644,8 +646,8 @@ EOF
 EXPECT=<<EOF
 // callconv: v0 n32 (a0, a1, a2, a3, a4, a5, a6, a7, stack);
 void fcn.00000000 (void) {
-        a0 = [obj.myglobal]
-        ret
+    a0 = [obj.myglobal]
+    ret
 }
 
 EOF
@@ -660,7 +662,7 @@ af
 pdc~a0 =
 EOF
 EXPECT=<<EOF
-        a0 = [gp - 0x7ff0] // [0x88010:4]=-1
+    a0 = [gp - 0x7ff0] // [0x88010:4]=-1
 EOF
 RUN
 
@@ -671,7 +673,7 @@ aaa
 pdc @ sym.updateCurNetworkSpeed~v0 = [obj
 EOF
 EXPECT=<<EOF
-        v0 = [obj.tc_meter_enable]
+    v0 = [obj.tc_meter_enable]
 EOF
 RUN
 
@@ -684,8 +686,8 @@ pdc~printf("Results
 pdc~printf("msg
 EOF2
 EXPECT=<<EOF2
-         sym.imp.printf () // int printf("Results : a : %u , b: %ld\n", 21, 21)
-         sym.imp.printf () // int printf("msg : %s\n", "")
+    sym.imp.printf () // int printf("Results : a : %u , b: %ld\n", 30, 0x2710)
+    sym.imp.printf () // int printf("msg : %s\n", "")
 EOF2
 RUN
 
@@ -697,7 +699,7 @@ s main
 pdc~printf("IOLI
 EOF2
 EXPECT=<<EOF2
-        sym.imp.printf () // int printf("IOLI Crackme Level 0x00\n")
+    sym.imp.printf () // int printf("IOLI Crackme Level 0x00\n")
 EOF2
 RUN
 
@@ -753,9 +755,9 @@ af
 pdc && ?e decompile-ok
 EOF
 EXPECT=<<EOF
-// callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, xmm0, xmm1, xmm2, xmm3, xmm4);
+// callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, stack);
 void fcn.00000000 (void) {
-        return
+    return
 }
 
 decompile-ok
@@ -782,7 +784,6 @@ ARGS=-a x86 -b 64
 CMDS=<<EOF
 wx 83ff01 7507 b801000000 eb05 b802000000 c3 @ 0
 af @ 0
-e pdc.structured=1
 pdc~if (,eax,else
 EOF
 EXPECT=<<EOF
@@ -793,9 +794,26 @@ EXPECT=<<EOF
 EOF
 RUN
 
-NAME=pdc structured default off keeps gotos
+NAME=pdc structured if-else on a flag-jump diamond
 FILE=malloc://64
 ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 83ff01 7807 b801000000 eb05 b802000000 c3 @ 0
+af @ 0
+e pdc.structured=1
+pdc~if (,eax,else
+EOF
+EXPECT=<<EOF
+    if (edi >= 1) {
+        eax = 1
+    } else {
+        eax = 2
+EOF
+RUN
+
+NAME=pdc linear keeps gotos with the structured renderer off
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=0
 CMDS=<<EOF
 wx 83ff01 7507 b801000000 eb05 b802000000 c3 @ 0
 af @ 0
@@ -820,16 +838,56 @@ EXPECT=<<EOF
 EOF
 RUN
 
-NAME=pdc structured bails to linear on loops
+# merged: pdc structured keeps the loop header body inside the loop
+NAME=pdc structured renders a self loop as do while
 FILE=bins/elf/ls
+ARGS=-e pdc.structured=1
 CMDS=<<EOF
 aa
-s 0x15c80
-e pdc.structured=1
-pdc~goto loc_0x15c60
+s 0x15e70
+pdc~do {,} while
+?e --
+aaa
+s 0x102b0
+pdc~while (true),eax += 0x30,break
 EOF
 EXPECT=<<EOF
-        if (!v) goto loc_0x15c60 // likely
+        do {
+        } while (rdx & rdx);
+--
+    while (true) {
+        eax += 0x30
+            break;
+EOF
+RUN
+
+NAME=pdc structured recovers continue and break in a loop body
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 31c0eb0c83c00183f80a7504c390909089c3ebf0
+af
+pdc~while (true),continue,break
+EOF
+EXPECT=<<EOF
+    while (true) {
+            continue;
+        break;
+EOF
+RUN
+
+NAME=pdc structured renders each jump table case with its own body
+FILE=bins/elf/ls
+CMDS=<<EOF
+aaa
+s 0x145b0
+pdc~switch (r12),case 0:,abort,break
+EOF
+EXPECT=<<EOF
+        switch (r12) { // jump table of 10 cases at 0x0001bca4
+            case 0: // 0x00004056
+                qword [reloc.abort] () // [0x21ca8:8]=0 // void abort(void)
+                break;
 EOF
 RUN
 
@@ -841,14 +899,14 @@ pdcj~{annotations[0]}
 pdcj~{annotations[1]}
 EOF
 EXPECT=<<EOF
-{"start":52,"end":116,"offset":134513504,"type":"offset"}
-{"start":116,"end":137,"offset":134513506,"type":"offset"}
+{"start":52,"end":112,"offset":134513504,"type":"offset"}
+{"start":112,"end":129,"offset":134513506,"type":"offset"}
 EOF
 RUN
 
-NAME=pdcj orphan annotations use the block address
+NAME=pdcj linear orphan annotations use the block address
 FILE=bins/mach0/ls-m1
-ARGS=-a arm -b64
+ARGS=-a arm -b64 -e pdc.structured=0
 CMDS=<<EOF
 s 0x100003a54
 af
@@ -857,15 +915,15 @@ pdcj~{annotations[11]}
 pdcj~{annotations[12]}
 EOF
 EXPECT=<<EOF
-{"start":519,"end":571,"offset":4294982284,"type":"offset"}
-{"start":571,"end":620,"offset":4294982264,"type":"offset"}
-{"start":620,"end":668,"offset":4294982252,"type":"offset"}
+{"start":505,"end":557,"offset":4294982284,"type":"offset"}
+{"start":557,"end":605,"offset":4294982264,"type":"offset"}
+{"start":605,"end":652,"offset":4294982252,"type":"offset"}
 EOF
 RUN
 
-NAME=pdc keeps a function's only orphan block
+NAME=pdc linear keeps a function's only orphan block
 FILE=malloc://32
-ARGS=-a x86 -b64
+ARGS=-a x86 -b64 -e pdc.structured=0
 CMDS=<<EOF
 wx 31c0c390b801000000c3
 af
@@ -873,21 +931,21 @@ afb+ 0 4 6
 pdc
 EOF
 EXPECT=<<EOF
-// callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, xmm0, xmm1, xmm2, xmm3, xmm4);
+// callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, stack);
 void fcn.00000000 (void) {
         eax = 0
         return eax
-             eax = 1
-         return 1
+        eax = 1
+        return 1
 
 }
 
 EOF
 RUN
 
-NAME=pdca renders an orphan block in the asm column layout
+NAME=pdca linear renders an orphan block in the asm column layout
 FILE=malloc://32
-ARGS=-a x86 -b64
+ARGS=-a x86 -b64 -e pdc.structured=0
 CMDS=<<EOF
 wx 31c0c390b801000000c3
 af
@@ -895,7 +953,7 @@ afb+ 0 4 6
 pdca
 EOF
 EXPECT=<<EOF
- 0x00000000 |                                | // callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, xmm0, xmm1, xmm2, xmm3, xmm4);
+ 0x00000000 |                                | // callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, stack);
  0x00000000 |                                | void fcn.00000000 (void) {
  0x00000000 | xor eax, eax                   |         eax = 0
  0x00000002 | ret                            |         return eax
@@ -918,9 +976,1035 @@ EOF
 EXPECT=<<EOF
 // callconv: r3 ppc-64 (r3, r4, r5, r6, r7, r8, r9, r10, stack);
 void fcn.00000000 (void) {
-        if (f0 >= 0.0) f1 = f0; else f1 = f2
-        return
+    if (f0 >= 0.0) f1 = f0; else f1 = f2
+    return
 }
 
+EOF
+RUN
+
+NAME=pdc linear keeps a renamed case tag on an orphan block untruncated
+FILE=bins/mach0/ls-m1
+ARGS=-a arm -b64 -e pdc.structured=0
+CMDS=<<EOF
+s 0x100003a54
+af
+f case.strcoll.result_when_greater_than_other @ 0x100003a78
+pdc~loc_0x100003a78,loc_0x100003a6c
+EOF
+EXPECT=<<EOF
+    loc_0x100003a78: // case result_when_greater_than_other
+    loc_0x100003a6c: // orphan
+EOF
+RUN
+
+NAME=pdc linear reads the case value of an orphan tag in decimal like the jmptbl writer
+FILE=bins/mach0/ls-m1
+ARGS=-a arm -b64 -e pdc.structured=0
+CMDS=<<EOF
+s 0x100003a54
+af
+f case.strcoll.65 @ 0x100003a78
+f case.strcoll.300 @ 0x100003a6c
+pdc~loc_0x100003a78,loc_0x100003a6c
+EOF
+EXPECT=<<EOF
+    loc_0x100003a78: // case 'A'
+    loc_0x100003a6c: // case 300
+EOF
+RUN
+
+NAME=pdc renders no switch default when the switch op has none
+FILE=bins/elf/boa-mips
+CMDS=<<EOF
+af @ 0x415694
+s 0x415694
+pdc~switch (,default:
+EOF
+EXPECT=<<EOF
+        switch (switch_var) { // jump table of 1 cases at 0x004156b8
+EOF
+RUN
+
+NAME=pdc structured keeps both arms of a loop header that branches inside the loop
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 85c0750583c001ebf783e80183f8057402ebedc3
+af
+pdc~while (true),eax += 1,eax -= 1,continue,break
+EOF
+EXPECT=<<EOF
+    while (true) {
+            eax += 1
+            eax -= 1
+                continue;
+            break;
+EOF
+RUN
+
+NAME=pdc structured ends every switch arm with an explicit transfer
+FILE=bins/elf/bomb
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+aaa
+s 0x400f43
+pdc~case ,goto loc_0x00400fbe
+EOF
+EXPECT=<<EOF
+                case 0: // 0x00400f7c
+                case 1: // 0x00400fb9
+                    goto loc_0x00400fbe;
+                case 2: // 0x00400f83
+                    goto loc_0x00400fbe;
+                case 3: // 0x00400f8a
+                    goto loc_0x00400fbe;
+                case 4: // 0x00400f91
+                    goto loc_0x00400fbe;
+                case 5: // 0x00400f98
+                    goto loc_0x00400fbe;
+                case 6: // 0x00400f9f
+                    goto loc_0x00400fbe;
+                case 7: // 0x00400fa6
+                    goto loc_0x00400fbe;
+EOF
+RUN
+
+NAME=pdc structured renders a repeated case target once and jumps to it
+FILE=bins/elf/ls
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+aaa
+s 0x5c40
+pdc~case 88:,loc_0x00005d80:,case 120:,goto loc_0x00005d80
+EOF
+EXPECT=<<EOF
+                                    case 88: // 'X' 0x00005d80
+                                        loc_0x00005d80:
+                                    case 120: // 'x' 0x00005d80
+                                        goto loc_0x00005d80;
+EOF
+RUN
+
+NAME=pdc structured strips a flag-named own edge instead of rendering it twice
+FILE=bins/elf/ls
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+aaa
+s 0x5c40
+pdc~goto case.~?
+pdc~switch (cl)~?
+pdc~if (((unsigned) v) <= 0) {~?
+EOF
+EXPECT=<<EOF
+0
+1
+2
+EOF
+RUN
+
+NAME=pdc structured keeps the body of a loop whose header jumps to itself
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 85c074fc83c00183f80575f4c3
+af
+pdc~while (true),eax += 1,continue,break
+EOF
+EXPECT=<<EOF
+    while (true) {
+            eax += 1
+                continue;
+            break;
+EOF
+RUN
+
+NAME=pdc structured labels no arm for an adjacent only case run
+FILE=bins/elf/ls
+CMDS=<<EOF
+aaa
+s 0x5c40
+pdc~case 48...55:,loc_0x00005d48:
+EOF
+EXPECT=<<EOF
+                                    case 48...55: // '0'..'7' 0x00005d48
+EOF
+RUN
+
+NAME=pdc structured renders both arms behind a loop secondary exit
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 85c0741483c00183f80574f483f807750483c002c383c003c3
+af
+pdc~loc_0x0000000c:,eax - 7,eax += 2,eax += 3
+EOF
+EXPECT=<<EOF
+    loc_0x0000000c:
+    v = eax - 7
+    if (!(eax - 7)) {
+        eax += 2
+        eax += 3
+EOF
+RUN
+
+NAME=pdc structured recovers arm64 b.cond operands from the cmp
+FILE=malloc://64
+ARGS=-a arm -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 1f00016b 6c000054 20008052 02000014 40008052 c0035fd6 @ 0
+af @ 0
+pdc~if (,w0 =,else
+pdc~cond_0x~?
+EOF
+EXPECT=<<EOF
+    if (w0 <= w1) {
+        w0 = 1
+    } else {
+        w0 = 2
+0
+EOF
+RUN
+
+NAME=pdc structured recovers arm32 b<cc> operands from the cmp
+FILE=malloc://64
+ARGS=-a arm -b 32 -e pdc.structured=1
+CMDS=<<EOF
+wx 010050e1 010000ca 0100a0e3 000000ea 0200a0e3 1eff2fe1 @ 0
+af @ 0
+pdc~if (,r0 =,else
+pdc~cond_0x~?
+EOF
+EXPECT=<<EOF
+    if (r0 <= r1) {
+        r0 = 1
+    } else {
+        r0 = 2
+0
+EOF
+RUN
+
+NAME=pdc structured ppc64 plt stub has no placeholder for the bcl get-pc idiom
+FILE=bins/elf/ppc64v1-more
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+s 0xdb14
+af
+pdc~cond_0x~?
+pdc~if (~?
+pdc~lr = pc
+EOF
+EXPECT=<<EOF
+0
+0
+    lr = pc + 4; goto 0xdae0
+EOF
+RUN
+
+NAME=pdc structured keeps a jump into another function as a transfer
+FILE=malloc://64
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx b801000000eb09 @ 0
+wx b802000000c3 @ 0x10
+af @ 0x10
+af+ 0 fcn.caller
+afb+ 0 0 7 0x10
+pdc @ 0
+EOF
+EXPECT=<<EOF
+// callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, stack);
+void fcn.caller (void) {
+    eax = 1
+    goto fcn.00000010;
+}
+
+EOF
+RUN
+
+NAME=pdc structured returns from a block that ends without a terminator
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx b805000000f4 @ 0
+af
+pdc
+pdco~return,}
+pdca~hlt,return,}
+pdcj~{annotations[2].offset}
+.pdc*
+CC
+EOF
+EXPECT=<<EOF
+// callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9, stack);
+void fcn.00000000 (void) {
+    eax = 5
+    hlt
+    return rax;
+}
+
+ 0x00000005 |     return rax;
+ 0x00000005 | }
+ 0x00000005 | hlt                            |     hlt
+ 0x00000005 |                                |     return rax;
+ 0x00000005 |                                | }
+5
+0x00000000 CCu "void fcn.00000000 (void) {\neax = 5"
+0x00000005 CCu "hlt\nreturn rax;"
+EOF
+RUN
+
+NAME=pdc structured recovers riscv unsigned branch operands
+FILE=malloc://64
+ARGS=-a riscv -b 64
+CMDS=<<EOF
+wx 6366b500 13051000 67800000 13052000 67800000 @ 0
+af @ 0
+pdc~if (,a0 =,else
+pdc~cond_0x~?
+EOF
+EXPECT=<<EOF
+    if ((unsigned)a0 >= a1) {
+        a0 = 1
+    } else {
+        a0 = 2
+0
+EOF
+RUN
+
+NAME=pdc structured recovers sparc b<cc> operands from the cmp
+FILE=malloc://64
+ARGS=-a sparc -b 32 -e cfg.bigendian=true
+CMDS=<<EOF
+wx 80a20009 04800005 01000000 90102001 81c3e008 01000000 90102002 81c3e008 01000000 @ 0
+af @ 0
+pdc~if (,o0 =,else
+pdc~cond_0x~?
+EOF
+EXPECT=<<EOF
+    if (o0 > o1) {
+        o0 = 1
+    } else {
+        o0 = 2
+0
+EOF
+RUN
+
+NAME=pdc structured renders an s390 diamond
+FILE=bins/elf/ls-s390x
+CMDS=<<EOF
+af @ 0x176d8
+pdc @ 0x176d8~if (cc,} else {,r3 = 0x38
+EOF
+EXPECT=<<EOF
+    if (cc != 0) {
+        r3 = 0x38
+    } else {
+        r3 = 0x38
+EOF
+RUN
+
+NAME=pdc modes render an if and else through the structured renderer
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 83ff01 7507 b801000000 eb05 b802000000 c3 @ 0
+af @ 0
+pdco~if (,eax,else,}
+pdca~if (,eax,else,},jmp
+pdc*
+pdcj~{annotations[1].offset}
+pdcj~{annotations[1].type}
+pdcj~{annotations[3].offset}
+pdcj~} else {~?
+EOF
+EXPECT=<<EOF
+ 0x00000003 |     if (!(edi - 1)) {
+ 0x00000005 |         eax = 1
+ 0x00000003 |     } else {
+ 0x0000000c |         eax = 2
+ 0x00000003 |     }
+ 0x00000011 | }
+ 0x00000003 | jne 0xc                        |     if (!(edi - 1)) {
+ 0x00000005 | mov eax, 1                     |         eax = 1
+ 0x0000000a | jmp 0x11
+ 0x00000003 |                                |     } else {
+ 0x0000000c | mov eax, 2                     |         eax = 2
+ 0x00000003 |                                |     }
+ 0x00000011 |                                | }
+CCu base64:dm9pZCBmY24uMDAwMDAwMDAgKGludDY0X3QgYXJnMSkgewp2ID0gZWRpIC0gMSAgIC8vIGFyZzE= @ 0x00000000
+CCu base64:aWYgKCEoZWRpIC0gMSkpIHsKfSBlbHNlIHsKfQ== @ 0x00000003
+CCu base64:ZWF4ID0gMQ== @ 0x00000005
+CCu base64:ZWF4ID0gMg== @ 0x0000000c
+CCu base64:Ly8gQ09ERSBYUkVGIGZyb20gZmNuLjAwMDAwMDAwIEAgMHhhKHgpCnJldHVybg== @ 0x00000011
+3
+offset
+3
+1
+EOF
+RUN
+
+NAME=pdc modes anchor a transfer on the jump that performs it
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 83c701 83ff05 7d0e 83ff09 7407 b801000000 ebec c3 90 b802000000 c3 @ 0
+af @ 0
+pdco~break,continue,goto,else
+pdca~if (,break,continue,goto
+.pdc*
+CC
+EOF
+EXPECT=<<EOF
+ 0x00000006 |             break;
+ 0x00000012 |             continue;
+ 0x0000000b |         } else {
+ 0x0000000b |             goto loc_0x00000014;
+ 0x00000006 | jge 0x16                       |         if (edi >= 5) {
+ 0x00000006 |                                |             break;
+ 0x0000000b | je 0x14                        |         if (edi != 9) {
+ 0x00000012 | jmp fcn.00000000               |             continue;
+ 0x0000000b |                                |             goto loc_0x00000014;
+0x00000000 CCu "void fcn.00000000 (int64_t arg1) {\nwhile (true) {\n// CODE XREF from fcn.00000000 @ 0x12(x)\nedi += 1      // arg1\n}"
+0x00000003 CCu "v = edi - 5   // arg1"
+0x00000006 CCu "if (edi >= 5) {\nbreak;\n}"
+0x00000008 CCu "v = edi - 9   // arg1"
+0x0000000b CCu "if (edi != 9) {\n} else {\ngoto loc_0x00000014;\n}"
+0x0000000d CCu "eax = 1"
+0x00000012 CCu "continue;"
+0x00000014 CCu "loc_0x00000014:\nreturn"
+0x00000016 CCu "eax = 2"
+0x0000001b CCu "return 2"
+EOF
+RUN
+
+NAME=pdcj annotates no empty line
+FILE=malloc://32
+ARGS=-a x86 -b 64 -e anal.nopskip=false
+CMDS=<<EOF
+wx 90 b801000000 c3 @ 0
+af @ 0
+pdcj~{}~"offset":~?
+pdcj~{annotations[0].offset}
+pdcj~{annotations[1].offset}
+pdcj~{annotations[2].offset}
+EOF
+EXPECT=<<EOF
+3
+1
+6
+6
+EOF
+RUN
+
+NAME=pdca structured places the switch header after the dispatching block
+FILE=-
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 49bf00000000000000804c8b24244c89e04c31f84d85e46a0159480f48c8488d053b00000048630c884801c1ffe1909090eb1590eb1290eb0f909090909090909090909090909090c390909090909090c3909090909090909090909090909090ceffffffd6ffffffd0ffffffcefffffff0ffffff @ 0
+s 0
+afr
+pdca~cmovs,switch (,case ,goto
+.pdc*
+CC~switch
+EOF
+EXPECT=<<EOF
+ 0x0000001a | cmovs rcx, rax                 |     cmovs rcx rax
+ 0x0000002c |                                |     switch (switch_var) { // jump table of 4 cases at 0x00000060
+ 0x0000002e |                                |         case 0: // 0x0000002e
+ 0x00000036 |                                |         case 1: // 0x00000036
+ 0x00000030 |                                |         case 2: // 0x00000030
+ 0x00000030 |                                |             goto loc_0x00000030;
+ 0x0000002e |                                |         case 3: // 0x0000002e
+ 0x0000002e |                                |             goto loc_0x0000002e;
+0x0000002c CCu "switch (switch_var) { // jump table of 4 cases at 0x00000060\n}"
+EOF
+RUN
+
+NAME=pdca case labels carry no asm column
+FILE=-
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 49bf00000000000000804c8b24244c89e04c31f84d85e46a0159480f48c8488d053b00000048630c884801c1ffe1909090eb1590eb1290eb0f909090909090909090909090909090c390909090909090c3909090909090909090909090909090ceffffffd6ffffffd0ffffffcefffffff0ffffff @ 0
+s 0
+afr
+pdca~: // 0x
+EOF
+EXPECT=<<EOF
+ 0x0000002e |                                |         case 0: // 0x0000002e
+ 0x00000036 |                                |         case 1: // 0x00000036
+ 0x00000030 |                                |         case 2: // 0x00000030
+ 0x0000002e |                                |         case 3: // 0x0000002e
+EOF
+RUN
+
+NAME=pdca structured renders a transfer after its delay slot
+FILE=malloc://128
+ARGS=-a mips -b 32 -e cfg.bigendian=true -e pdc.structured=1
+CMDS=<<EOF
+wx 24840001 28820005 10400009 00000000 24080003 15080003 00000000 10000004 24630001 24630002 1000fff5 24630003 03e00008 00000000 @ 0
+af @ 0
+pdca~continue,break,v1 += 3
+EOF
+EXPECT=<<EOF
+ 0x00000008 |                                |             break;
+ 0x0000002c | addiu v1, v1, 3                |             v1 += 3
+ 0x00000028 | b fcn.00000000                 |             continue;
+EOF
+RUN
+
+NAME=pdc* linear keeps one comment per line
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=0
+CMDS=<<EOF
+wx 83c701 83ff05 7d0e 83ff09 7407 b801000000 ebec c3 90 b802000000 c3 @ 0
+af @ 0
+pdc*
+EOF
+EXPECT=<<EOF
+CCu base64:dm9pZCBmY24uMDAwMDAwMDAgKGludDY0X3QgYXJnMSkgew== @ 0x00000000
+CCu base64:bG9jXzB4MDAwMDAwMDA6 @ 0x00000000
+CCu base64:Ly8gQ09ERSBYUkVGIGZyb20gZmNuLjAwMDAwMDAwIEAgMHgxMih4KQ== @ 0x00000000
+CCu base64:ZWRpICs9IDEgICAgICAvLyBhcmcx @ 0x00000000
+CCu base64:diA9IGVkaSAtIDUgICAvLyBhcmcx @ 0x00000003
+CCu base64:aWYgKHYgPj0gMCkgZ290byBsb2NfMHgxNiAvLyB1bmxpa2VseQ== @ 0x00000006
+CCu base64:Z290byBsb2NfMHgwMDAwMDAwODs= @ 0x00000000
+CCu base64:bG9jXzB4MDAwMDAwMTY6 @ 0x00000016
+CCu base64:ZWF4ID0gMg== @ 0x00000016
+CCu base64:cmV0dXJuIDI= @ 0x0000001b
+CCu base64:Z290byBsb2NfMHgwMDAwMDAwZDs= @ 0x00000008
+CCu base64:cmV0dXJuIHJheDs= @ 0x00000008
+CCu base64:bG9jXzB4MDAwMDAwMGQ6 @ 0x0000000d
+CCu base64:ZWF4ID0gMQ== @ 0x0000000d
+CCu base64:Z290byBsb2NfMCAgICAvLyBmY24uMDAwMDAwMDAoMHgxKQ== @ 0x00000012
+CCu base64:YnJlYWs7 @ 0x0000000d
+CCu base64:bG9jXzB4MDAwMDAwMDg6IC8vIG9ycGhhbg== @ 0x00000008
+CCu base64:diA9IGVkaSAtIDkgICAvLyBhcmcx @ 0x00000008
+CCu base64:aWYgKCF2KQ== @ 0x0000000b
+CCu base64:bG9jXzB4MDAwMDAwMTQ6IC8vIG9ycGhhbg== @ 0x00000014
+CCu base64:cmV0dXJu @ 0x00000014
+EOF
+RUN
+
+NAME=pdc modes anchor a transfer with no jump of its own on the line above it
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 31ff 83c701 83f805 7d0a 83f803 75f3 b801000000 c3 @ 0
+af @ 0
+pdco~eax = 1,goto loc_0x00000014
+pdca~eax = 1,goto loc_0x00000014
+EOF
+EXPECT=<<EOF
+ 0x0000000f |     eax = 1
+ 0x0000000f |     goto loc_0x00000014;
+ 0x0000000f | mov eax, 1                     |     eax = 1
+ 0x0000000f |                                |     goto loc_0x00000014;
+EOF
+RUN
+
+NAME=pdc trycatch blocks mach0 compact unwind
+FILE=bins/mach0/ClassCpp.out
+CMDS=<<EOF
+e scr.color=0
+aaa
+s main
+pdc~try { //
+pdc~end try
+pdc~// try 0x
+EOF
+EXPECT=<<EOF
+    try { // cleanup at 0x1000029f8
+    } // end try
+    catch (...) { // try 0x100002a04..0x100002a0c
+EOF
+RUN
+
+NAME=pdc trycatch blocks mach0 structured
+FILE=bins/mach0/ClassCpp.out
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+e scr.color=0
+aaa
+s main
+pdc~try { //
+pdc~end try
+pdc~// try 0x
+EOF
+EXPECT=<<EOF
+    try { // cleanup at 0x1000029f8
+    } // end try
+    catch (...) { // try 0x100002a04..0x100002a0c
+EOF
+RUN
+
+NAME=pdc trycatch blocks elf itanium attached typed catch
+FILE=bins/elf/0pack
+CMDS=<<EOF
+e scr.color=0
+af @ 0x4779b4
+s 0x4779b4
+pdc~try { // catch
+pdc~// try 0x
+EOF
+EXPECT=<<EOF
+    try { // catch at 0x004779d8
+    } catch (std::exception) { // try 0x004779d0..0x004779d3
+EOF
+RUN
+
+NAME=pdc trycatch blocks pe64 seh
+FILE=bins/pe/dhcpssvc.dll
+CMDS=<<EOF
+e scr.color=0
+af @ 0x7ff5d426bdc
+s 0x7ff5d426bdc
+pdc~try { //
+pdc~end try
+pdc~// try 0x
+EOF
+EXPECT=<<EOF
+                                try { // catch at 0x7ff5d426eb2
+                                } catch { // try 0x7ff5d426e95..0x7ff5d426ea3
+EOF
+RUN
+
+NAME=pdc trycatch blocks dotnet finally
+FILE=bins/dotnet/HelloWorld.dll
+CMDS=<<EOF
+e scr.color=0
+s 0x100021c0
+af
+pdc~try { //
+pdc~end try
+EOF
+EXPECT=<<EOF
+    try { // cleanup at 0x100021eb
+    } // end try
+EOF
+RUN
+
+# merged: pdc trycatch disabled with pdc.trycatch=false
+NAME=pdc trycatch blocks dex attached catch
+FILE=bins/dex/dex38.dex
+CMDS=<<EOF
+e scr.color=0
+af @ 0x1378
+s 0x1378
+pdc~try { //
+pdc~// try 0x
+pdc~v0 = exception
+?e --
+e scr.color=0
+e pdc.trycatch=false
+af @ 0x1378
+s 0x1378
+pdc~try { //
+pdc~catch (
+pdc~end try
+EOF
+EXPECT=<<EOF
+    try { // catch at 0x000013d8
+    } catch (Ljava/lang/Throwable;) { // try 0x00001384..0x000013b2
+        v0 = exception
+--
+EOF
+RUN
+
+NAME=pdc trycatch blocks dex structured
+FILE=bins/dex/dex38.dex
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+e scr.color=0
+af @ 0x1378
+s 0x1378
+pdc~try { //
+pdc~// try 0x
+EOF
+EXPECT=<<EOF
+    try { // catch at 0x000013d8
+    } catch (Ljava/lang/Throwable;) { // try 0x00001384..0x000013b2
+EOF
+RUN
+
+NAME=pdc emu string args are not clipped to the block size
+FILE=bins/elf/analysis/clark
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+aa
+s main
+pdc~puts("Booh,puts("No no
+EOF
+EXPECT=<<EOF
+        sym.imp.puts () // int puts("Booh! Don't debug me!")
+            sym.imp.puts () // int puts("No no no! Don't patch me!")
+EOF
+RUN
+
+NAME=pdc leaves no emulated writes in the io cache
+FILE=bins/elf/format
+ARGS=-e io.cache=true
+CMDS=<<EOF
+aa
+s main
+wx 41 @ main
+wc~?
+pdc~zzznomatch
+wc~?
+p8 1 @ main
+EOF
+EXPECT=<<EOF
+1
+1
+41
+EOF
+RUN
+
+NAME=pdc structured reports the same emulated args as linear
+FILE=bins/elf/format
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+aa
+s main
+pdc~printf("Results
+EOF
+EXPECT=<<EOF
+    sym.imp.printf () // int printf("Results : a : %u , b: %ld\n", 30, 0x2710)
+EOF
+RUN
+
+NAME=pdc emulates each block once
+FILE=malloc://0x2000
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+wx 488b1c2500080000488b0425000800004883c00148890425000800004883fb037c1e @ 0
+wx 488b1c2508080000488b0425080800004883c0014889042508080000eb20 @ 34
+wx 488b1c2510080000488b0425100800004883c0014889042510080000eb02 @ 64
+wx 9090 @ 94
+wx 488b1c2518080000488b0425180800004883c0014889042518080000c3 @ 96
+af @ 0
+pdc @ 0~0x808
+EOF
+EXPECT=<<EOF
+        rbx = qword [0x808] // [0x808:8]=0
+        rax = qword [0x808] // [0x808:8]=0
+        qword [0x808] = rax
+EOF
+RUN
+
+NAME=pdc renders a landing pad no edge reaches
+FILE=bins/elf/demangle-test-cpp
+CMDS=<<EOF
+aaa
+pdco @ 0x15aa~&0x000017b6,rax = qword
+pdco @ 0x15aa~&0x000017d8,rax = qword
+pdc @ 0x15aa~?_Unwind_Resume
+EOF
+EXPECT=<<EOF
+ 0x000017b6 |             rax = qword [rbp - 0x58]
+ 0x000017d8 |         rax = qword [rbp - 0x58]
+1
+EOF
+RUN
+
+NAME=pdc seeds jump table cases from the dispatcher state
+FILE=bins/elf/ls
+ARGS=-e pdc.structured=1
+CMDS=<<EOF2
+aaa
+s 0x145b0
+pdc~rdx = rax
+EOF2
+EXPECT=<<EOF2
+                rdx = rax     // case.0x14659.0
+                rdx = rax     // case.0x14659.0
+                rdx = rax     // case.0x14659.0
+                rdx = rax     // case.0x14659.0
+                rdx = rax     // case.0x14659.0
+        rdx = rax
+EOF2
+RUN
+
+NAME=pdc disassembles the bytes an emulated store overwrote
+FILE=malloc://0x2000
+ARGS=-a x86 -b 64
+CMDS=<<EOF2
+wx c604251100000002eb06909090909090b801000000c3 @ 0
+af @ 0
+pdc @ 0~eax =
+EOF2
+EXPECT=<<EOF2
+    eax = 1
+EOF2
+RUN
+
+NAME=pdc keeps a branch's stores from the sibling branch
+FILE=malloc://0x2000
+ARGS=-a x86 -b 64
+CMDS=<<EOF2
+wx 4885ff740a488b1c2500080000eb0c48c704250008000001000000c3 @ 0
+af @ 0
+pdc @ 0~0x800]
+EOF2
+EXPECT=<<EOF2
+        rbx = qword [0x800] // [0x800:8]=0
+        qword [0x800] = 1
+EOF2
+RUN
+
+NAME=pdc ignores the seeds another command left on the blocks
+FILE=bins/elf/ls
+ARGS=-e asm.emu=true -e graph.few=true
+CMDS=<<EOF2
+aaa
+s 0x145b0
+agf~zzznomatch
+pdc~rdi = rbp
+EOF2
+EXPECT=<<EOF2
+    rdi = rbp     // rsp
+                rdi = rbp     // rsp
+                rdi = rbp     // rsp
+                rdi = rbp     // rsp
+                rdi = rbp     // rsp
+                rdi = rbp     // rsp
+        rdi = rbp     // rsp
+EOF2
+RUN
+
+NAME=pdc structured names a goto leaving the function
+FILE=malloc://128
+ARGS=-a arm -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wa cbz x0, 0x20
+wa mov x0, 1 @ 4
+wa ret @ 8
+wa mov x0, 2 @ 0x20
+wa ret @ 0x24
+af+ 0 wrapper
+afb+ 0 0 4 0x20 0x4
+afb+ 0 0x4 8
+af+ 0x20 helper
+afb+ 0x20 0x20 8
+pdc
+EOF
+EXPECT=<<EOF
+// callconv: x0 arm64 (x0, x1, x2, x3, x4, x5, x6, x7, stack);
+void wrapper (void) {
+    if (!x0) {
+        goto helper;
+    }
+    x0 = 1
+    return x0;
+}
+
+EOF
+RUN
+
+NAME=pdc structured names a foreign switch target the same in every arm
+FILE=malloc://0x200
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 4883f8027700ff24c50001000000 @ 0
+wx 770a @ 4
+wx c3 @ 0x10
+wx b805000000c3 @ 0x20
+wx b807000000eb0e @ 0x40
+wx c3 @ 0x50
+wv8 0x40 @ 0x100
+wv8 0x20 @ 0x108
+wv8 0x40 @ 0x110
+af @ 0
+afb- 0x40
+af+ 0x40 helper
+afb+ 0x40 0x40 7 0x50
+afb+ 0x40 0x50 1
+pdc @ 0~goto,loc_0x00000010:
+EOF
+EXPECT=<<EOF
+                goto helper;
+                goto helper;
+                goto loc_0x00000010;
+        loc_0x00000010:
+EOF
+RUN
+
+NAME=pdc structured keeps loc for a jump table case body
+FILE=malloc://0x200
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 4883f8027700ff24c50001000000 @ 0
+wx 770a @ 4
+wx c3 @ 0x10
+wx b805000000c3 @ 0x20
+wx b807000000eb0e @ 0x40
+wx c3 @ 0x50
+wv8 0x40 @ 0x100
+wv8 0x20 @ 0x108
+wv8 0x40 @ 0x110
+af @ 0
+afb- 0x40
+af+ 0x40 case.0x0.2 l
+afb+ 0x40 0x40 7 0x50
+afb+ 0x40 0x50 1
+pdc @ 0~goto,loc_0x00000010:
+wx 83ff0190c3 @ 0x180
+wx b82a000000c3 @ 0x190
+af+ 0x180 wfun
+afb+ 0x180 0x180 3 0x190 0x183
+afb+ 0x180 0x183 2
+af+ 0x190 hfun
+afb+ 0x190 0x190 6
+pdc @ 0x180~goto
+EOF
+EXPECT=<<EOF
+                goto loc_0x00000040;
+                goto loc_0x00000040;
+                goto loc_0x00000010;
+        loc_0x00000010:
+        goto hfun;
+EOF
+RUN
+
+NAME=pdc structured keeps loc where the same rendering prints the label
+FILE=malloc://0x200
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 83ff01 @ 0
+wx 89f8 @ 8
+wx b82a00000090c3 @ 0x40
+af+ 0x40 gfunc
+afb+ 0x40 0x40 8 0x48
+afb+ 0x40 0x48 8
+af+ 0x0 ffunc
+afb+ 0x0 0x0 8 0x40 8
+afb+ 0x0 0x8 8 0x40
+afb+ 0x0 0x30 0x20
+pdc @ 0~goto,loc_0x00000040:
+wx 83ff0190c3 @ 0x180
+wx b82a000000c3 @ 0x190
+af+ 0x180 wfun
+afb+ 0x180 0x180 3 0x190 0x183
+afb+ 0x180 0x183 2
+af+ 0x190 hfun
+afb+ 0x190 0x190 6
+pdc @ 0x180~goto
+EOF
+EXPECT=<<EOF
+        goto loc_0x00000040;
+        loc_0x00000040:
+        goto hfun;
+EOF
+RUN
+
+NAME=pdc structured keeps loc for an orphan labelled block
+FILE=malloc://0x2000
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+af+ 0 F
+afb+ 0 0 0x10 0x10
+afb+ 0 0x10 0x10
+afbe 0 $$ @@s:0x1000 0x1490 0x10
+af+ 0x10 helper
+pdc @ 0~loc_0x00000010
+wx 83ff0190c3 @ 0x1500
+wx b82a000000c3 @ 0x1510
+af+ 0x1500 wfun
+afb+ 0x1500 0x1500 3 0x1510 0x1503
+afb+ 0x1500 0x1503 2
+af+ 0x1510 hfun
+afb+ 0x1510 0x1510 6
+pdc @ 0x1500~goto
+EOF
+EXPECT=<<EOF
+    goto loc_0x00000010;
+    loc_0x00000010: // orphan
+        goto hfun;
+EOF
+RUN
+
+NAME=pdc structured names a hoisted switch arm like the rest of the rendering
+FILE=malloc://0x2000
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+af+ 0 F
+afb+ 0 0 0x10 0x10
+afb+ 0 0x10 0x10
+afbe 0 $$ @@s:0x1000 0x1490 0x10
+afbe 0x10 0x1000
+af+ 0x1000 helper2
+pdc @ 0~helper2
+EOF
+EXPECT=<<EOF
+            goto helper2;
+                goto helper2;
+EOF
+RUN
+
+NAME=pdc structured never names a goto to address zero
+FILE=bins/elf/ppc64v1-libz.so
+ARGS=-e pdc.structured=1
+CMDS=<<EOF
+aaa
+af+ 0 zerofn
+af+ 0x194a0 named_target
+s sym.plt.crc32_combine_gen64
+pdc~goto
+EOF
+EXPECT=<<EOF
+        goto named_target;
+        goto loc_0x00000000;
+EOF
+RUN
+
+NAME=pdc structured keeps a loop exit out of the labels it prints
+FILE=malloc://0x100
+ARGS=-a x86 -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wx 85c07510 @ 0
+wx 85c074ec @ 0x10
+wx eb0e @ 0x30
+wx b82a000000c3 @ 0x40
+af+ 0 F
+afb+ 0 0 4 0x10 0x30
+afb+ 0 0x10 4 0 0x40
+afb+ 0 0x30 2 0x40
+af+ 0x40 helper
+afb+ 0x40 0x40 6
+pdc @ 0~goto,break,continue
+EOF
+EXPECT=<<EOF
+        if (v) goto loc_0x14 // unlikely
+            break;
+            goto helper;
+            continue;
+    goto helper;
+EOF
+RUN
+
+NAME=pdc structured keeps loc where no function starts at the target
+FILE=malloc://128
+ARGS=-a arm -b 64 -e pdc.structured=1
+CMDS=<<EOF
+wa cbz x0, 0x24
+wa cbz x1, 0x40 @ 4
+wa cbz x2, 0x20 @ 8
+wa mov x0, 1 @ 0xc
+wa ret @ 0x10
+wa mov x0, 2 @ 0x20
+wa ret @ 0x24
+af+ 0 wrapper
+afb+ 0 0 4 0x24 0x4
+afb+ 0 0x4 4 0x40 0x8
+afb+ 0 0x8 4 0x20 0xc
+afb+ 0 0xc 8
+af+ 0x20 helper
+afb+ 0x20 0x20 8
+pdc~goto loc_0x,goto helper
+EOF
+EXPECT=<<EOF
+        goto loc_0x00000024;
+        goto loc_0x00000040;
+        goto helper;
 EOF
 RUN

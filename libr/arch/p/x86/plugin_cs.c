@@ -113,7 +113,8 @@ struct Getarg {
 	csh handle;
 	cs_insn *insn;
 	int bits;
-	int syntax; // R_ARCH_SYNTAX_ATT or R_ARCH_SYNTAX_INTEL
+	// pending zero-extensions for the 32-bit registers this op writes
+	char zext[32];
 };
 
 // TODO: get rid of this unnecessary wrapper
@@ -273,17 +274,6 @@ static bool is_xmm_reg(cs_x86_op op) {
 }
 
 /**
- * Get normalized operand index for AT&T syntax
- * In AT&T, operands are source,dest so we swap for 2-operand instructions
- */
-static inline int norm_op(int n, int syntax, int op_count) {
-	if (syntax == R_ARCH_SYNTAX_ATT && op_count == 2) {
-		return 1 - n; // swap 0<->1
-	}
-	return n;
-}
-
-/**
  * Translates operand N to esil
  *
  * @param  handle  csh
@@ -294,6 +284,129 @@ static inline int norm_op(int n, int syntax, int op_count) {
  * @param  sel     Selector for output buffer in staic array
  * @return         Pointer to esil operand in static array
  */
+/* x86 takes the shift count modulo 32 for operands up to 32 bits wide, and
+ * modulo 64 for a 64-bit operand, before shifting anything. Without that,
+ * `sar eax, cl` with cl = 0xff asks ESIL for a 255-bit shift instead of the
+ * 31-bit one the processor performs. */
+static char *shift_count(const char *src, ut32 bitsize) {
+	return r_str_newf ("%s,0x%x,&", src, (bitsize > 32)? 0x3f: 0x1f);
+}
+
+// a rotate wraps at the operand width, and at one more for rcl/rcr because cf
+// joins the rotation. only 8 and 16 bit operands can outrun their own modulus.
+static char *wrap_count(const char *masked, ut32 bitsize, ut32 modulus) {
+	return (bitsize < 32)? r_str_newf ("%d,%s,%%", modulus, masked): strdup (masked);
+}
+
+static inline bool get64from32(const char *s, char *out, size_t outsz) {
+	if (*s == 'e') {
+		snprintf (out, outsz, "r%s", s + 1);
+		return true;
+	}
+	if (*s == 'r' && isdigit (s[1])) {
+		if (s[2] == 'd' || (s[2] != 0 && isdigit(s[2]) && s[3] == 'd')) {
+			snprintf (out, outsz, "r%d", atoi (s + 1));
+			return true;
+		}
+	}
+	return false;
+}
+
+// writing a 32-bit register zero-extends into its 64-bit half, which ESIL wont
+static void zext_reg(struct Getarg *gop, const char *reg) {
+	char r64[16], pair[24];
+	if (!reg || gop->bits != 64 || !get64from32 (reg, r64, sizeof (r64))) {
+		return;
+	}
+	snprintf (pair, sizeof (pair), ",%s,%s,=", reg, r64);
+	const size_t len = strlen (gop->zext);
+	// drop rather than truncate: a half-copied pair is a corrupt esil token
+	if (!strstr (gop->zext, pair) && len + strlen (pair) < sizeof (gop->zext)) {
+		r_str_ncpy (gop->zext + len, pair, sizeof (gop->zext) - len);
+	}
+}
+
+static void zext_opnd(struct Getarg *gop, int n) {
+	const cs_x86_op *op = &gop->insn->detail->x86.operands[n];
+	if (op->type == X86_OP_REG) {
+		zext_reg (gop, cs_reg_name (gop->handle, op->reg));
+	}
+}
+
+// a scan that breaks out never reaches the tail, so it extends before scanning
+static void zext_prefix(struct Getarg *gop, const char *reg, char *out, size_t sz) {
+	char r64[16];
+	*out = 0;
+	if (gop->bits == 64 && reg && get64from32 (reg, r64, sizeof (r64))) {
+		snprintf (out, sz, ",%s,%s,=", reg, r64);
+	}
+}
+
+// the implicit operands of the one-operand mul, imul, div and idiv
+static void muldiv_regs(int width, const char **quot, const char **rema) {
+	*quot = (width == 1)? "al": (width == 2)? "ax": (width == 4)? "eax": "rax";
+	*rema = (width == 1)? "ah": (width == 2)? "dx": (width == 4)? "edx": "rdx";
+}
+
+// the byte form divides ax alone, the wider ones the rema:quot pair
+static char *muldiv_dividend(int width, const char *quot, const char *rema, bool sign) {
+	char *num = (width == 1)
+		? strdup ("ax")
+		: r_str_newf ("%d,%s,<<,%s,+", width * 8, rema, quot);
+	if (sign && width < 4) {
+		// the dividend is signed at twice the operand width
+		char *snum = r_str_newf ("%d,%s,~", width * 16, num);
+		free (num);
+		return snum;
+	}
+	return num;
+}
+
+// counts the set bits of a register in place, by the usual halving sums
+static void popcnt_esil(RStrBuf *sb, const char *reg, int bits) {
+	const int sh = 64 - bits;
+	const ut64 m1 = 0x5555555555555555ULL >> sh;
+	const ut64 m2 = 0x3333333333333333ULL >> sh;
+	const ut64 m4 = 0x0f0f0f0f0f0f0f0fULL >> sh;
+	const ut64 m8 = 0x0101010101010101ULL >> sh;
+	r_strbuf_appendf (sb, ",1,%s,>>,0x%"PFMT64x",&,%s,-,%s,=", reg, m1, reg, reg);
+	r_strbuf_appendf (sb, ",0x%"PFMT64x",%s,&,2,%s,>>,0x%"PFMT64x",&,+,%s,=",
+		m2, reg, reg, m2, reg);
+	r_strbuf_appendf (sb, ",4,%s,>>,%s,+,0x%"PFMT64x",&,%s,=", reg, reg, m4, reg);
+	// the byte sums land in the top byte, which can carry out of bits
+	r_strbuf_appendf (sb, ",%d,0x%"PFMT64x",%s,*,>>,0x7f,&,%s,=",
+		bits - 8, m8, reg, reg);
+}
+
+// esil for the byte-reversed value of an expression of the given byte width
+static char *byteswap_expr(const char *v, int bytes) {
+	RStrBuf *sb = r_strbuf_new ("");
+	int i;
+	for (i = 0; i < bytes; i++) {
+		const int shr = 8 * i;
+		const int shl = 8 * (bytes - 1 - i);
+		if (i) {
+			r_strbuf_append (sb, ",");
+		}
+		if (shl) {
+			r_strbuf_appendf (sb, "%d,", shl);
+		}
+		if (shr) {
+			r_strbuf_appendf (sb, "%d,%s,>>,0xff,&", shr, v);
+		} else {
+			r_strbuf_appendf (sb, "0xff,%s,&", v);
+		}
+		r_strbuf_appendf (sb, "%s%s", shl? ",<<": "", i? ",|": "");
+	}
+	return r_strbuf_drain (sb);
+}
+
+// the flags an addition defines, shared by add and xadd
+static char *add_flags(ut32 bitsize) {
+	return r_str_newf ("%d,$o,of,:=,%d,$s,sf,:=,$z,zf,:=,%d,$c,cf,:=,$p,pf,:=,3,$c,af,:=",
+		bitsize - 1, bitsize - 1, bitsize - 1);
+}
+
 static char *getarg(struct Getarg* gop, int n, int set, char *setop, ut32 *bitsize) {
 	const char *setarg = r_str_get (setop);
 	cs_insn *insn = gop->insn;
@@ -303,19 +416,10 @@ static char *getarg(struct Getarg* gop, int n, int set, char *setop, ut32 *bitsi
 		// default blind bitsize which may be wrong
 		*bitsize = 8;
 	}
-	// For AT&T syntax, capstone reports operands in source,dest order
-	// We need to swap indices for 2-operand instructions to normalize
-	int actual_n = n;
-	if (gop->syntax == R_ARCH_SYNTAX_ATT && INSOPS == 2) {
-		actual_n = 1 - n; // swap 0<->1
-	}
-	cs_x86_op op = INSOP (actual_n);
-	if (!insn->detail) {
+	if (!insn->detail || n < 0 || n >= INSOPS) {
 		return NULL;
 	}
-	if (actual_n < 0 || actual_n >= INSOPS) {
-		return NULL;
-	}
+	cs_x86_op op = INSOP (n);
 	if (bitsize) {
 		size_t bs = op.size * 8;
 		*bitsize = bs? bs: 8;
@@ -333,6 +437,7 @@ static char *getarg(struct Getarg* gop, int n, int set, char *setop, ut32 *bitsi
 					rn = stbuf;
 				}
 				if (set == 1) {
+					zext_reg (gop, rn);
 					return r_str_newf ("%s,%s=", rn, setarg);
 				}
 				return strdup (rn);
@@ -446,20 +551,6 @@ static const char *reg32_to_name(ut8 reg) {
 }
 #endif
 
-static inline bool get64from32(const char *s, char *out, size_t outsz) {
-	if (*s == 'e') {
-		snprintf (out, outsz, "r%s", s + 1);
-		return true;
-	}
-	if (*s == 'r' && isdigit (s[1])) {
-		if (s[2] == 'd' || (s[2] != 0 && isdigit(s[2]) && s[3] == 'd')) {
-			snprintf (out, outsz, "r%d", atoi (s + 1));
-			return true;
-		}
-	}
-	return false;
-}
-
 static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, int len, csh handle, cs_insn *insn) {
 	RAnalValue *val = NULL;
 	const int bits = as->config->bits;
@@ -490,7 +581,7 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		.handle = handle,
 		.insn = insn,
 		.bits = bits,
-		.syntax = as->config->syntax
+		.zext = {0}
 	};
 	char *src = NULL;
 	char *src2 = NULL;
@@ -498,7 +589,6 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 	char *dst2 = NULL;
 	char *dst_r = NULL;
 	char *dst_w = NULL;
-	char *dstAdd = NULL;
 	char *arg0 = NULL;
 	char *arg1 = NULL;
 	char *arg2 = NULL;
@@ -1044,7 +1134,6 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 	case X86_INS_MOVHPS:
 	case X86_INS_MOVLPD:
 	case X86_INS_MOVLPS:
-	case X86_INS_MOVBE:
 	case X86_INS_MOVSX:
 	case X86_INS_MOVSXD:
 	case X86_INS_MOVQ:
@@ -1052,15 +1141,12 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 	case X86_INS_MOVDQA:
 	case X86_INS_MOVDQ2Q:
 		{
-		// Use normalized operand indices for AT&T syntax support
-		int dst_idx = norm_op (0, gop.syntax, INSOPS);
-		int src_idx = norm_op (1, gop.syntax, INSOPS);
-		switch (INSOP (dst_idx).type) {
+		switch (INSOP (0).type) {
 		case X86_OP_MEM:
 			if (op->prefix & R_ANAL_OP_PREFIX_REP) {
-				int width = INSOP (dst_idx).size;
-				const char *src = cs_reg_name (handle, INSOP (src_idx).mem.base);
-				const char *dst = cs_reg_name (handle, INSOP (dst_idx).mem.base);
+				int width = INSOP (0).size;
+				const char *src = cs_reg_name (handle, INSOP (1).mem.base);
+				const char *dst = cs_reg_name (handle, INSOP (0).mem.base);
 				const char *counter = (bits == 16)?"cx": (bits==32)?"ecx":"rcx";
 				esilprintf (op, "%s,!,?{,BREAK,},%s,NUM,%s,NUM,"\
 						"%s,[%d],%s,=[%d],df,?{,%d,%s,-=,%d,%s,-=,},"\
@@ -1079,39 +1165,27 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 			break;
 		case X86_OP_REG:
 		default:
-			if (INSOP (dst_idx).type == X86_OP_MEM) {
-				op->direction = R_ANAL_OP_DIR_READ;
-			}
-			if (INSOP (src_idx).type == X86_OP_MEM) {
+			if (INSOP (1).type == X86_OP_MEM) {
 				// MOV REG, [PTR + IREG*SCALE]
-				op->ireg = cs_reg_name (handle, INSOP (src_idx).mem.index);
-				op->disp = INSOP (src_idx).mem.disp;
-				op->scale = INSOP (src_idx).mem.scale;
+				op->ireg = cs_reg_name (handle, INSOP (1).mem.index);
+				op->disp = INSOP (1).mem.disp;
+				op->scale = INSOP (1).mem.scale;
 			}
 			{
-				int width = INSOP (src_idx).size;
+				int width = INSOP (1).size;
 
 				src = getarg (&gop, 1, 0, NULL, NULL);
 				// dst is name of register from instruction.
 				dst = getarg (&gop, 0, 0, NULL, NULL);
 				char dst64[16];
-				const bool havedst = get64from32 (dst, dst64, sizeof (dst64));
-				if (bits == 64 && havedst) {
-					// Here it is still correct, because 'e** = X'
-					// turns into 'r** = X' (first one will keep higher bytes,
-					// second one will overwrite them with zeros).
-					if (insn->id == X86_INS_MOVSX || insn->id == X86_INS_MOVSXD) {
-						esilprintf (op, "%d,%s,~,%s,=", width*8, src, dst64);
-					} else {
-						esilprintf (op, "%s,%s,=", src, dst64);
-					}
-
+				const bool wide = bits == 64 && get64from32 (dst, dst64, sizeof (dst64));
+				if (insn->id == X86_INS_MOVSX || insn->id == X86_INS_MOVSXD) {
+					// the sign extension stops at the 32-bit destination
+					zext_opnd (&gop, 0);
+					esilprintf (op, "%d,%s,~,%s,=", width*8, src, dst);
 				} else {
-					if (insn->id == X86_INS_MOVSX || insn->id == X86_INS_MOVSXD) {
-						esilprintf (op, "%d,%s,~,%s,=", width*8, src, dst);
-					} else {
-						esilprintf (op, "%s,%s,=", src, dst);
-					}
+					// writing the 64-bit name zeroes the high half in one go
+					esilprintf (op, "%s,%s,=", src, wide? dst64: dst);
 				}
 				free (src);
 				free (dst);
@@ -1141,31 +1215,71 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		}
 		break;
 	case X86_INS_ROL:
-	case X86_INS_RCL:
-		// TODO: RCL Still does not work as intended
-		//  - Set flags
-		{
-			src = getarg (&gop, 1, 0, NULL, NULL);
-			src2 = getarg (&gop, 0, 0, NULL, NULL);
-			dst = getarg (&gop, 0, 1, NULL, NULL);
-			esilprintf (op, "%s,%s,ROL,%s", src, src2, dst);
-			free (src);
-			free (src2);
-			free (dst);
-		}
-		break;
 	case X86_INS_ROR:
+	case X86_INS_RCL:
 	case X86_INS_RCR:
-		// TODO: RCR Still does not work as intended
-		//  - Set flags
 		{
-			src = getarg (&gop, 1, 0, NULL, NULL);
-			src2 = getarg (&gop, 0, 0, NULL, NULL);
-			dst = getarg (&gop, 0, 1, NULL, NULL);
-			esilprintf (op, "%s,%s,ROR,%s", src, src2, dst);
+			const bool thru_cf = insn->id == X86_INS_RCL || insn->id == X86_INS_RCR;
+			ut32 bitsize;
+			char *count = getarg (&gop, 1, 0, NULL, NULL);
+			dst_r = getarg (&gop, 0, 0, NULL, &bitsize);
+			dst_w = getarg (&gop, 0, 1, NULL, NULL);
+			src = count? shift_count (count, bitsize): NULL;
+			free (count);
+			char *rot = src? wrap_count (src, bitsize, bitsize + thru_cf): NULL;
+			if (src && rot && dst_r && dst_w) {
+				// of exists only at a count of 1, and every term it needs is gone
+				// once the destination is written, so it is emitted first
+				char *ofx = NULL;
+				switch (insn->id) {
+				case X86_INS_ROL:
+				case X86_INS_RCL:
+					ofx = r_str_newf ("1,%s,-,!,?{,%d,%s,>>,1,&,%d,%s,>>,1,&,^,of,:=,},",
+						src, bitsize - 2, dst_r, bitsize - 1, dst_r);
+					break;
+				case X86_INS_ROR:
+					ofx = r_str_newf ("1,%s,-,!,?{,1,%s,&,%d,%s,>>,1,&,^,of,:=,},",
+						src, dst_r, bitsize - 1, dst_r);
+					break;
+				default:
+					ofx = r_str_newf ("1,%s,-,!,?{,cf,%d,%s,>>,1,&,^,of,:=,},",
+						src, bitsize - 1, dst_r);
+					break;
+				}
+				switch (insn->id) {
+				case X86_INS_ROL:
+					// esil ROL takes its width from a register operand, which a
+					// memory destination does not give it, so the shifts are explicit
+					esilprintf (op, "%s,?{,%s%s,%s,<<,%s,%d,-,%s,>>,|,%s,1,%s,&,cf,:=,}",
+						src, ofx, rot, dst_r, rot, bitsize, dst_r, dst_w, dst_r);
+					break;
+				case X86_INS_ROR:
+					esilprintf (op, "%s,?{,%s%s,%s,>>,%s,%d,-,%s,<<,|,%s,%d,%s,>>,1,&,cf,:=,}",
+						src, ofx, rot, dst_r, rot, bitsize, dst_r, dst_w,
+						bitsize - 1, dst_r);
+					break;
+				case X86_INS_RCL:
+					// two shifts: a single `dst >> (bitsize + 1 - n)` clamps at 63
+					esilprintf (op,
+						"%s,?{,%s%s,%s,<<,1,%s,-,cf,<<,|,1,%s,%d,-,%s,>>,>>,|,"
+						"1,%s,%d,-,%s,>>,&,cf,:=,%s,}",
+						src, ofx, rot, dst_r, rot, rot, bitsize, dst_r,
+						rot, bitsize, dst_r, dst_w);
+					break;
+				default:
+					esilprintf (op,
+						"%s,?{,%s%s,%s,>>,%s,%d,-,cf,<<,|,1,%s,%d,-,%s,<<,<<,|,"
+						"1,1,%s,-,%s,>>,&,cf,:=,%s,}",
+						src, ofx, rot, dst_r, rot, bitsize, rot, bitsize, dst_r,
+						rot, dst_r, dst_w);
+					break;
+				}
+				free (ofx);
+			}
+			free (rot);
 			free (src);
-			free (src2);
-			free (dst);
+			free (dst_r);
+			free (dst_w);
 		}
 		break;
 	case X86_INS_CPUID:
@@ -1174,59 +1288,75 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		esilprintf (op, "0xa,eax,=,0x756E6547,ebx,=,0x6C65746E,ecx,=,0x49656E69,edx,=");
 		break;
 	case X86_INS_SHLD:
-	case X86_INS_SHLX:
-		// TODO: SHLD is not implemented yet.
 		{
 			ut32 bitsize;
+			char *count = getarg (&gop, 2, 0, NULL, NULL);
 			src = getarg (&gop, 1, 0, NULL, NULL);
-			dst = getarg (&gop, 0, 1, "<<", &bitsize);
-			esilprintf (op, "%s,%s,$z,zf,:=,$p,pf,:=,%d,$s,sf,:=", src, dst, bitsize - 1);
-			free (src);
-			free (dst);
-		}
-		break;
-	case X86_INS_SAR:
-		// TODO: Set CF. See case X86_INS_SHL for more details.
-		{
-		ut32 bitsize;
-		src = getarg (&gop, 1, 0, NULL, NULL);
-		dst_r = getarg (&gop, 0, 0, NULL, NULL);
-		dst_w = getarg (&gop, 0, 1, NULL, &bitsize);
-		esilprintf (op, "0,cf,:=,1,%s,-,1,<<,%s,&,?{,1,cf,:=,},%s,%s,ASR,%s,$z,zf,:=,$p,pf,:=,%d,$s,sf,:=",
-			src, dst_r, src, dst_r, dst_w, bitsize - 1);
-		free (src);
-		free (dst_r);
-		free (dst_w);
-	}
-	break;
-	case X86_INS_SARX:
-		{
-			dst = getarg (&gop, 0, 1, NULL, NULL);
-			src = getarg (&gop, 1, 0, NULL, NULL);
-			src2 = getarg (&gop, 1, 0, NULL, NULL);
-			esilprintf (op, "%s,%s,ASR,%s,=", src2, src, dst);
+			dst_r = getarg (&gop, 0, 0, NULL, &bitsize);
+			dst_w = getarg (&gop, 0, 1, NULL, NULL);
+			src2 = count? shift_count (count, bitsize): NULL;
+			free (count);
+			if (src && src2 && dst_r && dst_w) {
+				// the vacated low bits come from the top of the source operand.
+				// of says the sign changed, so it needs the pre-write destination
+				esilprintf (op,
+					"%s,?{,1,%s,-,!,?{,%d,%s,>>,1,&,%d,%s,>>,1,&,^,of,:=,},"
+					"1,%s,%d,-,%s,>>,&,cf,:=,"
+					"%s,%s,<<,%s,%d,-,%s,>>,|,%s,"
+					"$z,zf,:=,$p,pf,:=,%d,$s,sf,:=,}",
+					src2, src2, bitsize - 1, dst_r, bitsize - 2, dst_r,
+					src2, bitsize, dst_r,
+					src2, dst_r, src2, bitsize, src, dst_w,
+					bitsize - 1);
+			}
 			free (src);
 			free (src2);
-			free (dst);
+			free (dst_r);
+			free (dst_w);
+		}
+		break;
+	case X86_INS_SHLX:
+	case X86_INS_SARX:
+	case X86_INS_SHRX:
+		{
+			ut32 bitsize;
+			char *count = getarg (&gop, 2, 0, NULL, NULL);
+			src = getarg (&gop, 1, 0, NULL, NULL);
+			dst_w = getarg (&gop, 0, 1, NULL, &bitsize);
+			src2 = count? shift_count (count, bitsize): NULL;
+			free (count);
+			if (src && src2 && dst_w) {
+				// bmi2 shifts take the count from operand 3 and touch no flags
+				const char *shop = (insn->id == X86_INS_SHLX)? "<<":
+					(insn->id == X86_INS_SARX)? "ASR": ">>";
+				esilprintf (op, "%s,%s,%s,%s", src2, src, shop, dst_w);
+			}
+			free (src);
+			free (src2);
+			free (dst_w);
 		}
 		break;
 	case X86_INS_SHL:
 	case X86_INS_SAL:
 		{
 		ut32 bitsize;
-		src = getarg (&gop, 1, 0, NULL, NULL);
+		char *count = getarg (&gop, 1, 0, NULL, NULL);
 		dst_r = getarg (&gop, 0, 0, NULL, &bitsize);
 		dst_w = getarg (&gop, 0, 1, NULL, NULL);
+		src = shift_count (count, bitsize);
+		free (count);
 		// CF = last bit shifted out = (dst >> (width - count)) & 1 from the
 		// pre-shift value; OF is defined only for 1-bit shifts as msb(result) ^ CF.
 		// Read via dst_r, write via dst_w so memory destinations store the result.
 		esilprintf (op,
+			"%s,?{,"
 			"%s,%d,-,%s,>>,1,&,cf,:=,"
 			"%s,%s,<<,%s,"
 			"$z,zf,:=,"
 			"$p,pf,:=,"
 			"%d,$s,sf,:=,"
-			"%d,%s,>>,1,&,cf,^,of,:=",
+			"%d,%s,>>,1,&,cf,^,of,:=,}",
+			src,
 			src, bitsize, dst_r,
 			src, dst_r, dst_w,
 			bitsize - 1,
@@ -1239,17 +1369,26 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 	case X86_INS_SALC:
 		esilprintf (op, "$z,DUP,zf,=,al,=");
 		break;
+	case X86_INS_SAR:
 	case X86_INS_SHR:
-	case X86_INS_SHRX:
-		// TODO: Set CF: See case X86_INS_SAL for more details.
 		{
 			ut32 bitsize;
-			src = getarg (&gop, 1, 0, NULL, NULL);
+			char *count = getarg (&gop, 1, 0, NULL, NULL);
 			dst_r = getarg (&gop, 0, 0, NULL, NULL);
 			dst_w = getarg (&gop, 0, 1, NULL, &bitsize);
+			src = count? shift_count (count, bitsize): NULL;
+			free (count);
 			if (src && dst_r && dst_w) {
-				esilprintf (op, "0,cf,:=,1,%s,-,1,<<,%s,&,?{,1,cf,:=,},%s,%s,>>,%s,$z,zf,:=,$p,pf,:=,%d,$s,sf,:=",
-					src, dst_r, src, dst_r, dst_w, bitsize - 1);
+				// x86 leaves the destination and all flags alone on a 0 count
+				const char *shop = (insn->id == X86_INS_SAR)? "ASR": ">>";
+				// of exists only at count 1: sar clears it, shr keeps old msb
+				char *ofx = (insn->id == X86_INS_SAR)? NULL:
+					r_str_newf ("%d,%s,>>,1,&", bitsize - 1, dst_r);
+				esilprintf (op, "%s,?{,1,%s,-,%s,>>,1,&,cf,:=,1,%s,-,!,?{,%s,of,:=,},"
+					"%s,%s,%s,%s,$z,zf,:=,$p,pf,:=,%d,$s,sf,:=,}",
+					src, src, dst_r, src, r_str_get_fail (ofx, "0"),
+					src, dst_r, shop, dst_w, bitsize - 1);
+				free (ofx);
 			}
 			free (src);
 			free (dst_r);
@@ -1259,24 +1398,27 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 	case X86_INS_SHRD:
 		{
 			ut32 bitsize;
-			char shft[32];
-			cs_x86_op operand = insn->detail->x86.operands[2];
-			if (operand.type == X86_OP_IMM) {
-				snprintf (shft, sizeof (shft), "%" PFMT64d, operand.imm);
-			} else {
-				snprintf (shft, sizeof (shft), "%s", "cl");
-			}
+			char *count = getarg (&gop, 2, 0, NULL, NULL);
 			src = getarg (&gop, 1, 0, NULL, NULL);
 			dst_r = getarg (&gop, 0, 0, NULL, NULL);
 			dst_w = getarg (&gop, 0, 1, NULL, &bitsize);
-			esilprintf (op,  // set CF to last bit shifted out, OF if sign changes
-				"%s,?{,1,1,%s,-,%s,>>,&,cf,:=,1,%s,-,!,%s,%d,%s,>>,^,!,&,of,:=,"
-				"%s,%d,-,%s,<<,%s,%s,>>,|,1,%d,1,<<,-,&,%s,$z,zf,:=,$p,pf,:=,%d,$s,sf,:=,}",
-				shft, shft, dst_r, shft, src, bitsize-1, dst_r,
-				shft, bitsize, src, shft, dst_r, bitsize, dst_w, bitsize-1);
+			src2 = count? shift_count (count, bitsize): NULL;
+			free (count);
+			if (src && src2 && dst_r && dst_w) {
+				// cf = last bit shifted out; of says the sign changed, and the new
+				// sign is the low bit of the source, so both read pre-write values
+				esilprintf (op,
+					"%s,?{,1,%s,-,!,?{,%d,%s,>>,1,&,1,%s,&,^,of,:=,},"
+					"1,1,%s,-,%s,>>,&,cf,:=,"
+					"%s,%d,-,%s,<<,%s,%s,>>,|,1,%d,1,<<,-,&,%s,$z,zf,:=,$p,pf,:=,%d,$s,sf,:=,}",
+					src2, src2, bitsize - 1, dst_r, src,
+					src2, dst_r,
+					src2, bitsize, src, src2, dst_r, bitsize, dst_w, bitsize-1);
+			}
+			free (src);
+			free (src2);
 			free (dst_r);
 			free (dst_w);
-			free (src);
 		}
 		break;
 	case X86_INS_PSLLDQ:
@@ -1302,12 +1444,14 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		esilprintf (op, "al,ax,=,7,ax,>>,?{,0xff00,ax,|=,}");
 		break;
 	case X86_INS_CWDE:
+		zext_reg (&gop, "eax");
 		esilprintf (op, "ax,eax,=,15,eax,>>,?{,0xffff0000,eax,|=,}");
 		break;
 	case X86_INS_CWD:
 		esilprintf (op, "0,dx,=,15,ax,>>,?{,0xffff,dx,=,}");
 		break;
 	case X86_INS_CDQ:
+		zext_reg (&gop, "edx");
 		esilprintf (op, "0,edx,=,31,eax,>>,?{,0xffffffff,edx,=,}");
 		break;
 	case X86_INS_CQO:
@@ -1355,7 +1499,7 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 			} else if (insn->id == X86_INS_CMP) {
 				esilprintf (op,
 					"%s,%s,==,$z,zf,:=,%u,$b,cf,:=,$p,pf,:=,%u,$s,sf,:=,"\
-					"%s,0x%"PFMT64x",-,!,%u,$o,^,of,:=,3,$b,af,:=",
+					"%s,0x%"PFMT64x",-,!,%u,$o,^,of,:=,4,$b,af,:=",
 					src, dst, bitsize, bitsize - 1, src, (ut64)(1ULL << (bitsize - 1)), bitsize - 1);
 			} else {
 				char *rsrc = (char *)cs_reg_name (handle, INSOP(1).mem.base);
@@ -1363,7 +1507,7 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 				const int width = INSOP(0).size;
 				esilprintf (op,
 					"%s,%s,==,$z,zf,:=,%u,$b,cf,:=,$p,pf,:=,%u,$s,sf,:=,%s,0x%"PFMT64x","\
-					"-,!,%u,$o,^,of,:=,3,$b,af,:=,df,?{,%d,%s,-=,%d,%s,-=,}{,%d,%s,+=,%d,%s,+=,}",
+					"-,!,%u,$o,^,of,:=,4,$b,af,:=,df,?{,%d,%s,-=,%d,%s,-=,}{,%d,%s,+=,%d,%s,+=,}",
 					src, dst, bitsize, bitsize - 1, src, (ut64)(1ULL << (bitsize - 1)), bitsize - 1,
 					width, rsrc, width, rdst, width, rsrc, width, rdst);
 			}
@@ -1505,7 +1649,7 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 					ut8 buf[5] = {0};
 					const ut8 data[] = { 0xe8, 0, 0, 0, 0 };
 					RBin *bin = as->arch->binb.bin;
-					if (bin && bin->iob.read_at (bin->iob.io, addr - 5, buf, sizeof (buf))) {
+					if (bin && bin->iob.read_at (bin->iob.io, addr - 5, buf, sizeof (buf)) == sizeof (buf)) {
 						if (!memcmp (buf, data, sizeof (buf))) {
 							dst = getarg (&gop, 0, 0, NULL, NULL);
 							esilprintf (op, "0x%"PFMT64x",%s,=", addr, dst);
@@ -1677,7 +1821,7 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 				ut8 thunk[4] = {0};
 #if ARCH_HAVE_READ
 				RBin *bin = as->arch->binb.bin;
-				if (bin && bin->iob.read_at (bin->iob.io, (ut64)INSOP (0).imm, thunk, sizeof (thunk))) {
+				if (bin && bin->iob.read_at (bin->iob.io, (ut64)INSOP (0).imm, thunk, sizeof (thunk)) == sizeof (thunk)) {
 					/* Handle CALL ebx_pc (callpop)
 					   8b xx x4    mov <reg>, dword [esp]
 					   c3          ret
@@ -1700,7 +1844,7 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 				ut64 n = r_num_get (NULL, arg0);
 				if (n == at) {
 					RBin *bin = as->arch->binb.bin;
-					if (bin && bin->iob.read_at && bin->iob.read_at (bin->iob.io, at, b, sizeof (b))) {
+					if (bin && bin->iob.read_at && bin->iob.read_at (bin->iob.io, at, b, sizeof (b)) == sizeof (b)) {
 						if (b[0] == 0x5b) { // pop ebx
 							esilprintf (op, "0x%"PFMT64x",ebx,=", at);
 							free (arg0);
@@ -1868,52 +2012,25 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		}
 		break;
 	case X86_INS_BSF:
-		{
-			src = getarg (&gop, 1, 0, NULL, NULL);
-			dst = getarg (&gop, 0, 0, NULL, NULL);
-			if (strcmp (src, dst)) {
-				const ut32 commas = r_str_char_count (src, ',');
-				esilprintf (op, "%s,!,zf,:=,zf,?{,BREAK,},"
-						"0x%"PFMT64x",%s,:=,"
-						"%s,++,%s,:=,%s,1,<<,%s,&,!,?{,%d,GOTO,}",
-						src, UT64_MAX, dst, dst, dst, dst, src, 11 + commas * 2);
-			} else {
-				// unroll the loop to avoid use of DUP operation
-				const ut32 bits = INSOP (0).size * 8;
-				ut32 i = 0;
-				esilprintf (op, "%s,!,zf,:=,zf,?{,BREAK,}", src);
-				for (; i < bits - 1; i++) {
-					r_strbuf_appendf (&op->esil, ",0x%"PFMT64x",%s,&,?{,%d,%s,:=,BREAK,}",
-						((ut64)1) << i, src, i, dst);
-				}
-				r_strbuf_appendf (&op->esil, ",%d,%s,:=", i, dst);
-			}
-			R_FREE (src);
-			R_FREE (dst);
-		}
-		break;
 	case X86_INS_BSR:
 		{
+			// bsr scans from the top bit downwards, bsf from bit zero up
+			const bool up = insn->id == X86_INS_BSF;
+			const ut32 bits = INSOP (0).size * 8;
+			const int start = up? 0: (int)bits - 1;
+			const ut64 bit = up? 1: (ut64)1 << (bits - 1);
 			src = getarg (&gop, 1, 0, NULL, NULL);
 			dst = getarg (&gop, 0, 0, NULL, NULL);
-			const ut32 bits = INSOP (0).size * 8;
-
-			if (strcmp (src, dst)) {
-				const ut32 commas = r_str_char_count (src, ',');
-				esilprintf (op, "%s,!,zf,:=,zf,?{,BREAK,},"
-						"%d,%s,:=,"
-						"%s,--,%s,:=,%s,1,<<,%s,&,!,?{,%d,GOTO,}",
-						src, bits, dst, dst, dst, dst, src, 11 + commas * 2);
-			} else {
-				// unroll the loop to avoid use of DUP operation
-				ut32 i = bits - 1;
-				esilprintf (op, "%s,!,zf,:=,zf,?{,BREAK,}", src);
-				for (; i; i--) {
-					r_strbuf_appendf (&op->esil, ",0x%"PFMT64x",%s,&,?{,%d,%s,:=,BREAK,}",
-						((ut64)1) << i, src, i, dst);
-				}
-				r_strbuf_appendf (&op->esil, ",0,%s,:=", dst);
-			}
+			char pre[24];
+			zext_prefix (&gop, dst, pre, sizeof (pre));
+			// the source is staged first, so dst may be src or address it
+			const ut32 head = r_str_char_count (src, ',')
+				+ r_str_char_count (pre, ',') + 13;
+			esilprintf (op, "%s,NUM,DUP,!,zf,:=,zf,?{,BREAK,}%s,"
+					"%d,%s,:=,"
+					"DUP,0x%"PFMT64x",&,!,?{,1,SWAP,%s,1,%s,%s,%d,GOTO,}",
+					src, pre, start, dst, bit, up? ">>": "<<",
+					dst, up? "+=": "-=", head);
 			R_FREE (src);
 			R_FREE (dst);
 		}
@@ -1921,20 +2038,72 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 	case X86_INS_BSWAP:
 		{
 			dst = getarg (&gop, 0, 0, NULL, NULL);
-			if (INSOP(0).size == 4) {
-				esilprintf (op, "0xff000000,24,%s,NUM,<<,&,24,%s,NUM,>>,|,"
-						"8,0x00ff0000,%s,NUM,&,>>,|,"
-						"8,0x0000ff00,%s,NUM,&,<<,|,"
-						"%s,=", dst, dst, dst, dst, dst);
-			} else {
-				esilprintf (op, "0xff00000000000000,56,%s,NUM,<<,&,"
-						"56,%s,NUM,>>,|,40,0xff000000000000,%s,NUM,&,>>,|,"
-						"40,0xff00,%s,NUM,&,<<,|,24,0xff0000000000,%s,NUM,&,>>,|,"
-						"24,0xff0000,%s,NUM,&,<<,|,8,0xff00000000,%s,NUM,&,>>,|,"
-						"8,0xff000000,%s,NUM,&,<<,|,"
-						"%s,=", dst, dst, dst, dst, dst, dst, dst, dst, dst);
-			}
+			zext_opnd (&gop, 0);
+			char *sw = byteswap_expr (dst, (INSOP (0).size == 4)? 4: 8);
+			esilprintf (op, "%s,%s,=", sw, dst);
+			free (sw);
 			R_FREE (dst);
+		}
+		break;
+	case X86_INS_POPCNT:
+	case X86_INS_LZCNT:
+	case X86_INS_TZCNT:
+		{
+			const char *reg = (INSOP (0).type == X86_OP_REG)
+				? cs_reg_name (handle, INSOP (0).reg): NULL;
+			src = getarg (&gop, 1, 0, NULL, NULL);
+			if (reg && src) {
+				const int id = insn->id;
+				const int bits = INSOP (0).size * 8;
+				RStrBuf *sb = r_strbuf_new ("");
+				zext_reg (&gop, reg);
+				r_strbuf_appendf (sb, "%s,%s,=", src, reg);
+				if (id != X86_INS_POPCNT) {
+					r_strbuf_appendf (sb, ",%s,!,cf,:=", reg);
+				}
+				if (id == X86_INS_TZCNT) {
+					// tzcnt = popcount(~x & (x - 1))
+					r_strbuf_appendf (sb, ",0x%"PFMT64x",%s,^,1,%s,-,&,%s,=",
+						UT64_MAX >> (64 - bits), reg, reg, reg);
+				} else if (id == X86_INS_LZCNT) {
+					int i;
+					// smear: one bit per non-leading zero
+					for (i = 1; i < bits; i *= 2) {
+						r_strbuf_appendf (sb, ",%d,%s,>>,%s,|,%s,=", i, reg, reg, reg);
+					}
+				}
+				popcnt_esil (sb, reg, bits);
+				if (id == X86_INS_LZCNT) {
+					r_strbuf_appendf (sb, ",%s,%d,-,%s,=", reg, bits, reg);
+				} else if (id == X86_INS_POPCNT) {
+					r_strbuf_append (sb, ",0,cf,:=,0,of,:=,0,sf,:=,0,af,:=,0,pf,:=");
+				}
+				r_strbuf_appendf (sb, ",%s,!,zf,:=", reg);
+				esilprintf (op, "%s", r_strbuf_get (sb));
+				r_strbuf_free (sb);
+			}
+			free (src);
+		}
+		break;
+	case X86_INS_MOVBE:
+		{
+			src = getarg (&gop, 1, 0, NULL, NULL);
+			dst = getarg (&gop, 0, 1, NULL, NULL);
+			if (src && dst) {
+				// swapping in place reads memory once
+				const bool to_reg = INSOP (0).type == X86_OP_REG;
+				const char *val = to_reg
+					? cs_reg_name (handle, INSOP (0).reg): src;
+				char *sw = byteswap_expr (val, INSOP (1).size);
+				if (to_reg) {
+					esilprintf (op, "%s,%s,%s,%s", src, dst, sw, dst);
+				} else {
+					esilprintf (op, "%s,%s", sw, dst);
+				}
+				free (sw);
+			}
+			free (src);
+			free (dst);
 		}
 		break;
 	case X86_INS_OR:
@@ -1978,7 +2147,7 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		{
 			ut32 bitsize;
 			src = getarg (&gop, 0, 1, "--", &bitsize);
-			esilprintf (op, "%s,%d,$o,of,:=,%d,$s,sf,:=,$z,zf,:=,$p,pf,:=,3,$b,af,:=", src, bitsize - 1, bitsize - 1);
+			esilprintf (op, "%s,%d,$o,of,:=,%d,$s,sf,:=,$z,zf,:=,$p,pf,:=,4,$b,af,:=", src, bitsize - 1, bitsize - 1);
 			free (src);
 		}
 		break;
@@ -2003,16 +2172,11 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 			ut32 bitsize;
 			src = getarg (&gop, 1, 0, NULL, NULL);
 			dst = getarg (&gop, 0, 1, "-", &bitsize);
-
-			if (!bitsize || bitsize > 64) {
-				break;
+			if (bitsize && bitsize <= 64) {
+				// $b, not $c: the carry flag really represents a borrow here
+				esilprintf (op, "%s,0x%"PFMT64x",-,!,%s,%s,%u,$o,^,of,:=,%u,$s,sf,:=,$z,zf,:=,$p,pf,:=,%u,$b,cf,:=,4,$b,af,:=",
+					src, (ut64)(1ULL << (bitsize - 1)), src, dst, bitsize - 1, bitsize - 1, bitsize);
 			}
-
-			// Set OF, SF, ZF, AF, PF, and CF flags.
-			// We use $b rather than $c here as the carry flag really
-			// represents a "borrow"
-			esilprintf (op, "%s,%s,%s,0x%"PFMT64x",-,!,%u,$o,^,of,:=,%u,$s,sf,:=,$z,zf,:=,$p,pf,:=,%u,$b,cf,:=,3,$b,af,:=",
-				src, dst, src, (uint64_t)(1ULL) << (bitsize - 1), bitsize - 1, bitsize - 1, bitsize);
 			free (src);
 			free (dst);
 		}
@@ -2022,11 +2186,24 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		{
 			ut32 bitsize;
 			src = getarg (&gop, 1, 0, NULL, NULL);
-			dst = getarg (&gop, 0, 0, NULL, &bitsize);
-			esilprintf (op, "cf,%s,+,%s,-=,%d,$o,of,:=,%d,$s,sf,:=,$z,zf,:=,$p,pf,:=,%d,$b,cf,:=",
-				src, dst, bitsize - 1, bitsize - 1, bitsize);
+			dst_r = getarg (&gop, 0, 0, NULL, &bitsize);
+			dst_w = getarg (&gop, 0, 1, "-", NULL);
+			if (src && dst_r && dst_w && bitsize && bitsize <= 64) {
+				// borrows pushed before the write clobbers dst, popped after
+				esilprintf (op, "%s,%s,==,%u,$b,cf,$z,&,|,"
+					"0xf,%s,&,0xf,%s,&,==,4,$b,cf,$z,&,|,"
+					"%s,0x%"PFMT64x",-,!,cf,!,&,"
+					"cf,%s,+,%s,%u,$o,^,of,:=,"
+					"%u,$s,sf,:=,$z,zf,:=,$p,pf,:=,af,:=,cf,:=",
+					src, dst_r, bitsize,
+					src, dst_r,
+					src, (ut64)1ULL << (bitsize - 1),
+					src, dst_w, bitsize - 1,
+					bitsize - 1);
+			}
 			free (src);
-			free (dst);
+			free (dst_r);
+			free (dst_w);
 		}
 		break;
 	case X86_INS_LIDT:
@@ -2123,24 +2300,17 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 			// IDIV does not change flags
 			op->sign = true;
 			if (!arg2 && !arg1) {
-				// TODO: IDIV rbx not implemented. this is just a workaround
-				//
-				// https://www.tptp.cc/mirrors/siyobik.info/instruction/IDIV.html
-				// Divides (signed) the value in the AX, DX:AX, or EDX:EAX registers (dividend) by the source operand (divisor) and stores the result in the AX (AH:AL), DX:AX, or EDX:EAX registers. The source operand can be a general-purpose register or a memory location. The action of this instruction depends on the operand size (dividend/divisor), as shown in the following table:
-				// IDIV RBX    ==   RDX:RAX /= RBX
-
-				//
+				// TODO: 64-bit idiv needs a 128-bit dividend
 				if (arg0) {
 					int width = INSOP(0).size;
-					const char *r_quot = (width == 1)?"al": (width == 2)?"ax": (width == 4)?"eax":"rax";
-					const char *r_rema = (width == 1)?"ah": (width == 2)?"dx": (width == 4)?"edx":"rdx";
-					const char *r_nume = (width == 1)?"ax": r_quot;
-
-					esilprintf (op, "%d,%s,~,%d,%s,<<,%s,+,~%%,%d,%s,~,%d,%s,<<,%s,+,~/,%s,=,%s,=",
-							width*8, arg0, width*8, r_rema, r_nume, width*8, arg0, width*8, r_rema, r_nume, r_quot, r_rema);
-				}
-				else {
-					/* should never happen */
+					const char *r_quot, *r_rema;
+					muldiv_regs (width, &r_quot, &r_rema);
+					char *num = muldiv_dividend (width, r_quot, r_rema, true);
+					zext_reg (&gop, r_quot);
+					zext_reg (&gop, r_rema);
+					esilprintf (op, "%d,%s,~,%s,~%%,%d,%s,~,%s,~/,%s,=,%s,=",
+							width*8, arg0, num, width*8, arg0, num, r_quot, r_rema);
+					free (num);
 				}
 			} else {
 				// does this instruction even exist?
@@ -2154,15 +2324,18 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		break;
 	case X86_INS_DIV:
 		{
+			// DIV does not change flags and is unsigned
+			// TODO: 64-bit div needs a 128-bit dividend, so rdx is ignored there
 			int width = INSOP(0).size;
 			dst = getarg (&gop, 0, 0, NULL, NULL);
-			const char *r_quot = (width == 1)?"al": (width == 2)?"ax": (width == 4)?"eax":"rax";
-			const char *r_rema = (width == 1)?"ah": (width == 2)?"dx": (width == 4)?"edx":"rdx";
-			const char *r_nume = (width == 1)?"ax": r_quot;
-			// DIV does not change flags and is unsigned
-
-			esilprintf (op, "%s,%d,%s,<<,%s,+,%%,%s,%d,%s,<<,%s,+,/,%s,=,%s,=",
-					dst, width*8, r_rema, r_nume, dst, width*8, r_rema, r_nume, r_quot, r_rema);
+			const char *r_quot, *r_rema;
+			muldiv_regs (width, &r_quot, &r_rema);
+			char *num = muldiv_dividend (width, r_quot, r_rema, false);
+			zext_reg (&gop, r_quot);
+			zext_reg (&gop, r_rema);
+			esilprintf (op, "%s,%s,%%,%s,%s,/,%s,=,%s,=",
+					dst, num, dst, num, r_quot, r_rema);
+			free (num);
 			free (dst);
 		}
 		break;
@@ -2179,21 +2352,22 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 				if (arg2) {
 					multiplier = arg2;
 				}
+				zext_opnd (&gop, 0);
 				esilprintf (op, "%d,%s,~,%d,%s,~,*,DUP,%s,=,%d,%s,~,-,!,!,DUP,cf,:=,of,:=",
 					width*8, multiplier, width*8, arg1, arg0, width*8, arg0);
-			} else {
-				if (arg0) {
-					const char *r_quot = (width == 1)?"al": (width==2)?"ax": (width==4)?"eax":"rax";
-					const char *r_rema = (width == 1)?"ah": (width==2)?"dx": (width==4)?"edx":"rdx";
-					const char *r_nume = (width == 1)?"ax": r_quot;
-
-					if (width == 8) { // TODO still needs to be fixed to handle correct signed 128 bit value
-						esilprintf (op, "%s,%s,L*,%s,=,DUP,%s,=,!,!,DUP,cf,:=,of,:=", // flags will be sometimes wrong
-								arg0, r_nume, r_nume, r_rema);
-					} else {
-						esilprintf (op, "%d,%s,~,%d,%s,~,*,DUP,DUP,%s,=,%d,SWAP,>>,%s,=,%d,%s,~,-,!,!,DUP,cf,:=,of,:=",
-								width*8, arg0, width*8, r_nume, r_nume, width*8, r_rema, width*8, r_nume);
-					}
+			} else if (arg0) {
+				const char *r_quot, *r_rema;
+				muldiv_regs (width, &r_quot, &r_rema);
+				zext_reg (&gop, r_quot);
+				zext_reg (&gop, r_rema);
+				if (width == 8) {
+					// L* is unsigned, so fix the high half; the source is
+					// staged in rema first, to read a memory one once
+					esilprintf (op, "%s,%s,=,63,%s,>>,%s,*,63,%s,>>,%s,*,+,%s,%s,L*,%s,=,-,DUP,%s,=,63,%s,>>,0,-,^,!,!,DUP,cf,:=,of,:=",
+							arg0, r_rema, r_quot, r_rema, r_rema, r_quot, r_rema, r_quot, r_quot, r_rema, r_quot);
+				} else {
+					esilprintf (op, "%d,%s,~,%d,%s,~,*,DUP,DUP,%s,=,%d,SWAP,>>,%s,=,%d,%s,~,-,!,!,DUP,cf,:=,of,:=",
+							width*8, arg0, width*8, r_quot, r_quot, width*8, r_rema, width*8, r_quot);
 				}
 			}
 			free (arg0);
@@ -2205,17 +2379,18 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		{
 			src = getarg (&gop, 0, 0, NULL, NULL);
 			if (src) {
+				// mul multiplies al, not ax, at a byte width
 				int width = INSOP(0).size;
-				const char *r_quot = (width == 1)?"al": (width == 2)?"ax": (width == 4)?"eax":"rax";
-				const char *r_rema = (width == 1)?"ah": (width == 2)?"dx": (width == 4)?"edx":"rdx";
-				const char *r_nume = (width == 1)?"ax": r_quot;
-
-				if (width == 8 ) {
+				const char *r_quot, *r_rema;
+				muldiv_regs (width, &r_quot, &r_rema);
+				zext_reg (&gop, r_quot);
+				zext_reg (&gop, r_rema);
+				if (width == 8) {
 					esilprintf (op, "%s,%s,L*,%s,=,DUP,%s,=,!,!,DUP,cf,:=,of,:=",
-							src, r_nume, r_nume, r_rema);
+							src, r_quot, r_quot, r_rema);
 				} else {
 					esilprintf (op, "%s,%s,*,DUP,%s,=,%d,SWAP,>>,DUP,%s,=,!,!,DUP,cf,:=,of,:=",
-							src, r_nume, r_nume, width*8, r_rema); // this should be ok for width == 1 also
+							src, r_quot, r_quot, width*8, r_rema);
 				}
 				free (src);
 			}
@@ -2253,28 +2428,13 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 			ut32 bitsize;
 			src = getarg (&gop, 0, 0, NULL, NULL);
 			dst = getarg (&gop, 0, 1, NULL, &bitsize);
-			ut64 xor = 0;
-			switch (bitsize) {
-			case 8:
-				xor = UT8_MAX;
-				break;
-			case 16:
-				xor = UT16_MAX;
-				break;
-			case 32:
-				xor = UT32_MAX;
-				break;
-			case 64:
-				xor = UT64_MAX;
-				break;
-			default:
-				R_LOG_ERROR ("Neg: Unhandled bitsize %d", bitsize);
+			if (bitsize && bitsize <= 64) {
+				const ut64 mask = r_num_bitmask (bitsize);
+				const ut64 intmin = 1ULL << (bitsize - 1);
+				// only INT_MIN overflows on negation; pf comes from the parity term
+				esilprintf (op, "%s,!,!,cf,:=,0xf,%s,&,!,!,af,:=,%s,0x%"PFMT64x",^,1,+,%s,$z,zf,:=,%s,0x%"PFMT64x",^,!,of,:=,%d,$s,sf,:=,$p,pf,:=",
+					src, src, src, mask, dst, src, intmin, bitsize - 1);
 			}
-			// OF set iff the operand is INT_MIN (the only value that overflows on
-			// negation); PF from the parity term, not the overflow term
-			ut64 intmin = 1ULL << (bitsize - 1);
-			esilprintf (op, "%s,!,!,cf,:=,%s,0x%"PFMT64x",^,1,+,%s,$z,zf,:=,%s,0x%"PFMT64x",^,!,of,:=,%d,$s,sf,:=,$p,pf,:=",
-				src, src, xor, dst, src, intmin, bitsize - 1);
 			free (src);
 			free (dst);
 		}
@@ -2302,6 +2462,8 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		{
 			dst = getarg (&gop, 0, 0, NULL, NULL);
 			src = getarg (&gop, 1, 0, NULL, NULL);
+			zext_opnd (&gop, 0);
+			zext_opnd (&gop, 1);
 			if (!strcmp (src, dst)) {
 				esilprintf (op, ",");
 			} else if (INSOP(0).type == X86_OP_MEM) {
@@ -2330,36 +2492,23 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		break;
 	case X86_INS_XADD: /* xchg + add */
 		{
+			ut32 bitsize;
 			src = getarg (&gop, 1, 0, NULL, NULL);
 			dst = getarg (&gop, 0, 0, NULL, NULL);
-			dstAdd = getarg (&gop, 0, 1, "+", NULL);
-			if (INSOP(0).type == X86_OP_MEM) {
-				dst2 = getarg (&gop, 0, 1, NULL, NULL);
-				esilprintf (op,
-					"%s,%s,^,%s,=,"
-					"%s,%s,^,%s,"
-					"%s,%s,^,%s,=,"
-					"%s,%s",
-					dst, src, src,	// x = x ^ y
-					src, dst, dst2,	// y = y ^ x
-					dst, src, src,  // x = x ^ y
-					src, dstAdd);
-				R_FREE (dst2);
+			dst2 = getarg (&gop, 0, 1, NULL, &bitsize);
+			zext_opnd (&gop, 1);
+			char *fl = add_flags (bitsize);
+			// the sum is staged, so xadd r,r doubles r instead of zeroing it
+			if (INSOP (0).type == X86_OP_MEM) {
+				// src may address dst, so the store goes before it
+				esilprintf (op, "%s,DUP,%s,+,%s,%s,%s,=", dst, src, dst2, fl, src);
 			} else {
-				esilprintf (op,
-					"%s,%s,^,%s,=,"
-					"%s,%s,^,%s,=,"
-					"%s,%s,^,%s,=,"
-					"%s,%s",
-					dst, src, src,  // x = x ^ y
-					src, dst, dst,  // y = y ^ x
-					dst, src, src,  // x = x ^ y
-					src, dstAdd);
-				//esilprintf (op, "%s,%s,%s,=,%s", src, dst, src, dst);
+				esilprintf (op, "%s,DUP,%s,+,SWAP,%s,=,%s,%s", dst, src, src, dst2, fl);
 			}
+			free (fl);
 			free (src);
 			free (dst);
-			free (dstAdd);
+			free (dst2);
 		}
 		break;
 	case X86_INS_FADD:
@@ -2547,8 +2696,9 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 			src = getarg (&gop, 1, 0, NULL, NULL);
 			dst = getarg (&gop, 0, 1, "+", &bitsize);
 			if (src && dst) {
-				esilprintf (op, "%s,%s,%d,$o,of,:=,%d,$s,sf,:=,$z,zf,:=,%d,$c,cf,:=,$p,pf,:=,3,$c,af,:=",
-					src, dst, bitsize - 1, bitsize - 1, bitsize - 1);
+				char *fl = add_flags (bitsize);
+				esilprintf (op, "%s,%s,%s", src, dst, fl);
+				free (fl);
 			}
 			free (src);
 			free (dst);
@@ -2558,19 +2708,22 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		{
 			ut32 bitsize;
 			src = getarg (&gop, 1, 0, NULL, NULL);
-			dst = getarg (&gop, 0, 1, "+", &bitsize);
-			// dst = dst + src + cf
-			// NOTE: We would like to add the carry first before adding the
-			// source to ensure that the flag computation from $c belongs
-			// to the operation of adding dst += src rather than the one
-			// that adds carry (as esil only keeps track of the last
-			// addition to set the flags).
-			if (src && dst) {
-				esilprintf (op, "cf,%s,+,%s,%d,$o,of,:=,%d,$s,sf,:=,$z,zf,:=,%d,$c,cf,:=,$p,pf,:=,3,$c,af,:=",
-					src, dst, bitsize - 1, bitsize - 1, bitsize - 1);
+			dst_r = getarg (&gop, 0, 0, NULL, &bitsize);
+			dst_w = getarg (&gop, 0, 1, "+", NULL);
+			if (src && dst_r && dst_w && bitsize && bitsize <= 64) {
+				const ut64 mask = r_num_bitmask (bitsize);
+				const ut64 smax = r_num_bitmask (bitsize - 1);
+				// cf/af are stacked before the write: src+cf can wrap and lose them
+				esilprintf (op, "0x%"PFMT64x",%s,&,%s,0x%"PFMT64x",^,==,%u,$b,cf,$z,&,|,"
+					"0xf,%s,&,0xf,%s,&,0xf,^,==,4,$b,cf,$z,&,|,"
+					"%s,0x%"PFMT64x",-,!,cf,&,cf,%s,+,%s,%u,$o,^,of,:=,"
+					"%u,$s,sf,:=,$z,zf,:=,$p,pf,:=,af,:=,cf,:=",
+					mask, src, dst_r, mask, bitsize, src, dst_r,
+					src, smax, src, dst_w, bitsize - 1, bitsize - 1);
 			}
 			free (src);
-			free (dst);
+			free (dst_r);
+			free (dst_w);
 		}
 		break;
 		/* Direction flag */
@@ -2721,6 +2874,10 @@ static void anop_esil(RArchSession *as, RAnalOp *op, ut64 addr, const ut8 *buf, 
 		r_strbuf_prepend (&op->esil, ",!,?{,BREAK,},");
 		r_strbuf_prepend (&op->esil, counter);
 		r_strbuf_appendf (&op->esil, ",%s,--=,zf,?{,BREAK,},0,GOTO", counter);
+	}
+	if (R_STR_ISNOTEMPTY (gop.zext) && r_strbuf_length (&op->esil) > 0) {
+		// after the flag assignments, so this doesnt disturb the comparison state
+		r_strbuf_append (&op->esil, gop.zext);
 	}
 }
 
@@ -2968,6 +3125,15 @@ static int find_immop(cs_insn *insn) {
 	return -1;
 }
 
+static void disp2ptr(RAnalOp *op, cs_insn *insn, int opidx) {
+	const st64 disp = INSOP (opidx).mem.disp;
+	const st64 threshold = (INSOP (opidx).mem.base == X86_REG_INVALID)? 0x1000: 0x10000;
+	if (disp >= threshold) {
+		op->ptr = (ut64)disp;
+		op->disp = UT64_MAX;
+	}
+}
+
 static void op0_memimmhandle(RAnalOp *op, cs_insn *insn, ut64 addr, int regsz) {
 	op->ptr = UT64_MAX;
 	switch (INSOP (0).type) {
@@ -2989,9 +3155,8 @@ static void op0_memimmhandle(RAnalOp *op, cs_insn *insn, ut64 addr, int regsz) {
 			if (op->ptr < 0x1000) {
 				op->ptr = UT64_MAX;
 			}
-		} else if (op->disp > 1000) {
-			op->ptr = op->disp;
-			op->disp = UT64_MAX;
+		} else {
+			disp2ptr (op, insn, 0);
 		}
 		break;
 	case X86_OP_REG:
@@ -3031,6 +3196,8 @@ static void op1_memimmhandle(RAnalOp *op, cs_insn *insn, ut64 addr, int regsz) {
 			} else if (INSOP (1).mem.segment == X86_REG_INVALID && INSOP (1).mem.base == X86_REG_INVALID
 					&& INSOP (1).mem.index == X86_REG_INVALID && INSOP (1).mem.scale == 1) { // [<addr>]
 				op->ptr = op->disp;
+			} else {
+				disp2ptr (op, insn, 1);
 			}
 			break;
 		case X86_OP_IMM:
@@ -3073,18 +3240,15 @@ static void op_stackidx(RAnalOp *op, cs_insn *insn, bool minus) {
 	}
 }
 
-static void set_opdir(RAnalOp *op, cs_insn *insn, int syntax) {
-	// Use normalized operand indices for AT&T syntax support
-	int dst_idx = norm_op (0, syntax, INSOPS);
-	int src_idx = norm_op (1, syntax, INSOPS);
+static void set_opdir(RAnalOp *op, cs_insn *insn) {
 	switch (op->type & R_ANAL_OP_TYPE_MASK) {
 	case R_ANAL_OP_TYPE_MOV:
-		switch (INSOP (dst_idx).type) {
+		switch (INSOP (0).type) {
 		case X86_OP_MEM:
 			op->direction = R_ANAL_OP_DIR_WRITE;
 			break;
 		case X86_OP_REG:
-			if (INSOP (src_idx).type == X86_OP_MEM) {
+			if (INSOP (1).type == X86_OP_MEM) {
 				op->direction = R_ANAL_OP_DIR_READ;
 			}
 			break;
@@ -3511,11 +3675,10 @@ static void anop(RArchSession *a, RAnalOp *op, ut64 addr, const ut8 *buf, int le
 		op->type = R_ANAL_OP_TYPE_MOV;
 		op0_memimmhandle (op, insn, addr, regsz);
 		op1_memimmhandle (op, insn, addr, regsz);
-		const int src_idx = norm_op (1, a->config->syntax, INSOPS);
-		if (INSOP (src_idx).type == X86_OP_MEM) {
-			op->ireg = cs_reg_name (*handle, INSOP (src_idx).mem.index);
-			op->disp = INSOP (src_idx).mem.disp;
-			op->scale = INSOP (src_idx).mem.scale;
+		if (INSOP (1).type == X86_OP_MEM) {
+			op->ireg = cs_reg_name (*handle, INSOP (1).mem.index);
+			op->disp = INSOP (1).mem.disp;
+			op->scale = INSOP (1).mem.scale;
 		}
 		}
 		break;
@@ -3631,7 +3794,7 @@ static void anop(RArchSession *a, RAnalOp *op, ut64 addr, const ut8 *buf, int le
 				}
 				break;
 			default:
-				/* unhandled */
+				disp2ptr (op, insn, 1);
 				break;
 			}
 			break;
@@ -4246,7 +4409,7 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
 			break;
 		}
 		anop (as, op, addr, buf, len, &handle, insn);
-		set_opdir (op, insn, as->config->syntax);
+		set_opdir (op, insn);
 		if (mask & R_ARCH_OP_MASK_ESIL) {
 			anop_esil (as, op, addr, buf, len, handle, insn);
 		}

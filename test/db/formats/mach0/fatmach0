@@ -137,6 +137,7 @@ RUN
 
 NAME=fatmach0 entry0
 FILE=bins/mach0/fatmach0-3true
+ARGS=-a x86 -b 64
 CMDS=?v entry0
 EXPECT=<<EOF
 0x100000ef8
@@ -145,26 +146,25 @@ RUN
 
 NAME=fatmach0 entry0 data
 FILE=bins/mach0/fatmach0-3true
+ARGS=-a x86 -b 64
 CMDS=p8 16 @ entry0
 EXPECT=<<EOF
 6a004889e54883e4f0488b7d08488d75
 EOF
 RUN
 
+# merged: fatmach0 entry1 data
 NAME=fatmach0 entry1
 FILE=bins/mach0/fatmach0-3true
 ARGS=-a x86 -b 32
-CMDS=?v entry0
+CMDS=<<EOF
+?v entry0
+?e --
+p8 16 @ entry0
+EOF
 EXPECT=<<EOF
 0x1f44
-EOF
-RUN
-
-NAME=fatmach0 entry1 data
-FILE=bins/mach0/fatmach0-3true
-ARGS=-a x86 -b 32
-CMDS=p8 16 @ entry0
-EXPECT=<<EOF
+--
 6a0089e583e4f083ec108b5d04891c24
 EOF
 RUN
@@ -198,20 +198,18 @@ paddr      vaddr      phaddr     vhaddr     type
 EOF
 RUN
 
+# merged: fatmach0 entry2 data
 NAME=fatmach0 entry2
 FILE=bins/mach0/fatmach0-3true
 ARGS=-a ppc -b 32
-CMDS=?v entry0
+CMDS=<<EOF
+?v entry0
+?e --
+p8 16 @ entry0
+EOF
 EXPECT=<<EOF
 0x1f64
-EOF
-RUN
-
-NAME=fatmach0 entry2 data
-FILE=bins/mach0/fatmach0-3true
-ARGS=-a ppc -b 32
-CMDS=p8 16 @ entry0
-EXPECT=<<EOF
+--
 7c3a0b783821fffc5421003438000000
 EOF
 RUN
@@ -422,6 +420,7 @@ RUN
 
 NAME=fatmacho o- refuses to close mounted fd
 FILE=bins/mach0/fatmach0-3true
+ARGS=-a x86 -b 64
 CMDS=<<EOF
 o~?
 o-3
@@ -435,6 +434,7 @@ RUN
 
 NAME=fatmacho o- works after umount
 FILE=bins/mach0/fatmach0-3true
+ARGS=-a x86 -b 64
 CMDS=<<EOF
 m-/bin
 o-3
@@ -447,6 +447,7 @@ RUN
 
 NAME=fatmacho mo loads binfile for slice
 FILE=bins/mach0/fatmach0-3true
+ARGS=-a x86 -b 64
 CMDS=<<EOF
 mo /bin/ppc_32.2
 ob~?

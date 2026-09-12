@@ -55,7 +55,7 @@ R_API int r_anal_diff_fingerprint_bb(RAnal *anal, RAnalBlock *bb) {
 		free (bb->fingerprint);
 		return 0;
 	}
-	if (anal->iob.read_at (anal->iob.io, bb->addr, buf, bb->size)) {
+	if (anal->iob.read_at (anal->iob.io, bb->addr, buf, bb->size) == bb->size) {
 		memcpy (bb->fingerprint, buf, bb->size);
 		if (anal->diff_ops) { // diff using only the opcode
 			if (!(op = r_anal_op_new ())) {
@@ -71,8 +71,9 @@ R_API int r_anal_diff_fingerprint_bb(RAnal *anal, RAnalBlock *bb) {
 					memset (bb->fingerprint+idx+op->nopcode, 0, oplen-op->nopcode);
 				}
 				idx += oplen;
+				r_anal_op_fini (op);
 			}
-			free (op);
+			r_anal_op_free (op);
 		}
 	}
 	free (buf);

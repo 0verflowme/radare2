@@ -151,9 +151,51 @@ bool test_reg_alias_op(void) {
 	mu_end;
 }
 
+bool test_define_op(void) {
+	RAnal *anal = r_anal_new ();
+	mu_assert_notnull (anal, "r_anal_new failed");
+	bool profile = r_reg_set_profile_string (anal->reg,
+		"=PC r0\n"
+		"=A0 r0\n"
+		"gpr r0 .16 0 0\n"
+		"gpr r1 .16 16 0");
+	mu_assert_true (profile, "failed to set reg profile");
+
+	bool defined = r_esil_define (anal->esil, "TRIPLE", "DUP,DUP,+,+", 1, 1, R_ESIL_OP_TYPE_MATH);
+	mu_assert_true (defined, "failed to define op");
+	bool parsed = r_esil_parse (anal->esil, "5,TRIPLE,r1,=");
+	mu_assert_true (parsed, "failed to parse defined op");
+	mu_assert_eq (r_reg_getv (anal->reg, "r1"), 15, "defined op computed wrong value");
+
+	// redefining replaces the expansion in place
+	defined = r_esil_define (anal->esil, "TRIPLE", "1,+", 1, 1, R_ESIL_OP_TYPE_MATH);
+	mu_assert_true (defined, "failed to redefine op");
+	parsed = r_esil_parse (anal->esil, "5,TRIPLE,r1,=");
+	mu_assert_true (parsed, "failed to parse redefined op");
+	mu_assert_eq (r_reg_getv (anal->reg, "r1"), 6, "redefined op computed wrong value");
+
+	r_anal_free (anal);
+	mu_end;
+}
+
+bool test_define_recursion(void) {
+	RAnal *anal = r_anal_new ();
+	mu_assert_notnull (anal, "r_anal_new failed");
+	// a self-referencing definition must trap instead of overflowing the C stack
+	bool defined = r_esil_define (anal->esil, "LOOP", "1,LOOP", 1, 0, R_ESIL_OP_TYPE_MATH);
+	mu_assert_true (defined, "failed to define recursive op");
+	bool parsed = r_esil_parse (anal->esil, "LOOP");
+	mu_assert_false (parsed, "recursive definition did not stop");
+	mu_assert_eq (anal->esil->trap, 1, "recursive definition did not trap");
+	r_anal_free (anal);
+	mu_end;
+}
+
 int main(int argc, char **argv) {
 	mu_run_test (test_setup_keeps_custom_interfaces);
 	mu_run_test (test_setup_installs_default_interfaces);
 	mu_run_test (test_reg_alias_op);
+	mu_run_test (test_define_op);
+	mu_run_test (test_define_recursion);
 	return tests_passed != tests_run;
 }

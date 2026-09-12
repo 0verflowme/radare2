@@ -1,0 +1,23 @@
+NAME=ELF Itanium exception cleanup region
+FILE=bins/elf/ClassCpp.out
+CMDS=iwj~{[0]}
+EXPECT=<<EOF
+{"index":0,"source":4713,"from":4778,"to":4872,"handler":4908,"filter":0,"kind":"cleanup"}
+EOF
+RUN
+
+NAME=ELF Itanium catch-all region
+FILE=bins/elf/demangle-test-cpp
+CMDS=iwj~{[1]}
+EXPECT=<<EOF
+{"index":1,"source":5546,"from":5808,"to":5871,"handler":6019,"filter":0,"kind":"catch","typeFilter":1,"catchAll":true}
+EOF
+RUN
+
+NAME=ELF Itanium typed catch region
+FILE=bins/elf/0pack
+CMDS=iwj~{[0]}
+EXPECT=<<EOF
+{"index":0,"source":4684212,"from":4684240,"to":4684243,"handler":4684248,"filter":0,"kind":"catch","typeFilter":1,"type":"std::exception"}
+EOF
+RUN

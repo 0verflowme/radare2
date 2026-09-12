@@ -27,9 +27,9 @@ static const char *str_callback(RNum *user, ut64 addr, bool *ok) {
 	}
 	if (user) {
 		RFlag *f = (RFlag*)user;
-		const RList *list = r_flag_get_list (f, addr);
-		if (list && !r_list_empty (list)) {
-			RFlagItem *item = r_list_last (list);
+		const RVecFlagItemPtr *list = r_flag_get_vec (f, addr);
+		RFlagItem *item = r_flag_item_vec_last (list);
+		if (item) {
 			if (ok) {
 				*ok = true;
 			}
@@ -39,12 +39,67 @@ static const char *str_callback(RNum *user, ut64 addr, bool *ok) {
 	return NULL;
 }
 
+/* RFlagsAtOffset.flags starts out backed by the inline_flag slot inside the
+ * struct, so an address holding a single flag costs no extra allocation and
+ * no extra pointer hop. The vector only moves to the heap when a second flag
+ * lands on the same address, and it never moves back. These helpers are the
+ * only code allowed to touch the storage of that vector */
+static inline bool flags_at_is_inline(const RFlagsAtOffset *fa) {
+	return fa->flags._start == &fa->inline_flag;
+}
+
+static void flags_at_init(RFlagsAtOffset *fa, ut64 addr) {
+	fa->addr = addr;
+	fa->inline_flag = NULL;
+	fa->flags._start = &fa->inline_flag;
+	fa->flags._end = fa->flags._start;
+	fa->flags._capacity = 1;
+}
+
+static void flags_at_fini(RFlagsAtOffset *fa) {
+	if (!flags_at_is_inline (fa)) {
+		RVecFlagItemPtr_fini (&fa->flags);
+	}
+}
+
+static bool flags_at_push(RFlagsAtOffset *fa, RFlagItem *fi) {
+	if (flags_at_is_inline (fa)) {
+		if (fa->flags._start == fa->flags._end) {
+			fa->inline_flag = fi;
+			fa->flags._end = fa->flags._start + 1;
+			return true;
+		}
+		// second flag at this address: move the vector to the heap. Two
+		// slots cover the common symbol plus function pair, and a third
+		// flag grows the vector as usual
+		RFlagItem **buf = R_NEWS (RFlagItem *, 2);
+		if (!buf) {
+			return false;
+		}
+		buf[0] = fa->inline_flag;
+		buf[1] = fi;
+		fa->flags._start = buf;
+		fa->flags._end = buf + 2;
+		fa->flags._capacity = 2;
+		return true;
+	}
+	RFlagItem **slot = RVecFlagItemPtr_emplace_back (&fa->flags);
+	if (slot) {
+		*slot = fi;
+		return true;
+	}
+	return false;
+}
+
 static void flag_skiplist_free(void *data) {
 	if (data) {
-		RFlagsAtOffset *item = (RFlagsAtOffset *)data;
-		r_list_free (item->flags);
+		flags_at_fini ((RFlagsAtOffset *)data);
 		free (data);
 	}
+}
+
+static ut64 flag_skiplist_key(const void *data) {
+	return ((const RFlagsAtOffset *)data)->addr;
 }
 
 static int flag_skiplist_cmp(const void *va, const void *vb) {
@@ -57,6 +112,19 @@ static int flag_skiplist_cmp(const void *va, const void *vb) {
 		return 1;
 	}
 	return 0;
+}
+
+static bool flag_vec_delete_item(RVecFlagItemPtr *flags, const RFlagItem *item) {
+	size_t i = 0;
+	RFlagItem **fi;
+	R_VEC_FOREACH (flags, fi) {
+		if (*fi == item) {
+			RVecFlagItemPtr_remove (flags, i);
+			return true;
+		}
+		i++;
+	}
+	return false;
 }
 
 static ut64 num_callback(RNum *user, const char *name, bool *ok) {
@@ -97,10 +165,11 @@ dir == 0 ->  result == addr
 dir == 1 ->  result >= addr
 #endif
 static RFlagsAtOffset *r_flag_get_nearest_list(RFlag *f, ut64 addr, int dir) {
-	RFlagsAtOffset key = { .addr = addr };
+	// key-based lookup: no probe element on the stack, and the traversal
+	// never dereferences an RFlagsAtOffset
 	RFlagsAtOffset *flags = (dir >= 0)
-		? r_skiplist_get_geq (f->by_addr, &key)
-		: r_skiplist_get_leq (f->by_addr, &key);
+		? r_skiplist_get_geq_key (f->by_addr, addr)
+		: r_skiplist_get_leq_key (f->by_addr, addr);
 	return (dir == 0 && flags && flags->addr != addr)? NULL: flags;
 }
 
@@ -108,8 +177,8 @@ static void remove_addrmap(RFlag *f, RFlagItem *item) {
 	R_RETURN_IF_FAIL (f && item);
 	RFlagsAtOffset *flags = r_flag_get_nearest_list (f, item->addr, 0);
 	if (flags) {
-		r_list_delete_data (flags->flags, item);
-		if (r_list_empty (flags->flags)) {
+		flag_vec_delete_item (&flags->flags, item);
+		if (RVecFlagItemPtr_empty (&flags->flags)) {
 			r_skiplist_delete (f->by_addr, flags);
 		}
 		R_DIRTY_SET (f);
@@ -120,20 +189,23 @@ static RFlagsAtOffset *flags_at_addr(RFlag *f, ut64 addr) {
 	if (f->mask) {
 		addr &= f->mask;
 	}
-	RFlagsAtOffset *res = r_flag_get_nearest_list (f, addr, 0);
-	if (res) {
-		return res;
+	// a single skiplist traversal: insert a fresh element and let the
+	// skiplist hand back the existing one when the address is taken.
+	// The element is cheap to build because it needs no allocation
+	RFlagsAtOffset *res = R_NEW (RFlagsAtOffset);
+	if (!res) {
+		return NULL;
 	}
-	// there is no existing flagsAtOffset, we create one now
-	res = R_NEW (RFlagsAtOffset);
-	res->flags = r_list_new ();
-	if (!res->flags) {
+	flags_at_init (res, addr);
+	RSkipListNode *node = r_skiplist_insert (f->by_addr, res);
+	if (!node) {
 		free (res);
 		return NULL;
 	}
-
-	res->addr = addr;
-	r_skiplist_insert (f->by_addr, res);
+	if (node->data != res) {
+		free (res);
+		return (RFlagsAtOffset *)node->data;
+	}
 	return res;
 }
 
@@ -195,8 +267,7 @@ static bool update_flag_item_addr(RFlag *f, RFlagItem *fi, ut64 newaddr, bool is
 		}
 		fi->addr = newaddr;
 		RFlagsAtOffset *flagsAtOffset = flags_at_addr (f, newaddr);
-		if (flagsAtOffset) {
-			r_list_append (flagsAtOffset->flags, fi);
+		if (flagsAtOffset && flags_at_push (flagsAtOffset, fi)) {
 			R_DIRTY_SET (f);
 			return true;
 		}
@@ -268,10 +339,11 @@ static HtPP *flag_ht_name_new(void) {
 
 static void ht_free_meta(HtUPKv *kv) {
 	if (kv) {
-		// free (kv->key);
 		RFlagItemMeta *fim = (RFlagItemMeta *)kv->value;
+		free (fim->type);
 		free (fim->comment);
 		free (fim->color);
+		free (fim->alias);
 		free (fim);
 	}
 }
@@ -310,7 +382,7 @@ R_API RFlag *r_flag_new(void) {
 	}
 	f->lock = r_th_lock_new (true);
 	f->base = 0;
-	f->zones = r_list_newf (r_flag_zone_item_free);
+	RVecFlagZoneItem_init (&f->zones);
 	f->tags = sdb_new0 ();
 	f->names = r_arena_new ();
 	if (!f->names) {
@@ -320,7 +392,7 @@ R_API RFlag *r_flag_new(void) {
 	f->names->default_alignment = 1;
 	f->ht_name = flag_ht_name_new ();
 	f->ht_meta = ht_up_new (NULL, ht_free_meta, NULL);
-	f->by_addr = r_skiplist_new (flag_skiplist_free, flag_skiplist_cmp);
+	f->by_addr = r_skiplist_new_with_key (flag_skiplist_free, flag_skiplist_cmp, flag_skiplist_key);
 	new_spaces (f);
 	R_DIRTY_SET (f);
 	return f;
@@ -395,7 +467,7 @@ R_API void r_flag_free(RFlag *f) {
 		sdb_free (f->tags);
 		r_spaces_fini (&f->spaces);
 		r_num_free (f->num);
-		r_list_free (f->zones);
+		RVecFlagZoneItem_fini (&f->zones);
 		r_arena_free (f->names);
 		free (f);
 	}
@@ -614,17 +686,15 @@ static RFlagItem *evalFlag(RFlag *f, RFlagItem *fi) {
  * For example (f, "sym", 3, 0x1000)*/
 R_API bool r_flag_exist_at(RFlag *f, const char *flag_prefix, ut16 fp_size, ut64 addr) {
 	R_RETURN_VAL_IF_FAIL (f && flag_prefix, false);
-	RListIter *iter = NULL;
-	RFlagItem *item = NULL;
 	if (f->mask) {
 		addr &= f->mask;
 	}
-	const RList *list = r_flag_get_list (f, addr);
-	if (list) {
-		r_list_foreach (list, iter, item) {
-			if (item->name && !strncmp (item->name, flag_prefix, fp_size)) {
-				return true;
-			}
+	const RVecFlagItemPtr *list = r_flag_get_vec (f, addr);
+	RFlagItem **iter;
+	RFlagItem *fi;
+	r_flag_item_vec_foreach (list, iter, fi) {
+		if (fi->name && !strncmp (fi->name, flag_prefix, fp_size)) {
+			return true;
 		}
 	}
 	return false;
@@ -644,46 +714,48 @@ R_API RFlagItem *r_flag_get_in(RFlag *f, ut64 addr) {
 	if (f->mask) {
 		addr &= f->mask;
 	}
-	const RList *list = r_flag_get_list (f, addr);
-	return list? evalFlag (f, r_list_last (list)): NULL;
+	const RVecFlagItemPtr *list = r_flag_get_vec (f, addr);
+	RFlagItem *item = r_flag_item_vec_last (list);
+	return item? evalFlag (f, item): NULL;
 }
 
-/* Return the first flag matching an address ordered by the operands */
-/* Pass in the name of each space, in order, followed by a NULL */
+/* Return the first flag at addr that lives in one of the given spaces, the
+ * spaces being ordered by priority. Pass in the name of each space followed
+ * by a NULL. Flags in other spaces are never returned, so NULL means no flag
+ * of the requested kind exists at addr. Without any space name every flag at
+ * addr qualifies. With prionospace a flag without space wins over the rest */
 R_API RFlagItem *r_flag_get_by_spaces(RFlag *f, bool prionospace, ut64 addr, ...) {
 	R_RETURN_VAL_IF_FAIL (f, NULL);
 	if (f->mask) {
 		addr &= f->mask;
 	}
 
-	const RList *list = r_flag_get_list (f, addr);
+	const RVecFlagItemPtr *list = r_flag_get_vec (f, addr);
+	if (!list || RVecFlagItemPtr_empty (list)) {
+		return NULL;
+	}
 	RFlagItem *ret = NULL;
-	RListIter *iter;
+	RFlagItem **iter;
 	RFlagItem *fi;
 	va_list ap, aq;
 
 	va_start (ap, addr);
-	// some quick checks for common cases
-	if (r_list_empty (list)) {
-		goto beach;
-	}
-	if (r_list_length (list) == 1) {
-		ret = r_list_last (list);
-		goto beach;
-	}
-
 	// count spaces in the vaarg
 	va_copy (aq, ap);
 	const char *spacename = va_arg (aq, const char *);
-
 	size_t n_spaces = 0;
 	while (spacename) {
 		n_spaces++;
 		spacename = va_arg (aq, const char *);
 	}
 	va_end (aq);
+	if (!n_spaces) {
+		// no space requested, any flag at this address is fine
+		ret = *RVecFlagItemPtr_at (list, 0);
+		goto beach;
+	}
 
-	// get RSpaces from the names
+	// get RSpaces from the names, unknown spaces just never match
 	size_t i = 0;
 	RSpace **spaces = R_NEWS (RSpace *, n_spaces);
 	if (!spaces) {
@@ -699,28 +771,21 @@ R_API RFlagItem *r_flag_get_by_spaces(RFlag *f, bool prionospace, ut64 addr, ...
 	}
 	n_spaces = i;
 
-	ut64 min_space_i = n_spaces + 1;
-	r_list_foreach (list, iter, fi) {
-		// get the "priority" of the flag flagspace and
-		// check if better than what we found so far
+	// lower index means higher priority, n_spaces means nothing found yet
+	size_t best = n_spaces;
+	r_flag_item_vec_foreach (list, iter, fi) {
 		if (prionospace && !fi->space) {
 			ret = fi;
 			break;
 		}
-		for (i = 0; i < n_spaces; i++) {
+		for (i = 0; i < best; i++) {
 			if (fi->space == spaces[i]) {
-				break;
-			}
-			if (i >= min_space_i) {
+				ret = fi;
+				best = i;
 				break;
 			}
 		}
-
-		if (i < min_space_i) {
-			min_space_i = i;
-			ret = fi;
-		}
-		if (!min_space_i) {
+		if (ret && !best && !prionospace) {
 			// this is the best flag we can find, let's stop immediately
 			break;
 		}
@@ -803,15 +868,15 @@ R_API RFlagItem *r_flag_get_at(RFlag *f, ut64 addr, bool closest) {
 
 	RFlagItem *nice = NULL;
 	int nice_priority = INT_MAX;
-	RListIter *iter;
 	const RFlagsAtOffset *flags_at = r_flag_get_nearest_list (f, addr, -1);
 	if (!flags_at) {
 		R_CRITICAL_LEAVE (f);
 		return NULL;
 	}
 	if (flags_at->addr == addr) {
-		RFlagItem *item;
-		r_list_foreach (flags_at->flags, iter, item) {
+		RFlagItem **iter;
+		R_VEC_FOREACH (&flags_at->flags, iter) {
+			RFlagItem *item = *iter;
 			if (is_better_flag (f, nice, item, &nice_priority)) {
 				nice = item;
 				if (!nice_priority) {
@@ -831,8 +896,9 @@ R_API RFlagItem *r_flag_get_at(RFlag *f, ut64 addr, bool closest) {
 		return NULL;
 	}
 	while (!nice && flags_at) {
-		RFlagItem *item;
-		r_list_foreach (flags_at->flags, iter, item) {
+		RFlagItem **iter;
+		R_VEC_FOREACH (&flags_at->flags, iter) {
+			RFlagItem *item = *iter;
 			if (isreg (item) || IS_FI_NOTIN_SPACE (f, item)) {
 				continue;
 			}
@@ -853,43 +919,52 @@ R_API RFlagItem *r_flag_get_at(RFlag *f, ut64 addr, bool closest) {
 	return fi;
 }
 
-static bool append_to_list(RFlagItem *fi, void *user) {
-	RList *ret = (RList *)user;
-	r_list_append (ret, fi);
-	return true;
-}
-
-R_API RList *r_flag_all_list(RFlag *f, bool by_space) {
-	RList *ret = r_list_new ();
+R_API RVecFlagItemPtr *r_flag_all_list(RFlag *f, bool by_space) {
+	R_RETURN_VAL_IF_FAIL (f, NULL);
+	RVecFlagItemPtr *ret = RVecFlagItemPtr_new ();
 	if (!ret) {
 		return NULL;
 	}
+	if (f->by_addr->size > 0) {
+		// at least one flag per address, avoid most of the growth reallocs
+		RVecFlagItemPtr_reserve (ret, f->by_addr->size);
+	}
 
 	RSpace *cur = by_space? r_flag_space_cur (f): NULL;
-	r_flag_foreach_space (f, cur, append_to_list, ret);
+	RSkipListNode *it;
+	RFlagsAtOffset *flags_at;
+	r_skiplist_foreach (f->by_addr, it, flags_at) {
+		RFlagItem **iter;
+		R_VEC_FOREACH (&flags_at->flags, iter) {
+			RFlagItem *fi = *iter;
+			if (IS_FI_IN_SPACE (fi, cur)) {
+				RVecFlagItemPtr_push_back (ret, &fi);
+			}
+		}
+	}
 	return ret;
 }
 
 /* return the list of flag items that are associated with a given offset */
-R_API const RList* /*<RFlagItem*>*/ r_flag_get_list(RFlag *f, ut64 addr) {
+R_API const RVecFlagItemPtr* /*<RFlagItem*>*/ r_flag_get_vec(RFlag *f, ut64 addr) {
 	if (f->mask) {
 		addr &= f->mask;
 	}
 	const RFlagsAtOffset *item = r_flag_get_nearest_list (f, addr, 0);
-	return item ? item->flags : NULL;
+	return item? &item->flags: NULL;
 }
 
 R_API char *r_flag_get_liststr(RFlag *f, ut64 addr) {
-	RFlagItem *fi;
-	RListIter *iter;
 	if (f->mask) {
 		addr &= f->mask;
 	}
-	const RList *list = r_flag_get_list (f, addr);
+	const RVecFlagItemPtr *list = r_flag_get_vec (f, addr);
 	RStrBuf *sb = r_strbuf_new ("");
-	r_list_foreach (list, iter, fi) {
+	RFlagItem **iter;
+	RFlagItem *fi;
+	r_flag_item_vec_foreach (list, iter, fi) {
 		r_strbuf_appendf (sb, "%s%s",
-			fi->realname, iter->n? ",": "");
+			fi->realname, iter + 1 != R_VEC_END_ITER (list)? ",": "");
 	}
 	if (r_strbuf_is_empty (sb)) {
 		r_strbuf_free (sb);
@@ -1290,7 +1365,7 @@ R_API void r_flag_bind(RFlag *f, RFlagBind *fb) {
 	fb->exist_at = r_flag_exist_at;
 	fb->get = r_flag_get;
 	fb->get_at = r_flag_get_at;
-	fb->get_list = r_flag_get_list;
+	fb->get_vec = r_flag_get_vec;
 	fb->set = r_flag_set;
 	fb->unset = r_flag_unset;
 	fb->unset_name = r_flag_unset_name;
@@ -1313,19 +1388,32 @@ R_API int r_flag_count(RFlag *f, const char * R_NULLABLE glob) {
 	return count;
 }
 
+/* The callback may unset the flag it is given, and nothing else at that
+ * address. Removing it shifts the following flags down by one, so the same
+ * index is visited again, and removing the last one frees the whole
+ * RFlagsAtOffset, which is why it is never read after the last callback */
 #define FOREACH_BODY(condition) \
 	RSkipListNode *it, *tmp; \
 	RFlagsAtOffset *flags_at; \
-	RListIter *it2, *tmp2;	  \
-	RFlagItem *fi; \
 	r_skiplist_foreach_safe (f->by_addr, it, tmp, flags_at) { \
-		if (flags_at) { \
-			r_list_foreach_safe (flags_at->flags, it2, tmp2, fi) {	\
-				if (condition) { \
-					if (!cb (fi, user)) { \
-						return; \
-					} \
+		size_t i = 0; \
+		size_t len = RVecFlagItemPtr_length (&flags_at->flags); \
+		while (i < len) { \
+			RFlagItem *fi = R_VEC_START_ITER (&flags_at->flags)[i]; \
+			const bool last = i + 1 == len; \
+			if (condition) { \
+				if (!cb (fi, user)) { \
+					return; \
 				} \
+			} \
+			if (last) { \
+				break; \
+			} \
+			const size_t now = RVecFlagItemPtr_length (&flags_at->flags); \
+			if (now < len) { \
+				len = now; \
+			} else { \
+				i++; \
 			} \
 		} \
 	}
@@ -1369,8 +1457,6 @@ static bool flag_match_prefix(const RFlagItem *fi, const void *user) {
 
 static RFlagItem *flag_closest_match(RFlag *f, ut64 addr, ut64 radius, RFlagItemMatchCb match, const void *user) {
 	const RFlagsAtOffset *exact, *left, *right;
-	RListIter *it;
-	RFlagItem *fi;
 
 	R_RETURN_VAL_IF_FAIL (f && match, NULL);
 	if (f->mask) {
@@ -1381,7 +1467,9 @@ static RFlagItem *flag_closest_match(RFlag *f, ut64 addr, ut64 radius, RFlagItem
 
 	exact = r_flag_get_nearest_list (f, addr, 0);
 	if (exact) {
-		r_list_foreach (exact->flags, it, fi) {
+		RFlagItem **it;
+		R_VEC_FOREACH (&exact->flags, it) {
+			RFlagItem *fi = *it;
 			if (match (fi, user)) {
 				RFlagItem *ret = evalFlag (f, fi);
 				R_CRITICAL_LEAVE (f);
@@ -1424,7 +1512,9 @@ static RFlagItem *flag_closest_match(RFlag *f, ut64 addr, ut64 radius, RFlagItem
 		if ((go_left ? ld : rd) > radius) {
 			break;
 		}
-		r_list_foreach (node->flags, it, fi) {
+		RFlagItem **it;
+		R_VEC_FOREACH (&node->flags, it) {
+			RFlagItem *fi = *it;
 			if (match (fi, user)) {
 				RFlagItem *ret = evalFlag (f, fi);
 				R_CRITICAL_LEAVE (f);

@@ -149,11 +149,11 @@ static bool anal_esil_mem_read(void *mem, ut64 addr, ut8 *buf, int len) {
 	if (!r_itv_contain (region.itv, addr + len - 1)) {
 		const int _len = r_itv_end (region.itv) - addr;
 		return anal_esil_mem_read (mem, r_itv_end (region.itv), &buf[_len], len - _len)
-			&& anal->iob.read_at (anal->iob.io, addr, buf, _len);
+			&& anal->iob.read_at (anal->iob.io, addr, buf, _len) == _len;
 	}
 	// do not set esil->trap or esil->trap_code here. esil handles that on it's own
 	// do not invoke esil->cmd_ioer, this is about to get removed from esil. core_esil is supposed to handle this
-	return anal->iob.read_at (anal->iob.io, addr, buf, len);
+	return anal->iob.read_at (anal->iob.io, addr, buf, len) == len;
 }
 
 static bool anal_esil_mem_write(void *mem, ut64 addr, const ut8 *buf, int len) {
@@ -214,7 +214,6 @@ R_API RAnal *r_anal_new(void) {
 	anal->gp = 0LL;
 	anal->sdb = sdb_new0 ();
 	anal->cxxabi = R_ANAL_CPP_ABI_ITANIUM;
-	anal->opt.depth = 32;
 	anal->opt.noncode = false; // do not analyze data by default
 	anal->lock = r_th_lock_new (true);
 	r_anal_backtrace_init (anal);
@@ -301,6 +300,7 @@ R_API void r_anal_free(RAnal *a) {
 		r_bitset_free (a->visited);
 	}
 	r_anal_hint_storage_fini (a);
+	r_anal_xrefs_free (a);
 	r_th_lock_free (a->lock);
 	r_interval_tree_fini (&a->meta);
 	r_unref (a->config);
@@ -315,7 +315,6 @@ R_API void r_anal_free(RAnal *a) {
 	r_anal_pin_fini (a);
 	r_syscall_free (a->syscall);
 	r_unref (a->reg);
-	r_anal_xrefs_free (a);
 	r_list_free (a->threads);
 	r_list_free (a->leaddrs);
 	sdb_free (a->sdb);
@@ -336,7 +335,7 @@ R_API void r_anal_set_user_ptr(RAnal *anal, void *user) {
 R_API bool r_anal_plugin_add(RAnal *anal, RAnalPlugin *foo) {
 	R_RETURN_VAL_IF_FAIL (anal && foo, false);
 	if (foo->init) {
-		foo->init (anal->user);
+		foo->init (anal);
 	}
 	r_list_append (anal->libstore->plugins, foo);
 	return true;
@@ -474,7 +473,7 @@ R_API ut8 *r_anal_mask(RAnal *anal, int size, const ut8 *data, ut64 at) {
 		}
 		idx += oplen;
 		at += oplen;
-		R_FREE (op->mnemonic);
+		r_anal_op_fini (op);
 	}
 
 	r_anal_op_free (op);
@@ -534,6 +533,7 @@ R_API void r_anal_purge(RAnal *anal) {
 	sdb_reset (anal->sdb_cc);
 	r_list_free (anal->fcns);
 	anal->fcns = r_list_newf ((RListFree)r_anal_function_free);
+	(void)r_anal_xrefs_init (anal);
 	r_anal_purge_imports (anal);
 }
 
@@ -718,7 +718,7 @@ static bool noreturn_recurse(RAnal *anal, ut64 addr) {
 	if (!addr || addr == UT64_MAX) {
 		return false;
 	}
-	if (!anal->iob.read_at (anal->iob.io, addr, bbuf, sizeof (bbuf))) {
+	if (anal->iob.read_at (anal->iob.io, addr, bbuf, sizeof (bbuf)) != sizeof (bbuf)) {
 		R_LOG_ERROR ("Couldn't read buffer");
 		return false;
 	}
@@ -840,7 +840,11 @@ R_API bool r_anal_is_prelude(RAnal *anal, ut64 addr, const ut8 *data, int len) {
 			return false;
 		}
 		data = owned;
-		(void)anal->iob.read_at (anal->iob.io, addr, (ut8 *) owned, maxis);
+		len = anal->iob.read_at (anal->iob.io, addr, (ut8 *)owned, maxis);
+		if (len < 1) {
+			free (owned);
+			return false;
+		}
 	}
 	RList *l = r_anal_preludes (anal);
 	if (l) {

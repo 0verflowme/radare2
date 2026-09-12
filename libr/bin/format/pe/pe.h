@@ -125,6 +125,8 @@ struct PE_(r_bin_pe_obj_t) {
 	PE_(image_metadata_header) * metadata_header;
 	PE_(image_metadata_stream) * *streams;
 	RList *dotnet_symbols;
+	RVecRBinTrycatch trycatch;
+	bool trycatch_loaded;
 
 	/* store the section information for future use */
 	RVecPESection sections;
@@ -146,7 +148,7 @@ struct PE_(r_bin_pe_obj_t) {
 	bool verbose;
 	int big_endian;
 	RList* rich_entries;
-	RList* relocs;
+	RVecRBinReloc relocs; // one per import, moved out by the relocs() callback
 	RList* resources; //RList of r_pe_resources
 	const char* file;
 	char *sdbdir;

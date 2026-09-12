@@ -1,7 +1,11 @@
+# merged: ELF: CREL ET_REL import pinned (no dynstr, no phdr: plt lookup masked)
 NAME=compact relocs
 FILE=bins/elf/new/compact-relocs.oo
 CMDS=<<EOF
 iS;ir;s0x08000040;af;pdf
+?e --
+ii
+ir
 EOF
 EXPECT=<<EOF
 nth paddr       size vaddr       vsize perm flags type     name
@@ -18,6 +22,7 @@ nth paddr       size vaddr       vsize perm flags type     name
 vaddr      paddr      type   ntype name
 ---------------------------------------
 0x08000048 0x00000048 ADD_64 283   callee
+0x0800008c 0x0000008c ADD_64 261   .text
             ;-- section..text:
 / 20: sym.caller ();
 |           0x08000040      fd7bbfa9       stp x29, x30, [sp, -0x10]!  ; [02] -r-x section size 20 named .text
@@ -26,6 +31,41 @@ vaddr      paddr      type   ntype name
 |           0x08000048      00000094       bl reloc.callee             ; RELOC 64 callee
 |           0x0800004c      fd7bc1a8       ldp x29, x30, [sp], 0x10
 \           0x08000050      c0035fd6       ret
+--
+nth vaddr      bind   type   lib name
+-------------------------------------
+7   ---------- GLOBAL NOTYPE     callee
+vaddr      paddr      type   ntype name
+---------------------------------------
+0x08000048 0x00000048 ADD_64 283   callee
+0x0800008c 0x0000008c ADD_64 261   .text
 EOF
 RUN
 
+
+NAME=ELF: i386 implicit-addend crel patches with the in-place word
+FILE=bins/elf/i386-crel-implicit.o
+ARGS=-e bin.relocs.apply=true
+CMDS=<<EOF
+pxw 4 @ 0x08000035
+pxw 4 @ 0x0800003a
+pxw 4 @ 0x08000048
+EOF
+EXPECT=<<EOF
+0x08000035  0x00000006                                   ....
+0x0800003a  0x08000044                                   D...
+0x08000048  0x08000048                                   H...
+EOF
+RUN
+
+NAME=ELF: CREL relocs are parsed again for a second bin object
+FILE=bins/elf/new/compact-relocs.oo
+CMDS=<<EOF
+o bins/elf/new/compact-relocs.oo
+ob 1
+ir~ADD_64?
+EOF
+EXPECT=<<EOF
+2
+EOF
+RUN

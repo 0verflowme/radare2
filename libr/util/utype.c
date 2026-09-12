@@ -22,9 +22,49 @@ R_API bool r_type_set(Sdb *TDB, ut64 at, const char *field, ut64 val) {
 	return false;
 }
 
+static const char *const type_qualifiers[] = {
+	"const", "volatile", "restrict", "atomic", "_Atomic", NULL
+};
+
+static const char *type_skip_qualifiers(const char *R_NONNULL type) {
+	int i;
+	do {
+		type = r_str_trim_head_ro (type);
+		for (i = 0; type_qualifiers[i]; i++) {
+			size_t qlen = strlen (type_qualifiers[i]);
+			if (r_str_startswith (type, type_qualifiers[i]) && (!type[qlen] || IS_WHITESPACE (type[qlen]))) {
+				type += qlen;
+				break;
+			}
+		}
+	} while (type_qualifiers[i]);
+	return type;
+}
+
+static const char *type_aggregate_prefixed(const char *R_NONNULL type, const char **R_NONNULL name) {
+	const char *kind = r_str_startswith (type, "struct")? "struct": r_str_startswith (type, "union")? "union": NULL;
+	if (kind) {
+		size_t klen = strlen (kind);
+		if (IS_WHITESPACE (type[klen])) {
+			*name = r_str_trim_head_ro (type + klen);
+			return R_STR_ISNOTEMPTY (*name)? kind: NULL;
+		}
+	}
+	return NULL;
+}
+
 R_API RTypeKind r_type_kind(Sdb *TDB, const char *name) {
 	R_RETURN_VAL_IF_FAIL (TDB && R_STR_ISNOTEMPTY (name), -1);
-	const char *type = sdb_const_get (TDB, name, 0);
+	// a type may be spelled with qualifiers and its aggregate keyword; the sdb keys it bare
+	const char *bare = type_skip_qualifiers (name);
+	const char *inner = NULL;
+	if (type_aggregate_prefixed (bare, &inner)) {
+		bare = inner;
+	}
+	if (R_STR_ISEMPTY (bare)) {
+		return R_TYPE_INVALID;
+	}
+	const char *type = sdb_const_get (TDB, bare, 0);
 	if (type) {
 		if (!strcmp (type, "enum")) {
 			return R_TYPE_ENUM;
@@ -164,24 +204,6 @@ R_API char *r_type_enum_getbitfield(Sdb *TDB, const char *name, ut64 val) {
 	return r_strbuf_drain (sb);
 }
 
-static const char *const type_qualifiers[] = {
-	"const", "volatile", "restrict", "atomic", "_Atomic", NULL
-};
-
-static const char *type_skip_qualifiers(const char *R_NONNULL type) {
-	int i;
-	do {
-		type = r_str_trim_head_ro (type);
-		for (i = 0; type_qualifiers[i]; i++) {
-			size_t qlen = strlen (type_qualifiers[i]);
-			if (r_str_startswith (type, type_qualifiers[i]) && (!type[qlen] || IS_WHITESPACE (type[qlen]))) {
-				type += qlen;
-				break;
-			}
-		}
-	} while (type_qualifiers[i]);
-	return type;
-}
 
 static bool type_ident_char(char c) {
 	return c == '_' || isalnum ((ut8)c);
@@ -213,11 +235,14 @@ static bool type_has_any_word(const char *R_NONNULL type, const char *const *R_N
 #define TYPEDEF_MAX_DEPTH 8
 
 // the depth bound keeps a cyclic typedef from hanging
-static R_OWNED char *type_resolve_typedef(Sdb *TDB, const char *R_NONNULL type) {
+R_API R_OWNED char *r_type_resolve_typedef(Sdb *R_NONNULL TDB, const char *R_NONNULL type) {
+	R_RETURN_VAL_IF_FAIL (TDB && type, NULL);
 	char *ret = NULL;
 	int depth;
+	// a typedef may be spelled with qualifiers; the sdb keys it bare
+	const char *bare = type_skip_qualifiers (type);
 	for (depth = 0; depth < TYPEDEF_MAX_DEPTH; depth++) {
-		const char *next = sdb_const_getf (TDB, NULL, "typedef.%s", ret? ret: type);
+		const char *next = sdb_const_getf (TDB, NULL, "typedef.%s", ret? ret: bare);
 		if (!next) {
 			break;
 		}
@@ -249,7 +274,7 @@ static bool type_name_is_signed(const char *R_NONNULL t) {
 R_API bool r_type_is_signed(Sdb *R_NONNULL TDB, const char *R_NONNULL type) {
 	R_RETURN_VAL_IF_FAIL (TDB && type, false);
 	const char *base = type_skip_qualifiers (type);
-	char *resolved = type_resolve_typedef (TDB, base);
+	char *resolved = r_type_resolve_typedef (TDB, base);
 	const char *t = type_skip_qualifiers (resolved? resolved: base);
 	const bool ret = !strchr (t, '*') && type_name_is_signed (t);
 	free (resolved);
@@ -260,30 +285,24 @@ static bool type_kind_is_aggregate(const char *R_NONNULL kind) {
 	return !strcmp (kind, "struct") || !strcmp (kind, "union");
 }
 
-static const char *type_aggregate_prefixed(const char *R_NONNULL type, const char **R_NONNULL name) {
-	const char *kind = r_str_startswith (type, "struct")? "struct": r_str_startswith (type, "union")? "union": NULL;
-	if (kind) {
-		size_t klen = strlen (kind);
-		if (IS_WHITESPACE (type[klen])) {
-			*name = r_str_trim_head_ro (type + klen);
-			return R_STR_ISNOTEMPTY (*name)? kind: NULL;
-		}
-	}
-	return NULL;
+// the per-target type dbs carry the pointer width as the size of "char *"
+static ut64 type_ptr_bitsize(Sdb *R_NONNULL TDB) {
+	const ut64 bits = sdb_num_get (TDB, "type.char *.size", NULL);
+	return bits? bits: 32;
 }
 
-R_API ut64 r_type_get_bitsize(Sdb *R_NONNULL TDB, const char *R_NONNULL type) {
-	R_RETURN_VAL_IF_FAIL (TDB && type, 0);
-	/* Filter out qualifiers and the structure keyword if type looks like "struct mystruc" */
+// how many nested structs or unions a measurement follows before giving up
+#define TYPE_CHAIN_MAX 32
+
+// UT64_MAX means an aggregate reached itself; r_type_get_bitsize turns that into 0
+static ut64 type_bitsize(Sdb *TDB, const char *type, const char **chain, int depth) {
 	const char *type_view = type_skip_qualifiers (type);
-	const char *tmptype = type_view;
+	if (strchr (type_view, '*')) {
+		return type_ptr_bitsize (TDB);
+	}
+	// a type may be spelled with its aggregate keyword, as in "struct mystruct"
 	const char *name = NULL;
-	if (type_aggregate_prefixed (tmptype, &name)) {
-		tmptype = name;
-	}
-	if ((strstr (type_view, "*(") || strstr (type_view, " *")) && strcmp (type_view, "char *")) {
-		return 32;
-	}
+	const char *tmptype = type_aggregate_prefixed (type_view, &name)? name: type_view;
 	const char *t = sdb_const_get (TDB, tmptype, 0);
 	if (!t) {
 		if (r_str_startswith (tmptype, "enum ")) {
@@ -295,7 +314,47 @@ R_API ut64 r_type_get_bitsize(Sdb *R_NONNULL TDB, const char *R_NONNULL type) {
 	if (!strcmp (t, "type")) {
 		return sdb_num_getf (TDB, NULL, "type.%s.size", tmptype); // returns size in bits
 	}
+	if (!strcmp (t, "func")) {
+		// Canonical function-pointer members carry the same marker under type.*.
+		const char *mt = sdb_const_getf (TDB, NULL, "type.%s", tmptype);
+		return mt && !strcmp (mt, "func")? type_ptr_bitsize (TDB): 0;
+	}
+	if (!strcmp (t, "enum")) {
+		const ut64 size = sdb_num_getf (TDB, NULL, "type.%s.size", tmptype);
+		return size? size: 32;
+	}
+	if (!strcmp (t, "typedef")) {
+		// a typedef is as wide as the type it names: recorded width first, else the alias
+		ut64 size = sdb_num_getf (TDB, NULL, "type.%s.size", tmptype);
+		if (size) {
+			return size; // returns size in bits
+		}
+		char *resolved = r_type_resolve_typedef (TDB, tmptype);
+		if (resolved) {
+			// still a typedef after the resolver bound means a cycle, so fail closed
+			const char *kind = sdb_const_get (TDB, resolved, 0);
+			if (!kind || strcmp (kind, "typedef")) {
+				size = type_bitsize (TDB, resolved, chain, depth);
+			}
+			free (resolved);
+		}
+		return size;
+	}
 	if (!strcmp (t, "struct") || !strcmp (t, "union")) {
+		const ut64 recorded = sdb_num_getf (TDB, NULL, "type.%s.size", tmptype);
+		if (recorded) {
+			return recorded;
+		}
+		int i;
+		for (i = 0; i < depth; i++) {
+			if (!strcmp (chain[i], tmptype)) {
+				return UT64_MAX;
+			}
+		}
+		if (depth >= TYPE_CHAIN_MAX) {
+			return UT64_MAX;
+		}
+		chain[depth] = tmptype;
 		const char *value = sdb_const_getf (TDB, NULL, "%s.%s", t, tmptype);
 		char *members = value? strdup (value): NULL;
 		char *next, *ptr = members;
@@ -316,13 +375,18 @@ R_API ut64 r_type_get_bitsize(Sdb *R_NONNULL TDB, const char *R_NONNULL type) {
 				if (elements == 0) {
 					elements = 1;
 				}
+				const ut64 member = type_bitsize (TDB, subtype, chain, depth + 1);
+				free (subtype);
+				if (member == UT64_MAX) {
+					ret = UT64_MAX;
+					break;
+				}
 				if (!strcmp (t, "struct")) {
-					ret += r_type_get_bitsize (TDB, subtype) * elements;
+					ret += member * elements;
 				} else {
-					ut64 sz = r_type_get_bitsize (TDB, subtype) * elements;
+					ut64 sz = member * elements;
 					ret = sz > ret ? sz : ret;
 				}
-				free (subtype);
 				ptr = next;
 			} while (next);
 			free (members);
@@ -330,6 +394,13 @@ R_API ut64 r_type_get_bitsize(Sdb *R_NONNULL TDB, const char *R_NONNULL type) {
 		return ret;
 	}
 	return 0;
+}
+
+R_API ut64 r_type_get_bitsize(Sdb *R_NONNULL TDB, const char *R_NONNULL type) {
+	R_RETURN_VAL_IF_FAIL (TDB && type, 0);
+	const char *chain[TYPE_CHAIN_MAX];
+	const ut64 bits = type_bitsize (TDB, type, chain, 0);
+	return bits == UT64_MAX? 0: bits;
 }
 
 static const char *type_aggregate_kind(Sdb *R_NONNULL TDB, const char *R_NONNULL type, const char **R_NONNULL name) {
@@ -846,6 +917,7 @@ R_API void r_type_del(Sdb *TDB, const char *name) {
 			free (p);
 		}
 		sdb_unset (TDB, elements_key, 0);
+		sdb_unsetf (TDB, 0, "type.%s.size", name);
 		sdb_unset (TDB, name, 0);
 		free (elements_key);
 	} else if (!strcmp (kind, "func")) {
@@ -882,10 +954,10 @@ R_API void r_type_del(Sdb *TDB, const char *name) {
 	}
 }
 
-// Strip leading __ prefix for type database lookup
-// This allows __strcpy_chk to match strcpy_chk in the database
-static inline const char *trim_lodashes(const char *name) {
-	while (r_str_startswith (name, "__")) {
+// Strip leading __ prefix for type database lookup when the exact name
+// is not registered. This allows __strcpy_chk to match strcpy_chk
+static inline const char *trim_lodashes(Sdb *TDB, const char *name) {
+	while (!sdb_const_get (TDB, name, 0) && r_str_startswith (name, "__")) {
 		name += 2;
 	}
 	return name;
@@ -893,23 +965,29 @@ static inline const char *trim_lodashes(const char *name) {
 
 // Function prototypes api
 R_API int r_type_func_exist(Sdb *TDB, const char *func_name) {
-	const char *fcn = sdb_const_get (TDB, trim_lodashes (func_name), 0);
+	const char *fcn = sdb_const_get (TDB, trim_lodashes (TDB, func_name), 0);
 	return fcn && !strcmp (fcn, "func");
 }
 
+R_API bool r_type_func_prototype_exist(Sdb *TDB, const char *func_name) {
+	R_RETURN_VAL_IF_FAIL (TDB && func_name, false);
+	// struct stat overwrites stat=func, but the prototype under func.stat.* is still there
+	return sdb_const_getf (TDB, NULL, "func.%s.ret", trim_lodashes (TDB, func_name)) != NULL;
+}
+
 R_API const char *r_type_func_ret(Sdb *TDB, const char *func_name) {
-	return sdb_const_getf (TDB, NULL, "func.%s.ret", trim_lodashes (func_name));
+	return sdb_const_getf (TDB, NULL, "func.%s.ret", trim_lodashes (TDB, func_name));
 }
 
 R_API int r_type_func_args_count(Sdb *TDB, const char *R_NONNULL func_name) {
-	return sdb_num_getf (TDB, NULL, "func.%s.args", trim_lodashes (func_name));
+	return sdb_num_getf (TDB, NULL, "func.%s.args", trim_lodashes (TDB, func_name));
 }
 
 R_API R_OWNED char *r_type_func_args_type(Sdb *TDB, const char *R_NONNULL func_name, int i) {
-	const char *value = sdb_const_getf (TDB, NULL, "func.%s.arg.%d", trim_lodashes (func_name), i);
+	const char *value = sdb_const_getf (TDB, NULL, "func.%s.arg.%d", trim_lodashes (TDB, func_name), i);
 	char *ret = value? strdup (value): NULL;
 	if (ret) {
-		char *comma = strchr (ret, ',');
+		char *comma = strrchr (ret, ',');
 		if (comma) {
 			*comma = 0;
 		}
@@ -923,9 +1001,9 @@ static const char *const argnames[10] = {
 };
 
 R_API const char *r_type_func_args_name(Sdb *TDB, const char *R_NONNULL func_name, int i) {
-	const char *row = sdb_const_getf (TDB, NULL, "func.%s.arg.%d", trim_lodashes (func_name), i);
+	const char *row = sdb_const_getf (TDB, NULL, "func.%s.arg.%d", trim_lodashes (TDB, func_name), i);
 	if (row) {
-		const char *ret = strchr (row, ',');
+		const char *ret = strrchr (row, ',');
 		if (ret) {
 			return ret + 1;
 		}
@@ -1071,18 +1149,28 @@ R_API R_OWNED char *r_type_func_guess(Sdb *TDB, const char *R_NONNULL func_name)
 	return result;
 }
 
-R_API char *r_type_func_name(Sdb *types, const char *fname) {
+// walks name, then the last dotted component, then the fuzzy guesser; `key` returns the db key matched
+static char *type_func_lookup(Sdb *types, const char *fname, bool key) {
 	const char *str = fname;
 	const char *name = fname;
-	if (r_type_func_exist (types, fname)) {
-		return strdup (fname);
+	if (r_type_func_prototype_exist (types, fname)) {
+		return strdup (key? trim_lodashes (types, fname): fname);
 	}
 	while ( (str = strchr (str, '.'))) {
 		str++;
 		name = str;
 	}
-	if (r_type_func_exist (types, name)) {
-		return strdup (name);
+	if (r_type_func_prototype_exist (types, name)) {
+		return strdup (key? trim_lodashes (types, name): name);
 	}
 	return r_type_func_guess (types, fname);
+}
+
+R_API char *r_type_func_name(Sdb *types, const char *fname) {
+	return type_func_lookup (types, fname, false);
+}
+
+// same walk as r_type_func_name, but hands back the db key the match went through
+R_API char *r_type_func_key(Sdb *types, const char *fname) {
+	return type_func_lookup (types, fname, true);
 }

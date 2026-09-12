@@ -711,25 +711,22 @@ EXPECT=<<EOF
 \ 0x004873c4      e937f1ffff     jmp fcn.00486500
 | // true: 0x00486500
 afvR
-var_bp_38h  0x40f790,0x40f839
+var_bp_38h  0x40f790,0x40f7a6,0x40f839
    var_28h  0x40f7c1
 var_bp_30h  0x40f78c,0x40f835
    var_3ch  0x40f86e
 var_bp_20h  0x40f7d4
-    var_fh  0x40f7a6
 afvW
 var_bp_38h  0x40f728
    var_28h  0x40f735
 var_bp_30h  0x40f79b,0x40f843
    var_3ch  0x40f866
 var_bp_20h
-    var_fh
 var var_bp_38h = 0x00177fc0 = (qword)0x1111111111111111
 var var_28h = 0x00177fd0 = (qword)0x0000000000000000
 var var_bp_30h = 0x00177fc8 = (qword)0x0000000000000000
 var var_3ch = 0x00177fbc = 0x00000000
 var var_bp_20h = 0x00177fd8 = (qword)0x0000000000000000
-var var_fh = 0x00177fc7 = (qword)0x0000000000000011
 EOF
 RUN
 
@@ -958,14 +955,24 @@ EOF
 RUN
 
 
+# merged: axt capstone x86
 NAME=af-*
 FILE=bins/elf/analysis/main
 CMDS=<<EOF
 aa
 af-*
 afl
+?e --
+e asm.arch = x86
+e anal.arch = x86
+e scr.color=false
+e scr.wheel = false
+aa
+axt @ str.Hello_World
 EOF
 EXPECT=<<EOF
+--
+main 0x40050a [DATA:r--] mov edi, str.Hello_World
 EOF
 RUN
 
@@ -1001,10 +1008,17 @@ nth paddr       size vaddr       vsize perm flags type name
 EOF
 RUN
 
+# merged: iE and iE. implementation
 NAME=iSj entropy
 FILE=bins/elf/lab1B
 CMDS=<<EOF
 iSj entropy~{}
+?e --
+s 0x080489b9
+iE.
+s 0x080489a6
+s+5
+isj.
 EOF
 EXPECT=<<EOF
 [
@@ -1315,19 +1329,7 @@ EXPECT=<<EOF
     "vaddr": 0
   }
 ]
-EOF
-RUN
-
-NAME=iE and iE. implementation
-FILE=bins/elf/lab1B
-CMDS=<<EOF
-s 0x080489b9
-iE.
-s 0x080489a6
-s+5
-isj.
-EOF
-EXPECT=<<EOF
+--
 nth paddr      vaddr      bind   type size lib name    demangled
 ----------------------------------------------------------------
 22  0x000009b7 0x080489b7 GLOBAL FUNC 189      decrypt
@@ -1392,14 +1394,26 @@ name: sym.call_gmon_start
 EOF
 RUN
 
+# merged: 2: Wrong calling convention
 NAME=anal/name
 FILE=bins/mach0/ls-osx-x86_64
 CMDS=<<EOF
 af
 afi~name
+?e --
+s entry0
+aaa
+afta
+Ct. @ 0x100001413
+Ct. @ 0x10000145b
+Ct. @ 0x100001460
 EOF
 EXPECT=<<EOF
 name: main
+--
+int category
+int fd
+unsigned long request
 EOF
 RUN
 
@@ -1512,7 +1526,8 @@ EXPECT=<<EOF
 |    ||||   0x00011411      cmp sil, cl
 |   ,=====< 0x00011414      jne 0x11424
 |   |||||   0x00011416      lea rbx, [rax + 4]
-|   |||||   0x0001141a      mov rax, qword [rip + 0xdeaf]              ; [0x1f2d0:8]=0x221f0 reloc.program_invocation_short_name
+|   |||||   0x0001141a      mov rax, qword [rip + 0xdeaf]              ; reloc.program_invocation_short_name
+|   |||||                                                              ; [0x1f2d0:8]=0x221f0
 |   |||||   0x00011421      mov qword [rax], rbx
 |   |||||   ; CODE XREFS from fcn.00011390 @ 0x113d0(x), 0x113e0(x), 0x113f4(x), 0x11414(x)
 |   ````--> 0x00011424      mov rax, qword [rip + 0xde3d]              ; [0x1f268:8]=0x21680
@@ -1830,6 +1845,7 @@ EOF
 BROKEN=1
 RUN
 
+# merged: 1: Wrong calling convention
 NAME=call not function
 FILE=bins/pe/crackme0x00.exe
 CMDS=<<EOF
@@ -1844,28 +1860,7 @@ s 0x00401370
 pd 1~char *s1?
 s 0x00401368
 pd 1~char *s2?
-EOF
-EXPECT=<<EOF
-1
-1
-EOF
-RUN
-
-NAME=Settings global calling convention
-FILE=bins/pe/msvcfindmain.exe
-CMDS=<<EOF
-e anal.cc=pascal
-aaa
-afi @@@F~?pascal
-EOF
-EXPECT=<<EOF
-65
-EOF
-RUN
-
-NAME=1: Wrong calling convention
-FILE=bins/pe/crackme0x00.exe
-CMDS=<<EOF
+?e --
 s entry0
 af
 tk CRTStartup=func
@@ -1878,23 +1873,21 @@ aeim
 aftm
 EOF
 EXPECT=<<EOF
+1
+1
+--
 EOF
 RUN
 
-NAME=2: Wrong calling convention
-FILE=bins/mach0/ls-osx-x86_64
+NAME=Settings global calling convention
+FILE=bins/pe/msvcfindmain.exe
 CMDS=<<EOF
-s entry0
+e anal.cc=pascal
 aaa
-afta
-Ct. @ 0x100001413
-Ct. @ 0x10000145b
-Ct. @ 0x100001460
+afi @@@F~?pascal
 EOF
 EXPECT=<<EOF
-int category
-int fd
-unsigned long request
+65
 EOF
 RUN
 
@@ -2220,27 +2213,22 @@ s 0x10002d8d
 EOF
 RUN
 
+# merged: afvb-ArgName
 NAME=afvbj
 FILE=bins/efi/bootia32.efi
 CMDS=<<EOF
 af
 afvb 8 ImageHandle blah @ 0x10002d8d
 afvbj~?ImageHandle
-EOF
-EXPECT=<<EOF
-1
-EOF
-RUN
-
-NAME=afvb-ArgName
-FILE=bins/efi/bootia32.efi
-CMDS=<<EOF
+?e --
 af
 afvb 8 ImageHandle blah @ 0x10002d8d
 afvb-ImageHandle
 afvb~?ImageHandle
 EOF
 EXPECT=<<EOF
+1
+--
 0
 EOF
 RUN
@@ -2260,6 +2248,7 @@ EXPECT=<<EOF
 EOF
 RUN
 
+# merged: afvr-name; afvb-* afvr-*
 NAME=afvr idx & afvr*
 FILE=bins/efi/bootia32.efi
 CMDS=<<EOF
@@ -2267,29 +2256,12 @@ af
 afvr esi myreg int @ 0x10002d8d
 afvr*~?myreg
 afvr*~?int
-EOF
-EXPECT=<<EOF
-1
-1
-EOF
-RUN
-
-NAME=afvr-name
-FILE=bins/efi/bootia32.efi
-CMDS=<<EOF
+?e --
 af
 afvr esi myreg int @ 0x10002d8d
 afvr-myreg
 afvr~?myreg
-EOF
-EXPECT=<<EOF
-0
-EOF
-RUN
-
-NAME=afvb-* afvr-*
-FILE=bins/efi/bootia32.efi
-CMDS=<<EOF
+?e --
 af
 afvb-*
 afvr-*
@@ -2297,6 +2269,11 @@ afvb~?
 afvr~?
 EOF
 EXPECT=<<EOF
+1
+1
+--
+0
+--
 0
 0
 EOF
@@ -2325,15 +2302,23 @@ var char var_30h @ rbp-0x30
 EOF
 RUN
 
+# merged: t.anal/x86/aap
 NAME=anal vars rename
 FILE=bins/mach0/ls-osx-x86_64
 CMDS=<<EOF
 af
 afvn newname var_30h
 afvb~newname
+?e --
+f-sym.func.*
+aap
+pi 2 @ sub.strcoll
 EOF
 EXPECT=<<EOF
 var int64_t newname @ rbp-0x30
+--
+push rbp
+mov rbp, rsp
 EOF
 RUN
 
@@ -2384,21 +2369,6 @@ EXPECT=<<EOF
 EOF
 RUN
 
-NAME=axt capstone x86
-FILE=bins/elf/analysis/main
-CMDS=<<EOF
-e asm.arch = x86
-e anal.arch = x86
-e scr.color=false
-e scr.wheel = false
-aa
-axt @ str.Hello_World
-EOF
-EXPECT=<<EOF
-main 0x40050a [DATA:r--] mov edi, str.Hello_World
-EOF
-RUN
-
 # for some reason this test fails in the CI, but runs fine in mac/arm
 NAME=axt capstone x86: IOLI0
 FILE=bins/elf/ioli/crackme0x00
@@ -2416,6 +2386,7 @@ main 0x804843c [DATA:r--] mov dword [esp], str.Password:
 EOF
 RUN
 
+# merged: axt capstone x86: IOLI0 aaa vs aa
 NAME=axt capstone x86: IOLI0 aar vs aa
 FILE=bins/elf/ioli/crackme0x00
 CMDS=<<EOF
@@ -2425,15 +2396,7 @@ e scr.color=false
 e scr.wheel = false
 aar
 axt str.Password:
-EOF
-EXPECT=<<EOF
-(nofunc) 0x804843c [STRN:r--] mov dword [esp], str.Password:
-EOF
-RUN
-
-NAME=axt capstone x86: IOLI0 aaa vs aa
-FILE=bins/elf/ioli/crackme0x00
-CMDS=<<EOF
+?e --
 e asm.arch = x86
 e anal.arch = x86
 e scr.color=false
@@ -2442,6 +2405,8 @@ aaa
 axt str.Password:
 EOF
 EXPECT=<<EOF
+(nofunc) 0x804843c [STRN:r--] mov dword [esp], str.Password:
+--
 main 0x804843c [STRN:r--] mov dword [esp], str.Password:
 EOF
 RUN
@@ -3538,19 +3503,6 @@ ret
 EOF
 RUN
 
-NAME=t.anal/x86/aap
-FILE=bins/mach0/ls-osx-x86_64
-CMDS=<<EOF
-f-sym.func.*
-aap
-pi 2 @ sub.strcoll
-EOF
-EXPECT=<<EOF
-push rbp
-mov rbp, rsp
-EOF
-RUN
-
 NAME=mac-ls switch count
 FILE=bins/mach0/ls-osx-x86_64
 CMDS=<<EOF
@@ -3954,27 +3906,22 @@ EXPECT=<<EOF
 EOF
 RUN
 
+# merged: ./noncode 2
 NAME=./noncode
 FILE=bins/mach0/ls-osx-x86_64
 CMDS=<<EOF
 e anal.in=io.maps.x
 afr
 afl~?str.
-EOF
-EXPECT=<<EOF
-0
-EOF
-RUN
-
-NAME=./noncode 2
-FILE=bins/mach0/ls-osx-x86_64
-CMDS=<<EOF
+?e --
 e anal.in=io.maps
 e anal.calls=true
 af
 afl~?str.
 EOF
 EXPECT=<<EOF
+0
+--
 0
 EOF
 RUN
@@ -4206,36 +4153,38 @@ EXPECT=<<EOF
 | ;-- (0x00000003) fcn.00000003:
 | 0x00000000  ~   b821c10010     mov eax, 0x1000c121
 | // true: 0x00000005
-/ 9: fcn.00000003 ();
-| 0x00000003      0010           add byte [rax], dl
+/ 9: fcn.00000003 (int64_t arg1);
+| `- args(rdx)
+| 0x00000003      0010           add byte [rax], dl                    ; arg1
 | // true: 0x00000005
 | 0x00000005      ebf9           jmp 0
 | // true: 0x00000000
 
 .----.
 |    |
-|.----------------------------------------.    .-----------------------.
-||  0x0                                   |    |  0x3                  |
-|| ; CODE XREF from fcn.00000003 @ 0x5(x) |    | 9: fcn.00000003 ();   |
-|| ;-- (0x00000003) fcn.00000003:         |    | add byte [rax], dl    |
-|| mov eax, 0x1000c121                    |    `-----------------------'
-|`----------------------------------------'        v
-|    v                                             |
+|.----------------------------------------.    .---------------------------------.
+||  0x0                                   |    |  0x3                            |
+|| ; CODE XREF from fcn.00000003 @ 0x5(x) |    | ; arg1                          |
+|| ;-- (0x00000003) fcn.00000003:         |    | 9: fcn.00000003 (int64_t arg1); |
+|| mov eax, 0x1000c121                    |    | `- args(rdx)                    |
+|`----------------------------------------'    | add byte [rax], dl              |
+|    v                                         `---------------------------------'
+|    |                                             v
 |    |                                             |
-|    '-----------------------------.               |
-|                                  | .-------------'
-|                                  | |
-|                            .--------------------.
-|                            |  0x5               |
-|                            | jmp 0              |
-|                            `--------------------'
-|                                v
-|                                |
-`--------------------------------'
+|    '--------------------------------.            |
+|                                     | .----------'
+|                                     | |
+|                               .--------------------.
+|                               |  0x5               |
+|                               | jmp 0              |
+|                               `--------------------'
+|                                   v
+|                                   |
+`-----------------------------------'
 
 address            noret size  nbbs edges    cc cost          min bound range max bound          calls locals args xref frame name
 ================== ===== ===== ===== ===== ===== ==== ================== ===== ================== ===== ====== ==== ==== ===== ====
-0x0000000000000003     0    9     3     3     0    4 0x0000000000000000     7 0x0000000000000007     0    0      0    0     0 fcn.00000003
+0x0000000000000003     0    9     3     3     0    4 0x0000000000000000     7 0x0000000000000007     0    0      1    0     0 fcn.00000003
 EOF
 RUN
 
@@ -4330,5 +4279,36 @@ ptr: 0x00000007
 ptr: 0x00000007
 ptr: 0x00000007
 ptr: 0x0000000f
+EOF
+RUN
+
+NAME=a load through sp does not make bp a frame pointer
+FILE=malloc://64
+CMDS=<<EOF
+e asm.arch=x86
+e asm.bits=64
+wx 554889e54883ec20c745f801000000488b6c2418448b45f8c9c3
+af
+afv
+EOF
+EXPECT=<<EOF
+var int32_t var_8h @ rbp-0x8
+EOF
+RUN
+
+NAME=af walks a block chain longer than any depth
+FILE=malloc://8192
+CMDS=<<EOF
+e asm.arch=x86
+e asm.bits=64
+b 4000
+wow 85c07400
+wx c3 @ 4000
+s 0
+af
+afl
+EOF
+EXPECT=<<EOF
+0x00000000 1001   4001 fcn.00000000
 EOF
 RUN

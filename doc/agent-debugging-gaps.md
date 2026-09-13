@@ -327,14 +327,47 @@ This is the finding that matters most, and it is a safety finding rather than a
 capability one.
 
 The tamper response did not only print a message. It appended a 134-byte
-`PT_LOAD` segment with `RWE` permissions to shared libraries across the host and
-hooked them so the payload runs on load. The payload XOR-decodes a string with
-key `0x1d`, writes 73 bytes to file descriptor 1, re-encodes it, restores the
-registers it used, and jumps back.
+`PT_LOAD` segment with `RWE` permissions to shared libraries across the host.
+The payload XOR-decodes a string with key `0x1d`, writes 73 bytes to file
+descriptor 1, re-encodes it, restores the registers it used, and jumps away.
 
 Measured extent: **919 of 3080 shared objects**, `libc.so.6` among them. The
 count is stable, because the payload only prints; the spreading happened once,
 during a single run.
+
+### How it actually runs, which is not what it looks like
+
+The mechanism is worth stating precisely, because the obvious reading is wrong
+and this document asserted it before checking.
+
+There is no constructor hooking. `DT_INIT` and `DT_INIT_ARRAY` are untouched in
+every file examined. What the infector rewrote is each file's ELF **entry
+point**: `e_entry` now points at the appended segment, and the payload ends with
+a jump back to the entry address it replaced.
+
+| file | e_entry | payload's jump back | lands in |
+| --- | --- | --- | --- |
+| `ld-linux-x86-64.so.2` | `0x3c000` | `0x1f540` | executable segment |
+| `libc.so.6` | `0x214000` | `0x2a390` | executable segment |
+| `libreadline.so.8.2` | `0x57000` | `0x0` | the ELF header |
+| `libeot.so.0.0.0` | `0xf000` | `0x0` | the ELF header |
+
+An ordinary shared library has no entry point, so its saved original is zero and
+the jump would fault. It never faults, which is the evidence that those copies
+never execute: `e_entry` is ignored when a library is loaded as a dependency.
+**Of the 919 infected files, one hook is live.** It is the dynamic loader's,
+whose entry point the kernel genuinely does jump to.
+
+That is independently corroborated by an observation made hours earlier for an
+unrelated reason: stopping `d8` at its first instruction reported
+`@ld-linux-x86-64.so.2+0x1f540`, which is exactly the address the loader's
+payload jumps back to. It also explains the one thing a per-library hook would
+not: each process prints exactly once, however many infected libraries it loads,
+because one loader runs per process. `libc`'s copy has a valid jump target too,
+since libc can be executed directly as a program.
+
+So the honest count is: 919 files carry the payload, one of them runs it, and a
+repair is a two-byte edit to one file's entry point rather than 919 edits.
 
 The practical consequences, in order of how they appeared:
 
@@ -358,6 +391,14 @@ autonomously would have infected its own environment and carried on.
 Repairing the libraries was refused by this environment's own guard on modifying
 shared system resources, which is the correct outcome; the damage is documented
 rather than worked around, and the container is disposable.
+
+One methodological note, since it applies to everything above. The first version
+of this section said the files were "hooked so the payload runs on load", which
+was an inference from seeing the payload and the message, not an observation. It
+was wrong, and it overstated the blast radius by three orders of magnitude. The
+thing that caught it was the payload's own trailing jump resolving to virtual
+address zero: a target that cannot execute, in code that demonstrably does. An
+explanation that requires the impossible is not finished.
 
 **Fix.** `fsmon` watches the filesystem-modifying syscalls (`open`, `openat`,
 `openat2`, `unlink`, `unlinkat`, `rename`, `renameat`, `renameat2`, `truncate`,

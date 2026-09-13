@@ -89,6 +89,10 @@ def start(argv):
         time.sleep(0.05)
     else:
         die("session did not come up; see %s/%s.log" % (RUN, name))
+    if "--protect" in rest:
+        r = send(name, {"op": "protect"}, timeout=30)
+        if not r.get("ok"):
+            die("could not protect target: %s" % r.get("error"))
     json.dump({"name": name, "binary": binary, "gdb_pid": proc.pid,
                "started": time.time()}, open(meta_path(name), "w"))
     print(json.dumps({"ok": True, "result": {

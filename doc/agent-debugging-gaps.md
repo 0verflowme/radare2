@@ -147,3 +147,112 @@ One caveat worth keeping: gdb disables ASLR by default, and a recorder like rr
 serialises threads onto one core. Both change the execution being observed. A
 recorded run is evidence about that run, not proof the uninstrumented program
 behaves the same way.
+
+## Target 2: "veil" v3.1 (difficulty 4.0, static, stripped, declared anti-debug)
+
+A 512-cell cellular automaton. The key is 128 hex characters, which is the
+initial generation. The README says "the middle is watching" and "stop guessing
+futures, grow one", so the key is a preimage, not a password.
+
+Solved. The accepting key is
+
+    5070ed578e3ac5d1734d619f4b17b89181fe485b3c98b828d4aaef004d9ae933
+    7f75ec1cf79947c126b645dd7ff01a642176700b4e416d7909a19f3ede9cf6d9
+
+and the binary answers `access granted`. The route to it produced the most
+important finding in this document.
+
+### Finding 8: guessing one syscall name hides the whole mechanism
+
+`catch syscall write` never fires on veil. The program uses `writev`. gdb
+reports nothing unusual: the catchpoint is created, the program runs to
+completion, and the agent concludes either that the program produces no output
+or that anti-debugging blocked the breakpoint. Both conclusions are wrong.
+
+**Fix.** `bp.syscall group=output` sets catchpoints for the whole family and
+reports any name the kernel or gdb does not know, rather than failing silently.
+`sys.trace` records the actual syscall sequence in-session, which is how the
+`writev` was found, with no external tracer.
+
+### Finding 9: gdb cannot unwind a static stripped binary at all
+
+At the output syscall, every frame past the innermost came back empty. There is
+no CFI and no symbols, so `backtrace` is useless, and with it every "who called
+this" question.
+
+**Fix.** `stack.callers` scans the stack for values that point into an
+executable mapping *and* sit immediately after a real call instruction,
+verified by decoding the opcode. On veil it recovered a six-deep chain where
+gdb recovered one frame, which is what located the verdict site.
+
+### Finding 10: a memory read with no process silently returns the file
+
+Reading the comparison targets before starting the target returned 512 zero
+bytes, four times over, with no error. gdb had fallen back to the ELF on disk,
+where those buffers are uninitialised. The live values are what matter: 260 and
+233 set cells. An agent that reads first and runs later reports that the
+target is all zeros and builds everything downstream on it.
+
+**Fix.** Every `mem.read` and `mem.export` reply carries
+`source: live-process | file-backed`, and the file-backed case carries an
+explicit warning naming the consequence.
+
+### Finding 11: the debugger changed the answer, and nothing said so
+
+This is the finding that matters. veil reads `/proc/self/status` twice at
+startup and keeps the `TracerPid` result in a flag. That flag feeds a hash that
+flips exactly one cell of the 512-cell comparison target before the verdict is
+computed.
+
+So the program checks a *different target* under a debugger than it does on its
+own, and the difference is one bit out of 504 constraints. Nothing in the
+output, the exit code, or the rendered automaton differs. The tracer check costs
+two `openat` calls that look like routine startup.
+
+Measured, with the two keys this produces:
+
+| key | native | under rdbg, unmasked | under rdbg, masked |
+| --- | --- | --- | --- |
+| solved from the observed run | rejected | 1024, accepted | 1023, rejected |
+| solved from the masked run | **accepted** | 1023, rejected | 1024, accepted |
+
+The first row is the whole problem in one line. The investigation was sound,
+the extracted model predicted the observed score exactly, z3 solved the
+preimage in 0.5 s, and the resulting key does not work, because the execution
+that was observed is not the execution that runs.
+
+Replay fidelity would not have helped. Replaying that recording perfectly
+reproduces the perturbed verdict. What was needed was for the capture not to
+perturb the target, and then a way to check that it had not.
+
+**Fix.** `antidebug.mask` substitutes a doctored `/proc/self/status` with
+`TracerPid: 0` at the `openat` boundary, patching the path in place. With it the
+masked run and the native run agree, and the key solved under observation is
+the key that works.
+
+**And a check, not a promise.** The mask is not trusted on its own. Running the
+target natively and under each observation mode and comparing its own output
+byte for byte is a capture-fidelity test that a target can fail. veil's
+automaton rendering is identical across native, traced, and masked runs, which
+is exactly why the one-cell target difference was so easy to miss: the visible
+behaviour was preserved and only the verdict was not.
+
+### Also found here
+
+veil additionally times its own verification and compares against a 50.0
+threshold, taking a different path when observation makes the check slow. That
+path sets another bit in the same flag and moves the flipped cell again. Silent
+tracepoints, which record and resume without a round trip to the client, stay
+under the threshold where ordinary breakpoints do not.
+
+### What target 2 adds to the build order
+
+Target 1 argued for session persistence and logical locations. Target 2 argues
+for something the original plan treated as a late-stage concern:
+
+1. Every answer should name the observation regime it was obtained under.
+2. A capture-fidelity check belongs in the harness from the start, because a
+   target can preserve all of its visible behaviour and still change its verdict.
+3. Defeating the common tracer checks is not a nice-to-have. Without it the
+   observed execution is the wrong execution, and everything downstream, however
+   rigorous, answers a question nobody asked.

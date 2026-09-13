@@ -11,6 +11,7 @@ STATE = {
     "bps": {},              # id -> descriptor
     "done": {},             # request_id -> response (idempotent retry)
     "launch": None,         # argv/stdin used for the last run
+    "outfile": None,        # where the target's own stdout went
 }
 LOCK = threading.Lock()
 
@@ -19,6 +20,21 @@ LOCK = threading.Lock()
 # Resume commands therefore issue the command, then wait for a stop event.
 STOP_EV = threading.Event()
 LAST_STOP = {}
+
+# Syscall-level support. Two things a stripped static binary forces on you:
+# you cannot guess which syscall produces output (veil uses writev, not write),
+# and you cannot see the target reading /proc/self/status to find its tracer.
+SYSMASK = {"enabled": False, "subs": {}, "hits": [], "trace": None,
+           "trace_cap": 0}
+
+SYSCALL_GROUPS = {
+    "output": ["write", "writev", "pwrite64", "sendto", "sendmsg"],
+    "input": ["read", "readv", "pread64", "recvfrom", "recvmsg"],
+    "open": ["open", "openat", "openat2"],
+    "exec": ["execve", "execveat"],
+    "proc": ["fork", "vfork", "clone", "clone3"],
+    "antidebug": ["ptrace", "prctl", "openat", "process_vm_readv"],
+}
 
 
 def _on_stop(ev):
@@ -105,9 +121,48 @@ def _module_for(addr):
             return (None, addr, perms)
     return (None, addr, None)
 
+def _elf_static_base(path):
+    """Minimum PT_LOAD p_vaddr: the link-time base. 0x400000 for a classic
+    non-PIE binary, 0 for PIE. Lets logical locations resolve before any run."""
+    try:
+        with open(path, "rb") as fh:
+            hdr = fh.read(64)
+            if hdr[:4] != b"\x7fELF" or hdr[4] != 2:
+                return None
+            import struct
+            phoff = struct.unpack_from("<Q", hdr, 32)[0]
+            phentsize = struct.unpack_from("<H", hdr, 54)[0]
+            phnum = struct.unpack_from("<H", hdr, 56)[0]
+            fh.seek(phoff)
+            ph = fh.read(phentsize * phnum)
+        best = None
+        for i in range(phnum):
+            o = i * phentsize
+            p_type = struct.unpack_from("<I", ph, o)[0]
+            if p_type != 1:          # PT_LOAD
+                continue
+            vaddr = struct.unpack_from("<Q", ph, o + 16)[0]
+            if best is None or vaddr < best:
+                best = vaddr
+        return best
+    except Exception:
+        return None
+
+
 def _match_module(token):
     """Resolve a module token (basename or substring) to its load base."""
     bases = _module_bases()
+    if not bases:
+        # No process yet. A non-PIE binary still has a fixed base on disk.
+        prog = _main_module()
+        if prog and token in ("", "main", "exe", os.path.basename(prog)):
+            sb = _elf_static_base(prog)
+            if sb:
+                return prog, sb
+            raise gdb.error(
+                "%r is position-independent and the target is not running, so "
+                "its load base is unknown. Use run with at_entry=true, then set "
+                "the breakpoint." % os.path.basename(prog))
     if token in ("", "main", "exe"):
         mm = _main_module()
         if mm and mm in bases:
@@ -225,18 +280,47 @@ def _running():
 # ---------------------------------------------------------------- breakpoints
 
 class ScopedBP(gdb.Breakpoint):
-    """Breakpoint that can require its *caller* to live in a given module.
+    """Breakpoint that can require its *caller* to live in a given module,
+    and can record instead of stopping.
 
-    This is what makes `break mprotect` usable: the dynamic loader calls
-    mprotect during startup, and an unscoped breakpoint stops there first.
+    Caller scoping is what makes `break mprotect` usable: the dynamic loader
+    calls mprotect during startup, and an unscoped breakpoint stops there
+    first, so an agent reports the loader's argument as the program's.
+
+    silent=True turns it into a tracepoint: it records and returns False, so
+    gdb resumes without a round trip to the client.
     """
-    def __init__(self, spec, caller_module=None, bid=None, **kw):
+    def __init__(self, spec, caller_module=None, bid=None, silent=False,
+                 record=None, cap=20000, **kw):
         self.caller_module = caller_module
         self.bid = bid
         self.skipped = 0
+        self.silent_mode = silent
+        self.record_regs = record or []
+        self.cap = int(cap)
+        self.log = []
         super().__init__(spec, **kw)
 
+    def _record(self):
+        if len(self.log) >= self.cap:
+            return
+        e = {}
+        try:
+            f = gdb.newest_frame()
+            e["pc"] = "%#x" % _u64(f.pc())
+            for r in self.record_regs:
+                try:
+                    e[r] = int(f.read_register(r))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.log.append(e)
+
     def stop(self):
+        if self.silent_mode:
+            self._record()
+            return False            # record and keep running
         if not self.caller_module:
             return True
         try:
@@ -336,8 +420,17 @@ def h_eval(req):
 def h_mem_read(req):
     addr, _ = resolve_loc(req["loc"])
     n = int(req.get("len", 64))
+    live = _running()
     buf = bytes(gdb.selected_inferior().read_memory(addr, n))
-    out = {"addr": "%#x" % addr, "len": n, "hex": buf.hex()}
+    out = {"addr": "%#x" % addr, "len": n, "hex": buf.hex(),
+           "source": "live-process" if live else "file-backed"}
+    if not live:
+        # gdb silently falls back to the executable's own contents. A .bss or
+        # runtime-initialised buffer then reads as zeroes, and an agent reports
+        # that as the target's value.
+        out["warning"] = ("no process running: these bytes come from the ELF on "
+                          "disk, not from memory. Runtime-initialised data "
+                          "(.bss, decoded buffers) will read as zero.")
     if req.get("words"):
         w = int(req["words"])
         fmt = {4: "<I", 8: "<Q"}[w]
@@ -357,10 +450,12 @@ def h_mem_export(req):
     addr, _ = resolve_loc(req["loc"])
     n = int(req["len"])
     path = req["path"]
+    live = _running()
     buf = bytes(gdb.selected_inferior().read_memory(addr, n))
     with open(path, "wb") as fh:
         fh.write(buf)
     meta = {"base": "%#x" % addr, "len": n, "file": path,
+            "source": "live-process" if live else "file-backed",
             "source": describe_addr(addr),
             "r2": "r2 -a x86 -b 64 -m %#x %s" % (addr, path)}
     with open(path + ".json", "w") as fh:
@@ -377,9 +472,13 @@ def h_bp_set(req):
         spec, desc = loc, loc
     with LOCK:
         bid = "b%d" % (len(STATE["bps"]) + 1)
-    bp = ScopedBP(spec, caller_module=caller, bid=bid)
+    bp = ScopedBP(spec, caller_module=caller, bid=bid,
+                  silent=bool(req.get("silent")),
+                  record=req.get("record"), cap=req.get("cap", 20000))
     rec = {"id": bid, "loc": loc, "spec": spec, "desc": desc,
            "caller_module": caller, "gdb_num": bp.number,
+           "silent": bool(req.get("silent")),
+           "record": req.get("record"),
            "locations": bp.locations and len(bp.locations) or 1}
     with LOCK:
         STATE["bps"][bid] = dict(rec, obj=bp)
@@ -396,10 +495,37 @@ def h_bp_list(req):
             o = r.get("obj")
             items.append({"id": bid, "loc": r["loc"], "spec": r["spec"],
                           "caller_module": r.get("caller_module"),
+                          "silent": getattr(o, "silent_mode", False),
                           "hits": getattr(o, "hit_count", None),
+                          "recorded": len(getattr(o, "log", [])),
                           "skipped": getattr(o, "skipped", 0),
                           "enabled": getattr(o, "enabled", None)})
     return {"breakpoints": items}
+
+def h_bp_log(req):
+    """Read back what a silent tracepoint recorded."""
+    with LOCK:
+        r = STATE["bps"].get(req["id"])
+    if not r:
+        raise gdb.error("no breakpoint %r" % req["id"])
+    o = r["obj"]
+    log = list(getattr(o, "log", []))
+    n = int(req.get("tail", 0))
+    out = log[-n:] if n else log
+    res = {"id": req["id"], "hits": getattr(o, "hit_count", None),
+           "recorded": len(log), "entries": out}
+    if len(log) >= getattr(o, "cap", 0):
+        res["truncated_at"] = o.cap
+    return res
+
+
+def h_bp_clear_log(req):
+    with LOCK:
+        r = STATE["bps"].get(req["id"])
+    if r:
+        r["obj"].log = []
+    return {"cleared": req["id"]}
+
 
 def h_bp_delete(req):
     with LOCK:
@@ -438,21 +564,37 @@ def _mutate(req, fn, kind):
 
 def h_run(req):
     def go():
-        args = req.get("args")
-        if args:
-            _ex("set args " + " ".join(args))
+        args = req.get("args") or []
         stdin_data = req.get("stdin")
-        cmd = "run"
+        d = os.path.dirname(SOCK)
+        # Everything goes on the run line. `set args` is discarded as soon as
+        # the run command carries a redirection, which silently strips the
+        # program's arguments and can leave it blocking on gdb's own stdin.
+        verb = "starti" if req.get("at_entry") else "run"
+        parts = [verb] + [str(a) for a in args]
         if stdin_data is not None:
-            p = os.path.join(os.path.dirname(SOCK), "stdin-%d" % os.getpid())
+            p = os.path.join(d, "stdin-%s" % os.path.basename(SOCK))
             with open(p, "w") as fh:
                 fh.write(stdin_data)
-            cmd = "run < " + p
+            parts.append("< " + p)
+        else:
+            # never inherit gdb's stdin: a target that reads it hangs forever
+            parts.append("< /dev/null")
+        if req.get("capture_output", True):
+            outp = os.path.join(d, "out-%s.txt" % os.path.basename(SOCK))
+            try:
+                os.unlink(outp)
+            except OSError:
+                pass
+            parts.append("> " + outp)
+            parts.append("2>&1")
+            STATE["outfile"] = outp
+        cmd = " ".join(parts)
         with LOCK:
             STATE["launch"] = {"args": args, "stdin": stdin_data, "cmd": cmd}
         STOP_EV.clear()
         _ex(cmd)
-        return {"resumed": True}
+        return {"resumed": True, "cmd": cmd, "at_entry": bool(req.get("at_entry"))}
     return _mutate(req, go, "run")
 
 def _resume(cmd, req):
@@ -467,6 +609,15 @@ def _resume(cmd, req):
 
 
 def h_cont(req):   return _resume("continue", req)
+
+
+def h__raw_cont(req):
+    STOP_EV.clear()
+    try:
+        _ex("continue")
+    except gdb.error as e:
+        return {"resumed": False, "gdb_error": str(e)}
+    return {"resumed": True}
 def h_step(req):   return _resume("step %d" % int(req.get("n", 1)), req)
 def h_next(req):   return _resume("next %d" % int(req.get("n", 1)), req)
 def h_stepi(req):  return _resume("stepi %d" % int(req.get("n", 1)), req)
@@ -537,6 +688,19 @@ def h_note_list(req):
             notes[k] = d
     return {"notes": notes}
 
+def h_output(req):
+    """The target's own stdout/stderr for the current run, verbatim."""
+    p = STATE.get("outfile")
+    if not p or not os.path.exists(p):
+        return {"output": None, "reason": "no captured output"}
+    with open(p, "rb") as fh:
+        data = fh.read()
+    txt = data.decode("utf-8", "replace")
+    if req.get("tail"):
+        txt = "\n".join(txt.splitlines()[-int(req["tail"]):])
+    return {"file": p, "bytes": len(data), "output": txt}
+
+
 def h_journal(req):
     with LOCK:
         return {"revision": STATE["revision"], "journal": list(STATE["journal"]),
@@ -551,6 +715,248 @@ def h_mappings(req):
 def h_gdb(req):
     """Escape hatch: run a raw gdb command."""
     return {"out": _ex(req["cmd"])}
+
+def _at_syscall_entry():
+    """True when stopped at syscall entry (rax == -ENOSYS on x86-64)."""
+    try:
+        f = _cur_frame()
+        if f is None:
+            return False
+        return int(f.read_register("rax")) == -38
+    except Exception:
+        return False
+
+
+def _syscall_nr():
+    try:
+        return int(_cur_frame().read_register("orig_rax"))
+    except Exception:
+        return None
+
+
+def _read_cstr(addr, cap=512):
+    out = bytearray()
+    inf = gdb.selected_inferior()
+    while len(out) < cap:
+        chunk = bytes(inf.read_memory(addr + len(out), 64))
+        i = chunk.find(b"\x00")
+        if i >= 0:
+            out += chunk[:i]
+            break
+        out += chunk
+    return bytes(out).decode("utf-8", "replace")
+
+
+def h_sys_group(req):
+    return {"groups": SYSCALL_GROUPS}
+
+
+def h_bp_syscall(req):
+    """Catchpoint by name or by semantic group.
+
+    Guessing one name is how an agent misses the real mechanism: `write` never
+    fires on a target that uses `writev`. A group catches the whole family.
+    """
+    names = []
+    if req.get("group"):
+        g = req["group"]
+        if g not in SYSCALL_GROUPS:
+            raise gdb.error("unknown group %r (have %s)"
+                            % (g, sorted(SYSCALL_GROUPS)))
+        names = list(SYSCALL_GROUPS[g])
+    if req.get("name"):
+        names.append(req["name"])
+    if not names:
+        raise gdb.error("pass name= or group=")
+    set_ok, failed = [], {}
+    for n in names:
+        try:
+            _ex("catch syscall %s" % n)
+            set_ok.append(n)
+        except gdb.error as e:
+            failed[n] = str(e)
+    return {"caught": set_ok, "unavailable": failed,
+            "note": "a name absent from this kernel/gdb is reported, not silent"}
+
+
+def h_sys_trace(req):
+    """Arm a full syscall trace; the transport auto-continues and records."""
+    cap = int(req.get("cap", 400))
+    _ex("catch syscall")
+    SYSMASK["trace"] = []
+    SYSMASK["trace_cap"] = cap
+    return {"armed": True, "cap": cap}
+
+
+def h_sys_trace_get(req):
+    return {"trace": SYSMASK["trace"] or [], "count": len(SYSMASK["trace"] or [])}
+
+
+def h_antidebug_mask(req):
+    """Make the target's own tracer check come back clean.
+
+    veil opens /proc/self/status and reads TracerPid. Under any debugger that
+    is non-zero, so the target can take a different path and the agent sees a
+    normal-looking run. This substitutes a doctored file at the openat
+    boundary, in place, so the read returns TracerPid: 0.
+    """
+    subs = {}
+    wanted = req.get("paths") or ["/proc/self/status"]
+    d = os.path.dirname(SOCK)
+    for i, p in enumerate(wanted):
+        # replacement path must fit in the original buffer (patched in place)
+        repl = os.path.join("/tmp", ".rd%d%d" % (os.getpid() % 1000, i))
+        if len(repl) > len(p):
+            raise gdb.error("replacement %r longer than %r; cannot patch in place"
+                            % (repl, p))
+        subs[p] = repl
+    SYSMASK["enabled"] = True
+    SYSMASK["subs"] = subs
+    SYSMASK["hits"] = []
+    _ex("catch syscall openat")
+    return {"masking": subs, "armed": True,
+            "caveat": "the target is still traced; only its view of TracerPid changes"}
+
+
+def _materialise_status(real_path, repl_path):
+    """Write a copy of the target's /proc/<pid>/status with TracerPid: 0."""
+    try:
+        pid = gdb.selected_inferior().pid
+        src = real_path.replace("/proc/self/", "/proc/%d/" % pid)
+        with open(src, "rb") as fh:
+            data = fh.read()
+    except Exception:
+        data = b"Name:\tunknown\nTracerPid:\t0\n"
+    out = []
+    for ln in data.split(b"\n"):
+        if ln.startswith(b"TracerPid:"):
+            ln = b"TracerPid:\t0"
+        out.append(ln)
+    with open(repl_path, "wb") as fh:
+        fh.write(b"\n".join(out))
+    return repl_path
+
+
+def h__autohandle(req):
+    """Decide whether the current stop is ours to absorb silently."""
+    if not _running():
+        return {"handled": False, "reason": "not running"}
+    nr = _syscall_nr()
+    entry = _at_syscall_entry()
+    # record for the trace, if one is armed
+    if SYSMASK["trace"] is not None and nr is not None:
+        if len(SYSMASK["trace"]) < SYSMASK["trace_cap"]:
+            rec = {"nr": nr, "entry": entry}
+            try:
+                f = _cur_frame()
+                rec["args"] = ["%#x" % _u64(f.read_register(r))
+                               for r in ("rdi", "rsi", "rdx")]
+                if not entry:
+                    rec["ret"] = int(f.read_register("rax"))
+            except Exception:
+                pass
+            rec["pc"] = describe_addr(_u64(_cur_frame().pc()))
+            SYSMASK["trace"].append(rec)
+            return {"handled": True, "reason": "traced"}
+        return {"handled": False, "reason": "trace cap reached"}
+    # openat masking: absorb both the entry and the return stop
+    if SYSMASK["enabled"] and nr == 257 and not entry:
+        return {"handled": True, "reason": "openat return"}
+    if SYSMASK["enabled"] and entry and nr == 257:
+        try:
+            f = _cur_frame()
+            pathp = _u64(f.read_register("rsi"))
+            path = _read_cstr(pathp)
+        except Exception:
+            return {"handled": False, "reason": "unreadable path"}
+        if path in SYSMASK["subs"]:
+            repl = SYSMASK["subs"][path]
+            _materialise_status(path, repl)
+            buf = repl.encode() + b"\x00"
+            gdb.selected_inferior().write_memory(pathp, buf)
+            SYSMASK["hits"].append({"path": path, "replaced_with": repl,
+                                    "at": describe_addr(_u64(f.pc()))})
+            return {"handled": True, "reason": "masked openat", "path": path}
+        return {"handled": True, "reason": "openat not masked: %s" % path}
+    return {"handled": False, "reason": "nr=%s entry=%s" % (nr, entry)}
+
+
+def _exec_ranges():
+    return [(st, en, path) for st, en, _o, p, path in _mappings() if "x" in p]
+
+
+def _is_call_site(addr):
+    """Does a call instruction end exactly at addr? Confirms a return address."""
+    inf = gdb.selected_inferior()
+    try:
+        pre = bytes(inf.read_memory(addr - 8, 8))
+    except gdb.MemoryError:
+        return None
+    # direct call rel32: E8 xx xx xx xx  (5 bytes)
+    if pre[3] == 0xE8:
+        import struct
+        rel = struct.unpack("<i", pre[4:8])[0]
+        return {"form": "call rel32", "at": "%#x" % (addr - 5),
+                "target": "%#x" % ((addr + rel) & 0xFFFFFFFFFFFFFFFF)}
+    # indirect call: FF /2 with various modrm/prefix lengths
+    for ln in (2, 3, 4, 6, 7):
+        i = 8 - ln
+        if pre[i] == 0xFF and ((pre[i + 1] >> 3) & 7) == 2:
+            return {"form": "call indirect", "at": "%#x" % (addr - ln)}
+        if ln >= 3 and pre[i] in (0x41, 0x48, 0x49) and pre[i + 1] == 0xFF \
+                and ((pre[i + 2] >> 3) & 7) == 2:
+            return {"form": "call indirect", "at": "%#x" % (addr - ln)}
+    return None
+
+
+def h_stack_callers(req):
+    """Recover a call chain by scanning the stack for return addresses.
+
+    gdb cannot unwind a static stripped binary with no CFI: every frame past
+    the innermost comes back empty. Scanning for stack slots that point just
+    after a real call instruction recovers the chain the way a human does.
+    """
+    if not _running():
+        raise gdb.error("target is not running")
+    f = _cur_frame()
+    rsp = _u64(f.read_register("rsp"))
+    depth = int(req.get("bytes", 2048))
+    want_mod = req.get("module")
+    inf = gdb.selected_inferior()
+    import struct
+    raw = bytes(inf.read_memory(rsp, depth))
+    ranges = _exec_ranges()
+    out = []
+    for off in range(0, len(raw) - 8, 8):
+        v = struct.unpack_from("<Q", raw, off)[0]
+        if v < 0x1000:
+            continue
+        hit = next((r for r in ranges if r[0] <= v < r[1]), None)
+        if not hit:
+            continue
+        if want_mod and os.path.basename(hit[2] or "") != want_mod:
+            continue
+        ev = _is_call_site(v)
+        if not ev:
+            continue
+        e = describe_addr(v)
+        e["stack_offset"] = "%#x" % off
+        e["stack_at"] = "%#x" % (rsp + off)
+        e["call"] = ev
+        if ev.get("at"):
+            e["call_site"] = describe_addr(int(ev["at"], 16))
+        out.append(e)
+    return {"rsp": "%#x" % rsp, "scanned_bytes": depth,
+            "callers": out, "count": len(out),
+            "method": "return-address scan confirmed by a preceding call opcode",
+            "caveat": "heuristic: stale slots can appear; confirmed entries are "
+                      "return addresses, not necessarily the live chain"}
+
+
+def h_antidebug_status(req):
+    return {"enabled": SYSMASK["enabled"], "subs": SYSMASK["subs"],
+            "hits": SYSMASK["hits"]}
+
 
 def h_checkpoint(req):
     def go():
@@ -572,7 +978,13 @@ HANDLERS = {
     "next": h_next, "stepi": h_stepi, "finish": h_finish, "call": h_call,
     "note.set": h_note_set, "note.list": h_note_list, "journal": h_journal,
     "mappings": h_mappings, "gdb": h_gdb, "checkpoint": h_checkpoint,
-    "restore": h_restore,
+    "restore": h_restore, "bp.syscall": h_bp_syscall,
+    "sys.groups": h_sys_group, "sys.trace": h_sys_trace,
+    "sys.trace.get": h_sys_trace_get, "antidebug.mask": h_antidebug_mask,
+    "antidebug.status": h_antidebug_status, "_autohandle": h__autohandle,
+    "_raw_cont": h__raw_cont, "output": h_output,
+    "stack.callers": h_stack_callers, "bp.log": h_bp_log,
+    "bp.clear_log": h_bp_clear_log,
 }
 
 # ---------------------------------------------------------------- transport
@@ -621,14 +1033,28 @@ def _serve_resume(req, timeout):
     if not issued.get("resumed"):
         return first
     wait_s = float(req.get("wait_timeout", timeout))
-    if not STOP_EV.wait(timeout=wait_s):
-        return {"ok": True, "result": dict(
-            issued, stopped=False,
-            note="target still running after %gs; use op=interrupt" % wait_s)}
+    absorbed = 0
+    while True:
+        if not STOP_EV.wait(timeout=wait_s):
+            return {"ok": True, "result": dict(
+                issued, stopped=False, absorbed=absorbed,
+                note="target still running after %gs; use op=interrupt" % wait_s)}
+        if LAST_STOP.get("reason") == "exited":
+            break
+        auto = _on_main({"op": "_autohandle"}, timeout)
+        if not (auto.get("ok") and auto["result"].get("handled")):
+            break
+        absorbed += 1
+        if absorbed > int(req.get("absorb_cap", 20000)):
+            break
+        cont = _on_main({"op": "_raw_cont"}, timeout)
+        if not cont.get("ok"):
+            break
     snap = _on_main({"op": "snapshot", "disasm": req.get("disasm", 4),
                      "depth": req.get("depth", 8)}, timeout)
     out = dict(issued)
     out["stopped"] = True
+    out["absorbed"] = absorbed
     out["stop"] = dict(LAST_STOP)
     if snap.get("ok"):
         out.update(snap["result"])

@@ -12,6 +12,9 @@ STATE = {
     "done": {},             # request_id -> response (idempotent retry)
     "launch": None,         # argv/stdin used for the last run
     "outfile": None,        # where the target's own stdout went
+    "protect": None,        # {"path","master"} for self-deleting targets
+    "provisioned": 0,       # times the binary had to be restored
+    "interventions": [],    # target-changing acts: this run is no longer pristine
 }
 LOCK = threading.Lock()
 
@@ -26,6 +29,33 @@ LAST_STOP = {}
 # and you cannot see the target reading /proc/self/status to find its tracer.
 SYSMASK = {"enabled": False, "subs": {}, "hits": [], "trace": None,
            "trace_cap": 0}
+
+# Filesystem effects. An untrusted target can modify the machine it is being
+# analysed on. lernaia appended a 134-byte constructor to 919 of this host's
+# shared libraries during a single run, and nothing in the debugger said so.
+FSMON = {"armed": False, "records": [], "allow": [], "block": False,
+         "violations": [], "cap": 4000}
+
+# syscall number -> (name, [arg registers holding a path], writes?)
+FS_SYSCALLS = {
+    2:   ("open",      ["rdi"], "flags:rsi"),
+    257: ("openat",    ["rsi"], "flags:rdx"),
+    437: ("openat2",   ["rsi"], None),
+    87:  ("unlink",    ["rdi"], True),
+    263: ("unlinkat",  ["rsi"], True),
+    82:  ("rename",    ["rdi", "rsi"], True),
+    264: ("renameat",  ["rsi", "rcx"], True),
+    316: ("renameat2", ["rsi", "rcx"], True),
+    76:  ("truncate",  ["rdi"], True),
+    90:  ("chmod",     ["rdi"], True),
+    268: ("fchmodat",  ["rsi"], True),
+    86:  ("link",      ["rdi", "rsi"], True),
+    88:  ("symlink",   ["rdi", "rsi"], True),
+    83:  ("mkdir",     ["rdi"], True),
+    85:  ("creat",     ["rdi"], True),
+    133: ("mknod",     ["rdi"], True),
+}
+O_WRONLY, O_RDWR, O_CREAT, O_TRUNC = 1, 2, 0o100, 0o1000
 
 SYSCALL_GROUPS = {
     "output": ["write", "writev", "pwrite64", "sendto", "sendmsg"],
@@ -362,8 +392,11 @@ def h_snapshot(req):
     if frame is None:
         return {"revision": rev, "running": True, "no_frame": True}
     pc = _u64(frame.pc())
+    with LOCK:
+        niv = len(STATE["interventions"])
     snap = {"revision": rev, "running": True, "pc": describe_addr(pc),
-            "regs": _regs()}
+            "scope": "modeled" if niv else "observed",
+            "interventions": niv, "regs": _regs()}
     try:
         snap["thread"] = gdb.selected_thread().num
         snap["threads"] = len(gdb.selected_inferior().threads())
@@ -443,7 +476,11 @@ def h_mem_write(req):
     addr, _ = resolve_loc(req["loc"])
     data = bytes.fromhex(req["hex"])
     gdb.selected_inferior().write_memory(addr, data)
-    return {"addr": "%#x" % addr, "wrote": len(data)}
+    _note_intervention("mem.write", req)
+    with LOCK:
+        n = len(STATE["interventions"])
+    return {"addr": "%#x" % addr, "wrote": len(data),
+            "scope": "modeled", "interventions": n}
 
 def h_mem_export(req):
     """Dump a region AND record its base, so a disassembler can load it right."""
@@ -456,8 +493,11 @@ def h_mem_export(req):
         fh.write(buf)
     meta = {"base": "%#x" % addr, "len": n, "file": path,
             "source": "live-process" if live else "file-backed",
-            "source": describe_addr(addr),
+            "region": describe_addr(addr),
             "r2": "r2 -a x86 -b 64 -m %#x %s" % (addr, path)}
+    if not live:
+        meta["warning"] = ("no process running: these bytes come from the ELF on "
+                           "disk, not from memory")
     with open(path + ".json", "w") as fh:
         json.dump(meta, fh, indent=1)
     return meta
@@ -538,6 +578,39 @@ def h_bp_delete(req):
         pass
     return {"deleted": True, "id": req["id"]}
 
+# Acts that change what the target computes, as opposed to merely observing it.
+# Once one has been applied, nothing downstream is an observation of the
+# program's own behaviour any more, and every reply says so.
+INTERVENING = {"mem.write", "call", "restore"}
+
+
+def _note_intervention(kind, req):
+    rec = {"kind": kind, "t": time.time(),
+           "where": {k: v for k, v in req.items()
+                     if k in ("loc", "fn", "hex", "args", "id")}}
+    with LOCK:
+        STATE["interventions"].append(rec)
+
+
+def h_scope(req):
+    """Is the current session still observing, or has it been steered?"""
+    with LOCK:
+        iv = list(STATE["interventions"])
+    return {
+        "scope": "modeled" if iv else "observed",
+        "interventions": iv,
+        "count": len(iv),
+        "meaning": ("observed: the target ran its own course and these facts are "
+                    "about that execution. modeled: the session wrote target "
+                    "memory or called into the target, so results describe an "
+                    "execution the debugger helped produce, not one the program "
+                    "would have taken on its own."),
+        "masking": bool(SYSMASK.get("enabled")),
+        "masking_note": ("a masked run is closer to the unobserved program, not "
+                         "further: it removes a difference the target can see"),
+    }
+
+
 def _mutate(req, fn, kind):
     """Run a target mutation under revision + journal + retry protection."""
     rid = req.get("request_id")
@@ -551,6 +624,8 @@ def _mutate(req, fn, kind):
             raise gdb.error("stale revision: expected %s, target is at %d"
                             % (exp, STATE["revision"]))
     res = fn()
+    if kind in INTERVENING:
+        _note_intervention(kind, req)
     with LOCK:
         STATE["revision"] += 1
         res = dict(res or {})
@@ -570,6 +645,7 @@ def h_run(req):
         # Everything goes on the run line. `set args` is discarded as soon as
         # the run command carries a redirection, which silently strips the
         # program's arguments and can leave it blocking on gdb's own stdin.
+        prov = _provision()
         verb = "starti" if req.get("at_entry") else "run"
         parts = [verb] + [str(a) for a in args]
         if stdin_data is not None:
@@ -592,9 +668,14 @@ def h_run(req):
         cmd = " ".join(parts)
         with LOCK:
             STATE["launch"] = {"args": args, "stdin": stdin_data, "cmd": cmd}
+            STATE["interventions"] = []   # a new run starts observing again
         STOP_EV.clear()
         _ex(cmd)
-        return {"resumed": True, "cmd": cmd, "at_entry": bool(req.get("at_entry"))}
+        res = {"resumed": True, "cmd": cmd,
+               "at_entry": bool(req.get("at_entry"))}
+        if prov:
+            res["provisioned"] = prov
+        return res
     return _mutate(req, go, "run")
 
 def _resume(cmd, req):
@@ -687,6 +768,59 @@ def h_note_list(req):
                 d["hex"] = "%#x" % v["value"]
             notes[k] = d
     return {"notes": notes}
+
+def h_protect(req):
+    """Guard a target that destroys its own executable.
+
+    lernaia readlinks /proc/self/exe and unlinks it, so each execution consumes
+    the binary and there is no second run. Keeping a pristine master and
+    restoring the path before every run makes runs unlimited again.
+    """
+    import shutil
+    path = req.get("path") or _main_module()
+    if not path:
+        raise gdb.error("no program to protect")
+    master = req.get("master") or (os.path.join(
+        os.path.dirname(SOCK), "master-%s" % os.path.basename(path)))
+    if not os.path.exists(master):
+        if not os.path.exists(path):
+            raise gdb.error("neither %r nor a master copy %r exists" % (path, master))
+        shutil.copy2(path, master)
+    STATE["protect"] = {"path": path, "master": master}
+    return {"protecting": path, "master": master,
+            "note": "the executable is restored from the master before each run"}
+
+
+def _provision():
+    """Restore the guarded executable if the last run destroyed or changed it."""
+    p = STATE.get("protect")
+    if not p:
+        return None
+    import shutil
+    path, master = p["path"], p["master"]
+    missing = not os.path.exists(path)
+    changed = False
+    if not missing:
+        try:
+            changed = (os.path.getsize(path) != os.path.getsize(master))
+        except OSError:
+            changed = True
+    if missing or changed:
+        shutil.copy2(master, path)
+        os.chmod(path, 0o755)
+        STATE["provisioned"] += 1
+        return {"restored": path, "was": "missing" if missing else "modified",
+                "count": STATE["provisioned"]}
+    return None
+
+
+def h_protect_status(req):
+    p = STATE.get("protect")
+    out = {"protect": p, "provisioned": STATE["provisioned"]}
+    if p:
+        out["executable_present"] = os.path.exists(p["path"])
+    return out
+
 
 def h_output(req):
     """The target's own stdout/stderr for the current run, verbatim."""
@@ -792,6 +926,94 @@ def h_sys_trace_get(req):
     return {"trace": SYSMASK["trace"] or [], "count": len(SYSMASK["trace"] or [])}
 
 
+def h_fsmon_arm(req):
+    """Watch, and optionally stop on, filesystem writes by the target.
+
+    allow: path prefixes the target may legitimately write under.
+    block: stop the run at the first write outside them, before it lands.
+    """
+    FSMON["armed"] = True
+    FSMON["records"] = []
+    FSMON["violations"] = []
+    FSMON["allow"] = [os.path.abspath(p) for p in (req.get("allow") or [])]
+    FSMON["block"] = bool(req.get("block"))
+    names = sorted(set(n for n, _a, _w in FS_SYSCALLS.values()))
+    caught, missing = [], []
+    for n in names:
+        try:
+            _ex("catch syscall %s" % n)
+            caught.append(n)
+        except gdb.error:
+            missing.append(n)
+    return {"armed": True, "allow": FSMON["allow"], "block": FSMON["block"],
+            "watching": caught, "unavailable": missing}
+
+
+def h_fsmon_report(req):
+    recs = FSMON["records"]
+    if req.get("outside_only"):
+        recs = [r for r in recs if not r.get("allowed")]
+    by_path = {}
+    for r in recs:
+        by_path.setdefault(r["path"], {"path": r["path"], "ops": set(), "n": 0})
+        by_path[r["path"]]["ops"].add(r["syscall"])
+        by_path[r["path"]]["n"] += 1
+    summary = sorted(({"path": v["path"], "ops": sorted(v["ops"]), "count": v["n"]}
+                      for v in by_path.values()), key=lambda d: -d["count"])
+    return {"armed": FSMON["armed"], "total": len(FSMON["records"]),
+            "distinct_paths": len(by_path),
+            "violations": FSMON["violations"][:50],
+            "paths": summary[: int(req.get("limit", 60))]}
+
+
+def _fs_allowed(path):
+    if not FSMON["allow"]:
+        return True
+    ap = os.path.abspath(path)
+    return any(ap == a or ap.startswith(a.rstrip("/") + "/")
+               for a in FSMON["allow"])
+
+
+def _fs_check(nr, entry):
+    """Record a filesystem-modifying syscall. Returns True to absorb the stop."""
+    if not FSMON["armed"] or nr not in FS_SYSCALLS:
+        return None
+    if not entry:
+        return {"absorb": True}
+    name, regs, wflag = FS_SYSCALLS[nr]
+    try:
+        f = _cur_frame()
+    except Exception:
+        return {"absorb": True}
+    # only count opens that intend to write
+    if isinstance(wflag, str) and wflag.startswith("flags:"):
+        try:
+            fl = int(f.read_register(wflag.split(":", 1)[1])) & 0xFFFFFFFF
+        except Exception:
+            fl = 0
+        if not (fl & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)):
+            return {"absorb": True}
+    paths = []
+    for r in regs:
+        try:
+            p = _read_cstr(_u64(f.read_register(r)))
+            if p:
+                paths.append(p)
+        except Exception:
+            pass
+    for p in paths:
+        allowed = _fs_allowed(p)
+        rec = {"syscall": name, "path": p, "allowed": allowed,
+               "at": describe_addr(_u64(f.pc()))}
+        if len(FSMON["records"]) < FSMON["cap"]:
+            FSMON["records"].append(rec)
+        if not allowed:
+            FSMON["violations"].append(rec)
+            if FSMON["block"]:
+                return {"absorb": False, "violation": rec}
+    return {"absorb": True}
+
+
 def h_antidebug_mask(req):
     """Make the target's own tracer check come back clean.
 
@@ -859,6 +1081,12 @@ def h__autohandle(req):
             SYSMASK["trace"].append(rec)
             return {"handled": True, "reason": "traced"}
         return {"handled": False, "reason": "trace cap reached"}
+    fs = _fs_check(nr, entry)
+    if fs is not None and not fs.get("absorb"):
+        return {"handled": False, "reason": "filesystem write outside allowlist",
+                "violation": fs.get("violation")}
+    if fs is not None and fs.get("absorb") and not SYSMASK["enabled"]:
+        return {"handled": True, "reason": "fsmon recorded"}
     # openat masking: absorb both the entry and the return stop
     if SYSMASK["enabled"] and nr == 257 and not entry:
         return {"handled": True, "reason": "openat return"}
@@ -983,6 +1211,8 @@ HANDLERS = {
     "sys.trace.get": h_sys_trace_get, "antidebug.mask": h_antidebug_mask,
     "antidebug.status": h_antidebug_status, "_autohandle": h__autohandle,
     "_raw_cont": h__raw_cont, "output": h_output,
+    "protect": h_protect, "protect.status": h_protect_status, "scope": h_scope,
+    "fsmon.arm": h_fsmon_arm, "fsmon.report": h_fsmon_report,
     "stack.callers": h_stack_callers, "bp.log": h_bp_log,
     "bp.clear_log": h_bp_clear_log,
 }

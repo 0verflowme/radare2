@@ -12,7 +12,7 @@ configuration before being believed.
 
 Usage: diffuzz.py <seed-start> <count> <outdir> [worker-id]
 """
-import os, random, subprocess, sys, time
+import os, random, subprocess, sys, textwrap, time
 
 D8 = "/home/user/work/v8/dbg/d8"
 CWD = "/home/user/work/v8/dbg"

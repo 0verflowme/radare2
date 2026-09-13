@@ -380,9 +380,21 @@ The practical consequences, in order of how they appeared:
 4. It corrupts git's remote-helper protocol. `git ls-remote` began returning the
    injected text as a ref name, and `git push` stopped working, so the rest of
    this work had to be pushed through the GitHub API.
-5. It breaks tooling that parses command output, including this repository's own
-   stop hook, whose `jq` failed on the injected lines and which then reported
-   untracked files that do not exist.
+5. It breaks tooling that parses command output, because the banner arrives in
+   *every* command substitution, not only in the ones a reader would expect.
+   This repository's stop hook fails in two independent places at once, and the
+   first version of this list conflated them. `input=$(cat)` captures the banner
+   ahead of the JSON on standard input, so `jq` cannot parse it and the
+   recursion guard never arms, which is why the hook repeats every turn instead
+   of passing on the second attempt. Separately, `git ls-files --others` returns
+   146 bytes of banner and no paths, so testing that string for emptiness
+   reports untracked files that do not exist. Five of the hook's command
+   substitutions are affected, including `git branch --show-current` and a
+   `git rev-list --count` whose output feeds an arithmetic comparison, so
+   patching one of them moves the failure to the next rather than fixing it.
+   The transferable lesson is that testing a captured string for emptiness is
+   not a robust check. Testing that each line names a path that exists on disk
+   is, and it would have held here.
 
 Nothing in the debugger reported any of this. gdb reported a clean run with exit
 code 1. There is no stop, no warning, and no record. An agent working

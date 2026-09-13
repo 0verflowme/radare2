@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""rdbg - persistent, programmable debug sessions for automated agents.
+
+A session is a long-lived gdb hosting rdbg/server.py. It survives between
+commands, so an agent never re-runs the target to re-derive what it already
+knows. Every answer is JSON. Every address comes back as a logical location
+(@module+offset or $note+offset) that stays valid across relaunches.
+
+  rdbg start NAME BINARY [--args ...]   launch a session
+  rdbg ls                               list sessions
+  rdbg stop NAME                        kill a session
+  rdbg <NAME> OP [k=v ...]              send one request
+  rdbg <NAME> --json '{"op":...}'       send raw request
+"""
+import json, os, shlex, signal, socket, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SERVER = os.path.join(HERE, "server.py")
+RUN = os.environ.get("RDBG_DIR") or os.path.expanduser("~/.rdbg")
+
+
+def sock_path(name): return os.path.join(RUN, "%s.sock" % name)
+def meta_path(name): return os.path.join(RUN, "%s.json" % name)
+
+
+def send(name, req, timeout=3600.0):
+    p = sock_path(name)
+    if not os.path.exists(p):
+        die("no session %r (rdbg ls)" % name)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(p)
+    f = s.makefile("rwb")
+    f.write((json.dumps(req) + "\n").encode()); f.flush()
+    line = f.readline()
+    s.close()
+    if not line:
+        die("session %r closed the connection" % name)
+    return json.loads(line)
+
+
+def die(msg, code=1):
+    print(json.dumps({"ok": False, "error": msg}), file=sys.stderr)
+    sys.exit(code)
+
+
+def start(argv):
+    if len(argv) < 2:
+        die("usage: rdbg start NAME BINARY [--args A B ...]")
+    name, binary = argv[0], os.path.abspath(argv[1])
+    rest = argv[2:]
+    os.makedirs(RUN, exist_ok=True)
+    sp = sock_path(name)
+    if os.path.exists(sp):
+        r = None
+        try:
+            r = send(name, {"op": "ping"}, timeout=3)
+        except Exception:
+            pass
+        if r and r.get("ok"):
+            print(json.dumps({"ok": True, "result": {"existing": name}}))
+            return
+        os.unlink(sp)
+    ready = sp + ".ready"
+    if os.path.exists(ready):
+        os.unlink(ready)
+    env = dict(os.environ, RDBG_SOCK=sp)
+    log = open(os.path.join(RUN, "%s.log" % name), "wb")
+    cmd = ["gdb", "-q", "-nx", "-iex", "set confirm off", "-x", SERVER, binary]
+    if "--args" in rest:
+        i = rest.index("--args")
+        cmd += ["--args", binary] + rest[i + 1:]
+    # gdb must keep a live stdin or it exits at EOF once this launcher does.
+    # Hand it both ends of a pipe: it inherits the write end, so no EOF ever.
+    rfd, wfd = os.pipe()
+    os.set_inheritable(rfd, True)
+    os.set_inheritable(wfd, True)
+    proc = subprocess.Popen(cmd, stdin=rfd, stdout=log,
+                            stderr=subprocess.STDOUT, env=env,
+                            start_new_session=True, pass_fds=(wfd,),
+                            close_fds=True)
+    os.close(rfd)
+    os.close(wfd)
+    for _ in range(200):
+        if os.path.exists(ready):
+            break
+        if proc.poll() is not None:
+            die("gdb exited; see %s/%s.log" % (RUN, name))
+        time.sleep(0.05)
+    else:
+        die("session did not come up; see %s/%s.log" % (RUN, name))
+    json.dump({"name": name, "binary": binary, "gdb_pid": proc.pid,
+               "started": time.time()}, open(meta_path(name), "w"))
+    print(json.dumps({"ok": True, "result": {
+        "session": name, "binary": binary, "gdb_pid": proc.pid, "sock": sp}}))
+
+
+def ls(_argv):
+    out = []
+    if os.path.isdir(RUN):
+        for fn in sorted(os.listdir(RUN)):
+            if not fn.endswith(".json") or fn.endswith(".sock.json"):
+                continue
+            name = fn[:-5]
+            meta = json.load(open(os.path.join(RUN, fn)))
+            alive = False
+            rev = None
+            try:
+                r = send(name, {"op": "ping"}, timeout=3)
+                alive = bool(r.get("ok"))
+            except Exception:
+                pass
+            if alive:
+                try:
+                    s = send(name, {"op": "snapshot", "disasm": 0}, timeout=10)
+                    rev = s.get("result", {}).get("revision")
+                except Exception:
+                    pass
+            out.append({"session": name, "binary": meta.get("binary"),
+                        "alive": alive, "revision": rev})
+    print(json.dumps({"ok": True, "result": {"sessions": out}}, indent=1))
+
+
+def stop(argv):
+    if not argv:
+        die("usage: rdbg stop NAME")
+    name = argv[0]
+    try:
+        meta = json.load(open(meta_path(name)))
+        os.killpg(os.getpgid(meta["gdb_pid"]), signal.SIGKILL)
+    except Exception:
+        pass
+    for p in (sock_path(name), sock_path(name) + ".ready", meta_path(name)):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    print(json.dumps({"ok": True, "result": {"stopped": name}}))
+
+
+def coerce(v):
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    try:
+        return int(v, 0)
+    except ValueError:
+        pass
+    if v.startswith(("[", "{")):
+        try:
+            return json.loads(v)
+        except Exception:
+            pass
+    return v
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__); return
+    if a[0] == "start":   return start(a[1:])
+    if a[0] == "ls":      return ls(a[1:])
+    if a[0] == "stop":    return stop(a[1:])
+    name = a[0]
+    if len(a) >= 3 and a[1] == "--json":
+        req = json.loads(a[2])
+    else:
+        if len(a) < 2:
+            die("usage: rdbg NAME OP [k=v ...]")
+        req = {"op": a[1]}
+        for kv in a[2:]:
+            if "=" not in kv:
+                die("expected k=v, got %r" % kv)
+            k, v = kv.split("=", 1)
+            req[k] = coerce(v)
+    r = send(name, req)
+    print(json.dumps(r, indent=1))
+    sys.exit(0 if r.get("ok") else 2)
+
+
+if __name__ == "__main__":
+    main()

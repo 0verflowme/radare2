@@ -16,7 +16,8 @@ die with the process, so every step re-derives them and the agent grows a batch
 script by hand. On a real target that script becomes the project.
 
 The measured failures that motivated each feature are in
-[`doc/agent-debugging-gaps.md`](../agent-debugging-gaps.md).
+[`doc/agent-debugging-gaps.md`](../agent-debugging-gaps.md) and
+[`doc/agent-debugging-v8.md`](../agent-debugging-v8.md).
 
 ## Use
 
@@ -41,9 +42,10 @@ Every request and response is JSON. From Python:
 commands. Reconnecting costs nothing.
 
 **Logical locations.** Every address is accepted and returned as
-`@module+offset` or `$note+offset`, never a bare runtime address. These stay
-valid across relaunch and ASLR. `loc.resolve` converts one to an address;
-every reply describes addresses both ways.
+`@module+offset`, `$note+offset`, or `@anon:<region>+offset` for generated
+code, never a bare runtime address. These stay valid across relaunch and ASLR.
+`loc.resolve` converts one to an address; every reply describes addresses both
+ways.
 
 **Caller-scoped breakpoints.** `bp.set loc=mprotect caller_module=target`
 stops only when the *caller* is in that module. Without this, `break mprotect`
@@ -74,7 +76,7 @@ sidecar recording the base address, region permissions, and the exact
 ## Status and limits
 
 Research prototype, Linux x86-64, tested against stripped PIE and static
-crackmes.
+crackmes and against a V8 debug build.
 
 - One writer per session; concurrent readers are fine. `interrupt` is handled
   off gdb's main thread so it works while the target runs.
@@ -121,11 +123,34 @@ kernel or gdb does not know, rather than failing silently.
 
 **`stack.callers`** recovers a call chain by scanning the stack for values that
 land in an executable mapping *and* directly follow a decoded call instruction.
-This is for static stripped binaries, where gdb's unwinder returns one frame.
+This is for static stripped binaries and for generated code, where gdb's
+unwinder returns one frame or several addresses that are not frames at all.
 
 **Silent tracepoints** (`bp.set ... silent=true record=["rbx"]`) record and
 resume without a round trip to the client, which keeps them under the timing
 thresholds that targets use to detect instrumentation. Read them with `bp.log`.
+
+## Large real targets
+
+Tested against the official V8 debug build, which is where these came from.
+
+**Symbols.** Every address carries its function name, the offset into it, and
+the source file and line when debug info is present. Module-plus-offset is the
+fallback, not the answer.
+
+**Generated code.** A program counter with no backing file is reported as
+`@anon:<region start>+<offset>` with the region's bounds, size and permissions.
+On a JavaScript engine most interesting program counters look like this, and the
+code range can be hundreds of megabytes.
+
+**`sample.one`** returns the program counter and the recovered caller chain in
+one request. Interrupt, sample, resume, repeat is how a hang gets diagnosed, and
+it needs the session to survive between samples.
+
+A tracepoint inside generated code is the case that settles the architecture:
+its address is only knowable from a running process and is different in the
+next one, so a debugger that restarts the target on every call cannot set it at
+all.
 
 ## Verifying that observation did not change the answer
 

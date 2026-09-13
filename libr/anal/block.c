@@ -466,11 +466,25 @@ R_API bool r_anal_block_successor_addrs_foreach(RAnalBlock *block, RAnalAddrCb c
 
 	CB_ADDR (block->jump);
 	CB_ADDR (block->fail);
-	if (block->switch_op && block->switch_op->cases) {
+	if (block->switch_op) {
 		RListIter *iter;
 		RAnalCaseOp *caseop;
-		r_list_foreach (block->switch_op->cases, iter, caseop) {
-			CB_ADDR (caseop->jump);
+		// callers building CFGs miss an edge without the default; 0 means unset
+		// (jmptbl.c maps the UT64_MAX "none" to 0), so it is not a target
+		ut64 def = block->switch_op->def_val;
+		if (def == block->jump || def == block->fail) {
+			def = 0;
+		}
+		if (block->switch_op->cases) {
+			r_list_foreach (block->switch_op->cases, iter, caseop) {
+				if (caseop->jump == def) {
+					def = 0;
+				}
+				CB_ADDR (caseop->jump);
+			}
+		}
+		if (def) {
+			CB_ADDR (def);
 		}
 	}
 
@@ -855,7 +869,7 @@ R_API bool r_anal_block_was_modified(RAnalBlock *block) {
 	if (!buf) {
 		return false;
 	}
-	if (!block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size)) {
+	if (block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size) != block->size) {
 		free (buf);
 		return false;
 	}
@@ -874,7 +888,7 @@ R_API void r_anal_block_update_hash(RAnalBlock *block) {
 	}
 	ut8 *buf = malloc (block->size);
 	if (buf) {
-		if (!block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size)) {
+		if (block->anal->iob.read_at (block->anal->iob.io, block->addr, buf, block->size) != block->size) {
 			free (buf);
 			return;
 		}
@@ -937,7 +951,12 @@ static bool noreturn_get_blocks_cb(void *user, const ut64 k, const void *v) {
 
 R_API RAnalBlock *r_anal_block_chop_noreturn(RAnalBlock *block, ut64 addr) {
 	R_RETURN_VAL_IF_FAIL (block, NULL);
-	if (!r_anal_block_contains (block, addr) || addr == block->addr) {
+	// A noreturn call that is the block's last instruction chops at the block
+	// end, which is not "contained". The size is already right; the edges out
+	// of it are not, and control does not reach them.
+	const bool ends_the_block = addr == block->addr + block->size;
+	if ((!r_anal_block_contains (block, addr) && !ends_the_block)
+			|| addr == block->addr) {
 		return block;
 	}
 	block = r_ref (block);
@@ -952,6 +971,9 @@ R_API RAnalBlock *r_anal_block_chop_noreturn(RAnalBlock *block, ut64 addr) {
 
 	// Chop the block. Resize and remove all destination addrs
 	r_anal_block_set_size (block, addr - block->addr);
+	while (block->ninstr > 0 && r_anal_bb_offset_inst (block, block->ninstr - 1) >= block->size) {
+		block->ninstr--;
+	}
 	r_anal_block_update_hash (block);
 	block->jump = UT64_MAX;
 	block->fail = UT64_MAX;
@@ -969,6 +991,7 @@ R_API RAnalBlock *r_anal_block_chop_noreturn(RAnalBlock *block, ut64 addr) {
 			r_anal_block_recurse (entry, noreturn_successors_reachable_cb, succs);
 		}
 		ht_up_foreach (succs, noreturn_remove_unreachable_cb, fcn);
+		fcn->ninstr = r_anal_function_instrcount (fcn);
 	}
 	r_list_free (fcns_cpy);
 
@@ -1006,7 +1029,7 @@ R_API RAnalBlock *r_anal_block_chop_noreturn(RAnalBlock *block, ut64 addr) {
 typedef struct {
 	HtUP *predecessors; // maps a block to its predecessor if it has exactly one, or NULL if there are multiple or the predecessor has multiple successors
 	HtUP *visited_blocks; // during predecessor search, mark blocks whose successors we already checked. Value is void *-casted count of successors
-	HtUP *blocks; // adresses of the blocks we might want to merge with their predecessors => RAnalBlock *
+	HtUP *blocks; // addresses of the blocks we might want to merge with their predecessors => RAnalBlock *
 
 	RAnalBlock *cur_pred;
 	size_t cur_succ_count;

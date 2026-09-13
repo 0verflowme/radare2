@@ -177,6 +177,11 @@ to more than one location and multiple-home values are rejected.
 those registers from argument or role locations; an input register can also be
 listed as clobbered if the callee does not preserve its value after entry.
 
+`!F<args>` gives the separate floating-point argument register sequence. Its
+value uses the same comma lists, ranges, and static-profile references as the
+regular argument field. For example, `dyncc:rdi,rsi:rax!Fxmm0,xmm1` has two
+integer argument registers and two floating-point argument registers.
+
 ## Register-Name Conflicts
 
 Control syntax uses non-register characters: `:`, `,`, `!`, `'`, `&`, `_`, `^`,
@@ -212,6 +217,7 @@ name=cc
 cc.name.arg0=reg
 cc.name.arg1=reg
 cc.name.argn=stack
+cc.name.fparg0=freg
 cc.name.ret0=reg
 ```
 

@@ -658,6 +658,18 @@ static RGraphNode *_edf_var_get(RAnalEsilDFG *dfg, const char *var) {
 	return ret;
 }
 
+// resolve a popped operand to the node that defines it
+static RGraphNode *_edf_operand_get(RAnalEsilDFG *dfg, REsil *esil, RStrs s) {
+	switch (r_esil_get_parm_type (esil, s)) {
+	case R_ESIL_PARM_REG:
+		return _edf_reg_get (dfg, s.a);
+	case R_ESIL_PARM_NUM:
+		return _edf_const_get (dfg, s.a);
+	default:
+		return _edf_var_get (dfg, s.a);
+	}
+}
+
 static bool edf_consume_2_set_reg(REsil *esil);
 static bool edf_consume_2_push_1(REsil *esil);
 static bool edf_consume_1_push_1(REsil *esil);
@@ -794,33 +806,95 @@ static bool edf_consume_2_set_reg(REsil *esil) {
 	return _edf_consume_2_set_reg (esil, true);
 }
 
-// TODO: not properly implemented
-static bool edf_pop(REsil *esil) {
+// A comparison stores nothing. It only leaves old/cur behind for the flag ops.
+static bool edf_consume_2_set_cur(REsil *esil) {
 	const char *op_string = esil->current_opstr;
 	RAnalEsilDFG *edf = (RAnalEsilDFG *)esil->user;
+	const RStrs dst_s = r_esil_pop (esil);
 	const RStrs src_s = r_esil_pop (esil);
-	if (r_strs_empty (src_s)) {
+	if (r_strs_empty (dst_s) || r_strs_empty (src_s)) {
 		return false;
 	}
-	const char *src = src_s.a;
-	const int src_type = r_esil_get_parm_type (esil, src_s);
-	RGraphNode *src_node = NULL;
-	if (src_type == R_ESIL_PARM_REG) {
-		src_node = _edf_reg_get (edf, src);
-	} else if (src_type == R_ESIL_PARM_NUM) {
-		src_node = _edf_const_get (edf, src);
-	} else {
-		src_node = _edf_var_get (edf, src);
-	}
-	if (!src_node) {
+	RGraphNode *dst_node = _edf_operand_get (edf, esil, dst_s);
+	RGraphNode *src_node = _edf_operand_get (edf, esil, src_s);
+	if (!dst_node || !src_node) {
 		return false;
 	}
-	RAnalEsilDFGNode *eop_node = r_anal_esil_dfg_node_new (edf, src);
+	RAnalEsilDFGNode *eop_node = r_anal_esil_dfg_node_new (edf, src_s.a);
+	r_strbuf_appendf (eop_node->content, ",%s,%s", dst_s.a, op_string);
+	eop_node->type = R_ANAL_ESIL_DFG_TAG_GENERATIVE;
+	RGraphNode *op_node = r_graph_add_node (edf->flow, eop_node);
+	r_graph_add_edge (edf->flow, dst_node, op_node);
+	r_graph_add_edge (edf->flow, src_node, op_node);
+	RAnalEsilDFGNode *result = r_anal_esil_dfg_node_new (edf, "result_");
+	result->type = R_ANAL_ESIL_DFG_TAG_RESULT;
+	r_strbuf_appendf (result->content, "%d", edf->idx++);
+	RGraphNode *result_node = r_graph_add_node (edf->flow, result);
+	r_graph_add_edge (edf->flow, op_node, result_node);
+	_edf_var_set (edf, r_strbuf_get (result->content), result_node);
+	edf->old = dst_node;
+	edf->cur = result_node;
+	return true;
+}
+
+// read-modify-write of a single register operand, e.g. "eax,--="
+static bool edf_consume_1_set_reg(REsil *esil) {
+	const char *op_string = esil->current_opstr;
+	RAnalEsilDFG *edf = (RAnalEsilDFG *)esil->user;
+	const RStrs dst_s = r_esil_pop (esil);
+	if (r_strs_empty (dst_s) || r_esil_get_parm_type (esil, dst_s) != R_ESIL_PARM_REG) {
+		return false;
+	}
+	const char *dst = dst_s.a;
+	RGraphNode *dst_node = _edf_reg_get (edf, dst);
+	if (!dst_node) {
+		return false;
+	}
+	RAnalEsilDFGNode *eop_node = r_anal_esil_dfg_node_new (edf, dst);
 	r_strbuf_appendf (eop_node->content, ",%s", op_string);
 	eop_node->type = R_ANAL_ESIL_DFG_TAG_GENERATIVE;
 	RGraphNode *op_node = r_graph_add_node (edf->flow, eop_node);
-	r_graph_add_edge (edf->flow, src_node, op_node);
+	r_graph_add_edge (edf->flow, dst_node, op_node);
+	RAnalEsilDFGNode *result = r_anal_esil_dfg_node_new (edf, dst);
+	result->type = R_ANAL_ESIL_DFG_TAG_RESULT | R_ANAL_ESIL_DFG_TAG_VAR | R_ANAL_ESIL_DFG_TAG_REG |
+		(((RAnalEsilDFGNode *)dst_node->data)->type & R_ANAL_ESIL_DFG_TAG_CONST);
+	r_strbuf_appendf (result->content, ":var_%d", edf->idx++);
+	edf->old = dst_node;
+	dst_node = r_graph_add_node (edf->flow, result);
+	r_graph_add_edge (edf->flow, op_node, dst_node);
+	_edf_reg_set (edf, dst, dst_node);
+	edf->cur = dst_node;
 	return true;
+}
+
+// The graph records what an instruction may write, so the guarded body has to
+// be walked rather than skipped. "}{" still toggles esil->skip, so only the
+// first branch is taken.
+static bool edf_if(REsil *esil) {
+	if (esil->skip) {
+		esil->skip++;
+		return true;
+	}
+	return !r_strs_empty (r_esil_pop (esil));
+}
+
+// A backward jump would close a cycle, and this graph holds none. Drop the
+// target and fall through, walking a loop body exactly once. That shows which
+// registers and memory the loop touches, but not the remaining iterations.
+static bool edf_goto(REsil *esil) {
+	(void)r_esil_pop (esil);
+	return true;
+}
+
+// Carry on past an early exit so the rest of the expression reaches the graph.
+static bool edf_break(REsil *esil) {
+	return true;
+}
+
+// POP throws away the top of the stack. Whatever produced that value is
+// already in the graph, and dropping it here just leaves it with no consumer.
+static bool edf_pop(REsil *esil) {
+	return !r_strs_empty (r_esil_pop (esil));
 }
 
 #if 1
@@ -1001,6 +1075,11 @@ static bool _edf_is_stack_or_mem_const_node(RAnalEsilDFG *dfg, RGraphNode *gnode
 }
 #endif
 
+static ut32 edf_mem_size(const char *op_string) {
+	const char *bracket = r_str_lchr (op_string, '[');
+	return bracket? atoi (bracket + 1): 0;
+}
+
 static bool edf_consume_1_get_mem_push_1(REsil *esil) {
 	const char *op_string = esil->current_opstr;
 	RAnalEsilDFG *edf = (RAnalEsilDFG *)esil->user;
@@ -1016,16 +1095,7 @@ static bool edf_consume_1_get_mem_push_1(REsil *esil) {
 	// esil operation node
 	RGraphNode *op_node = r_graph_add_node (edf->flow, eop_node);
 	// operation node, but in the rgraph
-	ut32 mem_size = 0;
-	if (r_str_endswith (op_string, "[1]")) {
-		mem_size = 1;
-	} else if (r_str_endswith (op_string, "[2]")) {
-		mem_size = 2;
-	} else if (r_str_endswith (op_string, "[4]")) {
-		mem_size = 4;
-	} else if (r_str_endswith (op_string, "[8]")) {
-		mem_size = 8;
-	}
+	const ut32 mem_size = edf_mem_size (op_string);
 	const int src_type = r_esil_get_parm_type (esil, src_s);
 	RGraphNode *src_node = NULL;
 	RGraphNode *mem_src_node = NULL;
@@ -1098,16 +1168,7 @@ static bool edf_consume_2_set_mem(REsil *esil) {
 	const char *dst = dst_s.a;
 	const char *src = src_s.a;
 
-	ut32 mem_size = 0;
-	if (r_str_endswith (op_string, "[1]")) {
-		mem_size = 1;
-	} else if (r_str_endswith (op_string, "[2]")) {
-		mem_size = 2;
-	} else if (r_str_endswith (op_string, "[4]")) {
-		mem_size = 4;
-	} else if (r_str_endswith (op_string, "[8]")) {
-		mem_size = 8;
-	}
+	const ut32 mem_size = edf_mem_size (op_string);
 	int dst_type = r_esil_get_parm_type (esil, dst_s);
 
 	const int src_type = r_esil_get_parm_type (esil, src_s);
@@ -1205,16 +1266,7 @@ static bool edf_consume_2_use_set_mem(REsil *esil) {
 	const char *dst = dst_s.a;
 	const char *src = src_s.a;
 
-	ut32 mem_size = 0;
-	if (r_str_endswith (op_string, "[1]")) {
-		mem_size = 1;
-	} else if (r_str_endswith (op_string, "[2]")) {
-		mem_size = 2;
-	} else if (r_str_endswith (op_string, "[4]")) {
-		mem_size = 4;
-	} else if (r_str_endswith (op_string, "[8]")) {
-		mem_size = 8;
-	}
+	const ut32 mem_size = edf_mem_size (op_string);
 	int dst_type = r_esil_get_parm_type (esil, dst_s);
 
 	const int src_type = r_esil_get_parm_type (esil, src_s);
@@ -1320,16 +1372,7 @@ static bool edf_consume_1_set_mem(REsil *esil) {
 	}
 	const char *dst = dst_s.a;
 
-	ut32 mem_size = 0;
-	if (r_str_endswith (op_string, "[1]")) {
-		mem_size = 1;
-	} else if (r_str_endswith (op_string, "[2]")) {
-		mem_size = 2;
-	} else if (r_str_endswith (op_string, "[4]")) {
-		mem_size = 4;
-	} else if (r_str_endswith (op_string, "[8]")) {
-		mem_size = 8;
-	}
+	const ut32 mem_size = edf_mem_size (op_string);
 	int dst_type = r_esil_get_parm_type (esil, dst_s);
 
 	RGraphNode *dst_node = NULL;
@@ -1486,10 +1529,10 @@ static bool _dfg_mem_read(REsil *esil, ut64 addr, ut8 *buf, int len) {
 	if (dfg->use_maps) {
 		RIOMap *map = dfg->iob.map_get_at (dfg->iob.io, addr);
 		if (map && (map->perm & R_PERM_RW) == R_PERM_R) {
-			return dfg->iob.read_at (dfg->iob.io, addr, buf, len);
+			return dfg->iob.read_at (dfg->iob.io, addr, buf, len) == len;
 		}
 	}
-	return (dfg->iob.fd_read_at (dfg->iob.io, dfg->fd, addr, buf, len) > 0);
+	return dfg->iob.fd_read_at (dfg->iob.io, dfg->fd, addr, buf, len) == len;
 }
 
 static bool _dfg_mem_write(REsil *esil, ut64 addr, const ut8 *buf, int len) {
@@ -1613,6 +1656,20 @@ R_API void r_anal_esil_dfg_free(RAnalEsilDFG *dfg) {
 	}
 }
 
+// an op without a dfg handler runs the interpreter and folds to a constant
+static bool edf_fallback_cb(void *user, const void *k, const void *v) {
+	const REsilOp *op = v;
+	if (!op->code || op->push != 1) {
+		return true;
+	}
+	if (op->pop == 2) {
+		r_esil_set_op (user, op->name.a, edf_consume_2_push_1, 1, 2, op->type, op->info);
+	} else if (op->pop == 1) {
+		r_esil_set_op (user, op->name.a, edf_consume_1_push_1, 1, 1, op->type, op->info);
+	}
+	return true;
+}
+
 R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE dfg, const char *expr,
 	bool use_map_info, bool use_maps) {
 	R_RETURN_VAL_IF_FAIL (anal && expr, NULL);
@@ -1630,9 +1687,10 @@ R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE d
 		return NULL;
 	}
 
+	ht_pp_foreach (esil->ops, edf_fallback_cb, esil);
 	r_esil_set_op (esil, "=", edf_consume_2_set_reg, 0, 2, R_ESIL_OP_TYPE_REG_WRITE, NULL);
 	r_esil_set_op (esil, ":=", edf_eq_weak, 0, 2, R_ESIL_OP_TYPE_REG_WRITE, NULL);
-	r_esil_set_op (esil, "$s", edf_sf, 1, 0, R_ESIL_OP_TYPE_UNKNOWN, NULL); // XXX TODO
+	r_esil_set_op (esil, "$s", edf_sf, 1, 1, R_ESIL_OP_TYPE_UNKNOWN, NULL); // XXX TODO
 	r_esil_set_op (esil, "$z", edf_zf, 1, 0, R_ESIL_OP_TYPE_UNKNOWN, NULL);
 	r_esil_set_op (esil, "$p", edf_pf, 1, 0, R_ESIL_OP_TYPE_UNKNOWN, NULL);
 	r_esil_set_op (esil, "$c", edf_cf, 1, 1, R_ESIL_OP_TYPE_UNKNOWN, NULL);
@@ -1645,6 +1703,24 @@ R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE d
 	r_esil_set_op (esil, "&=", edf_consume_2_use_set_reg, 0, 2, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
 	r_esil_set_op (esil, "|=", edf_consume_2_use_set_reg, 0, 2, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
 	r_esil_set_op (esil, "^=", edf_consume_2_use_set_reg, 0, 2, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, "%=", edf_consume_2_use_set_reg, 0, 2, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, "<<=", edf_consume_2_use_set_reg, 0, 2, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, ">>=", edf_consume_2_use_set_reg, 0, 2, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, "~=", edf_consume_2_use_set_reg, 0, 2, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, "!=", edf_consume_1_set_reg, 0, 1, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, "++=", edf_consume_1_set_reg, 0, 1, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, "--=", edf_consume_1_set_reg, 0, 1, R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_REG_WRITE, NULL);
+	r_esil_set_op (esil, "==", edf_consume_2_set_cur, 0, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, "?{", edf_if, 0, 1, R_ESIL_OP_TYPE_CONTROL_FLOW, NULL);
+	r_esil_set_op (esil, "GOTO", edf_goto, 0, 1, R_ESIL_OP_TYPE_CONTROL_FLOW, NULL);
+	r_esil_set_op (esil, "BREAK", edf_break, 0, 0, R_ESIL_OP_TYPE_CONTROL_FLOW, NULL);
+	r_esil_set_op (esil, "<", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, ">", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, "<=", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, ">=", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, "~", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, "~/", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, "~%", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "+", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "-", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "&", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
@@ -1654,9 +1730,9 @@ R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE d
 	r_esil_set_op (esil, "*", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "/", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, ">>", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
-	r_esil_set_op (esil, "POP", edf_pop, 1, 0, R_ESIL_OP_TYPE_UNKNOWN, NULL);
+	r_esil_set_op (esil, "POP", edf_pop, 0, 1, R_ESIL_OP_TYPE_UNKNOWN, NULL);
 #if 1
-	r_esil_set_op (esil, "DUP", edf_dup, 1, 2, R_ESIL_OP_TYPE_UNKNOWN, NULL);
+	r_esil_set_op (esil, "DUP", edf_dup, 2, 1, R_ESIL_OP_TYPE_UNKNOWN, NULL);
 #endif
 	r_esil_set_op (esil, "<<", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "LSL", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
@@ -1664,6 +1740,8 @@ R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE d
 	r_esil_set_op (esil, "ROR", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "ROL", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "ASR", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, "CLZ", edf_consume_2_push_1, 1, 2, R_ESIL_OP_TYPE_MATH, NULL);
+	r_esil_set_op (esil, "POPCNT", edf_consume_1_push_1, 1, 1, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "!", edf_consume_1_push_1, 1, 1, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "++", edf_consume_1_push_1, 1, 1, R_ESIL_OP_TYPE_MATH, NULL);
 	r_esil_set_op (esil, "--", edf_consume_1_push_1, 1, 1, R_ESIL_OP_TYPE_MATH, NULL);
@@ -1671,11 +1749,14 @@ R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE d
 	r_esil_set_op (esil, "[2]", edf_consume_1_get_mem_push_1, 1, 1, R_ESIL_OP_TYPE_MEM_READ, NULL);
 	r_esil_set_op (esil, "[4]", edf_consume_1_get_mem_push_1, 1, 1, R_ESIL_OP_TYPE_MEM_READ, NULL);
 	r_esil_set_op (esil, "[8]", edf_consume_1_get_mem_push_1, 1, 1, R_ESIL_OP_TYPE_MEM_READ, NULL);
-	//	r_esil_set_op (esil, "[16]", edf_consume_1_push_1, 1, 1, R_ESIL_OP_TYPE_MEM_READ, NULL);
+	r_esil_set_op (esil, "[16]", edf_consume_1_get_mem_push_1, 1, 1, R_ESIL_OP_TYPE_MEM_READ, NULL);
+	r_esil_set_op (esil, "[3]", edf_consume_1_get_mem_push_1, 1, 1, R_ESIL_OP_TYPE_MEM_READ, NULL);
 	r_esil_set_op (esil, "=[1]", edf_consume_2_set_mem, 0, 2, R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 	r_esil_set_op (esil, "=[2]", edf_consume_2_set_mem, 0, 2, R_ESIL_OP_TYPE_MEM_WRITE, NULL);
+	r_esil_set_op (esil, "=[3]", edf_consume_2_set_mem, 0, 2, R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 	r_esil_set_op (esil, "=[4]", edf_consume_2_set_mem, 0, 2, R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 	r_esil_set_op (esil, "=[8]", edf_consume_2_set_mem, 0, 2, R_ESIL_OP_TYPE_MEM_WRITE, NULL);
+	r_esil_set_op (esil, "=[16]", edf_consume_2_set_mem, 0, 2, R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 	r_esil_set_op (esil, "|=[1]", edf_consume_2_use_set_mem, 0, 2,
 		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 	r_esil_set_op (esil, "|=[2]", edf_consume_2_use_set_mem, 0, 2,
@@ -1712,15 +1793,6 @@ R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE d
 	r_esil_set_op (esil, "+=[8]", edf_consume_2_use_set_mem, 0, 2,
 		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 
-	r_esil_set_op (esil, "-=[1]", edf_consume_2_use_set_mem, 0, 2,
-		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
-	r_esil_set_op (esil, "-=[2]", edf_consume_2_use_set_mem, 0, 2,
-		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
-	r_esil_set_op (esil, "-=[4]", edf_consume_2_use_set_mem, 0, 2,
-		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
-	r_esil_set_op (esil, "-=[8]", edf_consume_2_use_set_mem, 0, 2,
-		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
-
 	r_esil_set_op (esil, "%=[1]", edf_consume_2_use_set_mem, 0, 2,
 		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 	r_esil_set_op (esil, "%=[2]", edf_consume_2_use_set_mem, 0, 2,
@@ -1746,6 +1818,15 @@ R_API RAnalEsilDFG *r_anal_esil_dfg_expr(RAnal *anal, RAnalEsilDFG *R_NULLABLE d
 	r_esil_set_op (esil, "*=[4]", edf_consume_2_use_set_mem, 0, 2,
 		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 	r_esil_set_op (esil, "*=[8]", edf_consume_2_use_set_mem, 0, 2,
+		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
+
+	r_esil_set_op (esil, "-=[1]", edf_consume_2_use_set_mem, 0, 2,
+		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
+	r_esil_set_op (esil, "-=[2]", edf_consume_2_use_set_mem, 0, 2,
+		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
+	r_esil_set_op (esil, "-=[4]", edf_consume_2_use_set_mem, 0, 2,
+		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
+	r_esil_set_op (esil, "-=[8]", edf_consume_2_use_set_mem, 0, 2,
 		R_ESIL_OP_TYPE_MATH | R_ESIL_OP_TYPE_MEM_READ | R_ESIL_OP_TYPE_MEM_WRITE, NULL);
 
 	r_esil_set_op (esil, ">>=[1]", edf_consume_2_use_set_mem, 0, 2,

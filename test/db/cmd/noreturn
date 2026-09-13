@@ -1,3 +1,27 @@
+NAME=noreturn propagation updates block and function instruction counts
+FILE=bins/elf/noreturn
+CMDS=<<EOF
+e anal.imports=false
+aa
+afij @ sym.might_not_return~{0.ninstrs}
+abj @ 0x1181~{0.ninstr}
+abj @ 0x1181~{0.size}
+tn 0x1050
+aanr
+afij @ sym.might_not_return~{0.ninstrs}
+abj @ 0x1181~{0.ninstr}
+abj @ 0x1181~{0.size}
+EOF
+EXPECT=<<EOF
+93
+9
+45
+48
+2
+10
+EOF
+RUN
+
 NAME=tn symbol
 FILE=bins/elf/analysis/hello-objc-linux
 CMDS=<<EOF
@@ -50,37 +74,26 @@ size: 34
 EOF
 RUN
 
+# merged: no no return; no no return 2
 NAME=without noreturn
 FILE=bins/elf/analysis/hello-objc-linux
 CMDS=<<EOF
 tn-*
 af
 afi~size
-EOF
-EXPECT=<<EOF
-size: 34
-EOF
-RUN
-
-NAME=no no return
-FILE=bins/elf/analysis/hello-objc-linux
-CMDS=<<EOF
+?e --
 af
 af-
 afi~size
-EOF
-EXPECT=<<EOF
-EOF
-RUN
-
-NAME=no no return 2
-FILE=bins/elf/analysis/hello-objc-linux
-CMDS=<<EOF
+?e --
 af
 af-*
 afi~size
 EOF
 EXPECT=<<EOF
+size: 34
+--
+--
 EOF
 RUN
 

@@ -541,11 +541,10 @@ static int r_core_file_load_for_debug(RCore *r, ut64 baseaddr, const char * R_NU
 static int r_core_file_load_for_io_plugin(RCore *r, ut64 baseaddr, ut64 loadaddr) {
 	RIODesc *cd = r->io->desc;
 	int fd = cd ? cd->fd : -1;
-	int xtr_idx = 0; // if 0, load all if xtr is used
-	RBinPlugin *plugin;
+	bool redirected = false;
 
 	if (fd < 0) {
-		return false;
+		return -1;
 	}
 	R_CRITICAL_ENTER (r);
 	r_io_use_fd (r->io, fd);
@@ -556,53 +555,52 @@ static int r_core_file_load_for_io_plugin(RCore *r, ut64 baseaddr, ut64 loadaddr
 		}
 	}
 	RBinFileOptions opt;
+repeat:
 	r_bin_file_options_init (&opt, fd, baseaddr, loadaddr, r->bin->options.rawstr);
-	// opt.fd = fd;
-	opt.xtr_idx = xtr_idx;
 	if (!r_bin_open_io (r->bin, &opt)) {
 		R_CRITICAL_LEAVE (r);
-		return false;
+		return fd;
 	}
 	RBinFile *bf = r_bin_cur (r->bin);
+	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
 	if (r_core_bin_set_env (r, bf)) {
 		if (r->anal->verbose && !sdb_const_get (r->anal->sdb_cc, "default.cc", 0)) {
 			R_LOG_WARN ("No calling convention defined for this file, analysis may be inaccurate");
 		}
 	}
-	if (bf) {
-		const char *bclass = R_UNWRAP4 (bf, bo, info, bclass);
-		if (bclass && strstr (bclass, "://")) {
-			if (bf->file && strstr (bf->file, "://")) {
-				R_LOG_ERROR ("Skipping IO redirection for already-redirected file");
-				R_CRITICAL_LEAVE (r);
-				return false;
-			}
-			char *uri = r_str_newf ("%s%s", bclass, bf->file);
-			RIOPlugin *iop = r_io_plugin_resolve (r->io, uri, false);
-			if (iop && strcmp (iop->meta.name, "default")) {
-				r_bin_file_delete_all (r->bin);
-				RIODesc *desc = r_core_file_open (r, uri, R_PERM_R, 0);
-				if (desc) {
-					r_core_bin_load (r, uri, UT64_MAX);
+	if (!redirected && plugin && plugin->iouris && bf->file) {
+		const char *iouri = plugin->iouri? plugin->iouri (bf): plugin->iouris;
+		if (R_STR_ISNOTEMPTY (iouri) && isalpha ((ut8)*iouri) && r_str_endswith (iouri, "://")
+			&& strspn (iouri, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-") == strlen (iouri) - 3
+			&& r_str_cmp_list (plugin->iouris, iouri, ',')) {
+			char *uri = r_str_newf ("%s%s", iouri, bf->file);
+			RIOPlugin *iop = uri? r_io_plugin_resolve (r->io, uri, false): NULL;
+			if (iop && r_str_cmp_list (iop->binuris, iouri, ',')) {
+				RIODesc *desc = r_io_desc_open_plugin (r->io, iop, uri, R_PERM_R, 0644);
+				if (desc && desc->plugin == iop && desc->uri && !strcmp (desc->uri, uri)) {
+					r_bin_file_delete_all (r->bin);
+					fd = desc->fd;
+					r_io_use_fd (r->io, fd);
+					redirected = true;
 					free (uri);
-					R_CRITICAL_LEAVE (r);
-					return true;
+					goto repeat;
 				}
-			} else {
-				R_LOG_WARN ("bclass URI scheme has no matching IO plugin");
+				if (desc) {
+					const int desc_fd = desc->fd;
+					if (!r_io_desc_close (desc)) {
+						r_io_desc_del (r->io, desc_fd);
+					}
+				}
 			}
 			free (uri);
-			R_CRITICAL_LEAVE (r);
-			return false;
 		}
 	}
-	plugin = r_bin_file_cur_plugin (bf);
 	if (plugin && !strcmp (plugin->meta.name, "null")) {
 		RBinObject *obj = r_bin_cur_object (r->bin);
 		RBinInfo *info = obj? obj->info: NULL;
 		if (!info) {
 			R_CRITICAL_LEAVE (r);
-			return false;
+			return fd;
 		}
 		// set use of raw strings
 		// r_config_set_i (r->config, "io.va", false);
@@ -615,7 +613,7 @@ static int r_core_file_load_for_io_plugin(RCore *r, ut64 baseaddr, ut64 loadaddr
 		RBinInfo *info = obj? obj->info: NULL;
 		if (!info) {
 			R_CRITICAL_LEAVE (r);
-			return false;
+			return fd;
 		}
 		if (plugin) {
 			r_core_bin_set_arch_bits (r, bf->file, info->arch, info->bits);
@@ -626,7 +624,7 @@ static int r_core_file_load_for_io_plugin(RCore *r, ut64 baseaddr, ut64 loadaddr
 		r_core_cmd0 (r, "'(fix-dex;wx `ph sha1 $s-32 @32` @12 ; wx `ph adler32 $s-12 @12` @8)");
 	}
 	R_CRITICAL_LEAVE (r);
-	return true;
+	return fd;
 }
 
 static bool try_loadlib(RCore *core, const char *lib, ut64 addr) {
@@ -757,6 +755,168 @@ static bool mustreopen(RCore *core, RIODesc *desc, const char *fn) {
 	return false;
 }
 
+static char *mach0_dsym_path(const char *binary_path) {
+	R_RETURN_VAL_IF_FAIL (binary_path, NULL);
+	const char *basename = r_file_basename (binary_path);
+	return r_str_newf ("%s.dSYM/Contents/Resources/DWARF/%s", binary_path, basename);
+}
+
+static const char *mach0_uuid(RBinFile *bf) {
+	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+	if (!plugin || !plugin->meta.name) {
+		return NULL;
+	}
+	if (strcmp (plugin->meta.name, "mach0") && strcmp (plugin->meta.name, "mach064")) {
+		return NULL;
+	}
+	const char *uuid = bf->sdb_info? sdb_const_get (bf->sdb_info, "uuid.0", 0): NULL;
+	return uuid && strlen (uuid) == 32? uuid: NULL;
+}
+
+static bool mach0_identity_matches(RBinFile *main_bf, RBinFile *dsym_bf) {
+	RBinPlugin *main_plugin = r_bin_file_cur_plugin (main_bf);
+	RBinPlugin *dsym_plugin = r_bin_file_cur_plugin (dsym_bf);
+	if (!main_plugin || !dsym_plugin || !main_plugin->meta.name || !dsym_plugin->meta.name) {
+		return false;
+	}
+	if (strcmp (main_plugin->meta.name, dsym_plugin->meta.name)) {
+		return false;
+	}
+	RBinInfo *main_info = main_bf->bo? main_bf->bo->info: NULL;
+	RBinInfo *dsym_info = dsym_bf->bo? dsym_bf->bo->info: NULL;
+	if (!main_info || !dsym_info || R_STR_ISEMPTY (main_info->arch) || R_STR_ISEMPTY (dsym_info->arch) ||
+		main_info->bits < 1 || main_info->bits != dsym_info->bits || strcmp (main_info->arch, dsym_info->arch)) {
+		return false;
+	}
+	if (R_STR_ISEMPTY (main_info->machine) || R_STR_ISEMPTY (dsym_info->machine) ||
+		strcmp (main_info->machine, dsym_info->machine)) {
+		return false;
+	}
+	const char *main_uuid = mach0_uuid (main_bf);
+	const char *dsym_uuid = mach0_uuid (dsym_bf);
+	return main_uuid && dsym_uuid && !strcmp (main_uuid, dsym_uuid);
+}
+
+static void mach0_dsym_restore_main(RBin *bin, RBinFile *main_bf) {
+	r_bin_file_set_cur_binfile (bin, main_bf);
+	if (bin->sdb && main_bf->sdb) {
+		sdb_ns_set (bin->sdb, "cur", main_bf->sdb);
+	}
+}
+
+static void mach0_dsym_delete_fd_binfiles(RBin *bin, RBinFile *main_bf, RBinFile *keep_bf, int fd) {
+	RBinFile *bf;
+	RListIter *iter;
+	RListIter *tmp;
+	r_list_foreach_safe (bin->binfiles, iter, tmp, bf) {
+		if (!bf || bf == main_bf || bf == keep_bf || bf->fd != fd) {
+			continue;
+		}
+		if (bin->sdb && bf->sdb) {
+			r_strf_var (fdns, 32, "fd.%d", fd);
+			sdb_ns_unset (bin->sdb, fdns, bf->sdb);
+		}
+		r_bin_file_delete (bin, bf->id);
+	}
+	mach0_dsym_restore_main (bin, main_bf);
+}
+
+static void mach0_dsym_umount_fd(RCore *core, int fd) {
+	RFSRoot *root;
+	while ((root = r_fs_root_by_fd (core->fs, fd))) {
+		char *path = strdup (root->path);
+		if (!path) {
+			break;
+		}
+		bool unmounted = r_fs_umount (core->fs, path);
+		free (path);
+		if (!unmounted) {
+			break;
+		}
+	}
+}
+
+static RBinFile *mach0_load_matching_slice(RBin *bin, RBinFile *main_bf, RBinFile *dsym_bf) {
+	if (dsym_bf->bo) {
+		return mach0_identity_matches (main_bf, dsym_bf)? dsym_bf: NULL;
+	}
+	if (!dsym_bf->xtr_data) {
+		return NULL;
+	}
+	RBinXtrData *xtr_data;
+	RListIter *iter;
+	r_list_foreach (dsym_bf->xtr_data, iter, xtr_data) {
+		if (!xtr_data || !xtr_data->buf) {
+			continue;
+		}
+		RBinFileOptions opt;
+		r_bin_file_options_init (&opt, dsym_bf->fd, xtr_data->baddr, xtr_data->laddr, bin->options.rawstr);
+		opt.filename = dsym_bf->file;
+		if (!r_bin_open_buf (bin, xtr_data->buf, &opt)) {
+			mach0_dsym_delete_fd_binfiles (bin, main_bf, dsym_bf, dsym_bf->fd);
+			continue;
+		}
+		RBinFile *slice_bf = r_bin_cur (bin);
+		if (slice_bf && slice_bf != main_bf && slice_bf != dsym_bf && mach0_identity_matches (main_bf, slice_bf)) {
+			return slice_bf;
+		}
+		mach0_dsym_delete_fd_binfiles (bin, main_bf, dsym_bf, dsym_bf->fd);
+	}
+	return NULL;
+}
+
+static bool load_mach0_dsym_file(RCore *core, RBinFile *main_bf, const char *dsym_path) {
+	RIODesc *dsym_desc = r_io_open_nomap (core->io, dsym_path, R_PERM_R, 0644);
+	if (!dsym_desc) {
+		return false;
+	}
+	const int dsym_fd = dsym_desc->fd;
+	if (!r_io_use_fd (core->io, dsym_fd)) {
+		r_io_fd_close (core->io, dsym_fd);
+		return false;
+	}
+	RBinFileOptions opt;
+	r_bin_file_options_init (&opt, dsym_fd, r_bin_file_get_baddr (main_bf), 0, core->bin->options.rawstr);
+	bool old_skip_symbols = core->bin->options.skip_symbols;
+	core->bin->options.skip_symbols = true;
+	bool opened = r_bin_open_io (core->bin, &opt);
+
+	RBinFile *dsym_bf = r_bin_file_find_by_fd (core->bin, dsym_fd);
+	RBinFile *loaded_bf = opened && dsym_bf && dsym_bf != main_bf?
+		mach0_load_matching_slice (core->bin, main_bf, dsym_bf): NULL;
+	core->bin->options.skip_symbols = old_skip_symbols;
+	bool merged = loaded_bf != NULL;
+	if (merged) {
+		(void)r_core_bin_info (core, R_CORE_BIN_ACC_ADDRLINE, NULL, R_MODE_SET, true, NULL, NULL);
+		r_bin_file_merge (main_bf, loaded_bf);
+	}
+	mach0_dsym_delete_fd_binfiles (core->bin, main_bf, NULL, dsym_fd);
+	mach0_dsym_umount_fd (core, dsym_fd);
+	r_io_fd_close (core->io, dsym_fd);
+	r_io_use_fd (core->io, main_bf->fd);
+	return merged;
+}
+
+static void load_mach0_dsym(RCore *core, RBinFile *main_bf) {
+	if (!main_bf || !mach0_uuid (main_bf)) {
+		return;
+	}
+	const char *opened_path = r_io_fd_get_name (core->io, main_bf->fd);
+	if (R_STR_ISEMPTY (opened_path)) {
+		return;
+	}
+	char *alias_dsym = mach0_dsym_path (opened_path);
+	bool loaded = alias_dsym && load_mach0_dsym_file (core, main_bf, alias_dsym);
+	char *canonical_path = loaded? NULL: r_file_abspath (opened_path);
+	char *canonical_dsym = canonical_path? mach0_dsym_path (canonical_path): NULL;
+	if (!loaded && canonical_dsym && (!alias_dsym || strcmp (canonical_dsym, alias_dsym))) {
+		load_mach0_dsym_file (core, main_bf, canonical_dsym);
+	}
+	free (canonical_dsym);
+	free (canonical_path);
+	free (alias_dsym);
+}
+
 R_API bool r_core_bin_load(RCore *r, const char *filenameuri, ut64 baddr) {
 	R_RETURN_VAL_IF_FAIL (r && r->io, false);
 	R_CRITICAL_ENTER (r);
@@ -802,7 +962,7 @@ R_API bool r_core_bin_load(RCore *r, const char *filenameuri, ut64 baddr) {
 					mustclose = true;
 				}
 			}
-			r_core_file_load_for_io_plugin (r, baddr, 0LL);
+			desc_fd = r_core_file_load_for_io_plugin (r, baddr, 0LL);
 			desc = r->io->desc;
 		}
 		r_io_use_fd (r->io, desc_fd);
@@ -812,6 +972,7 @@ R_API bool r_core_bin_load(RCore *r, const char *filenameuri, ut64 baddr) {
 	}
 	desc = r->io->desc;
 	RBinFile *binfile = r_bin_cur (r->bin);
+	const int binfile_fd = binfile? binfile->fd: -1;
 	RBinPlugin *bp = R_UNWRAP5 (r, bin, cur, bo, plugin);
 	if (bp) {
 		char msg[2];
@@ -1000,26 +1161,9 @@ R_API bool r_core_bin_load(RCore *r, const char *filenameuri, ut64 baddr) {
 		goto beach;
 	}
 beach:
-	{
-		const char *dbginfo_uri = filenameuri_safe? filenameuri_safe: filenameuri;
-		if (has_cmd_load && !filenameuri_safe) {
-			dbginfo_uri = NULL;
-		}
-		if (r_config_get_b (r->config, "bin.dbginfo") && R_STR_ISNOTEMPTY (dbginfo_uri)) {
-			// TODO only for macho
-			// load companion dwarf files
-			const char *basename = r_file_basename (dbginfo_uri);
-			char *macdwarf = r_str_newf ("%s.dSYM/Contents/Resources/DWARF/%s", dbginfo_uri, basename);
-			if (r_file_exists (macdwarf)) {
-				// Skip symbols for dSYM since they duplicate main binary
-				bool old_skipsyms = r->bin->options.skip_symbols;
-				r->bin->options.skip_symbols = true;
-				r_core_callf (r, "o %s", macdwarf);
-				r->bin->options.skip_symbols = old_skipsyms;
-				r_core_call (r, "obm-");
-			}
-			free (macdwarf);
-		}
+	if (r_config_get_b (r->config, "bin.dbginfo") && (!has_cmd_load || filenameuri_safe)) {
+		RBinFile *main_bf = binfile_fd >= 0? r_bin_file_find_by_fd (r->bin, binfile_fd): NULL;
+		load_mach0_dsym (r, main_bf);
 	}
 	free (filenameuri_safe);
 	if (mustclose) {

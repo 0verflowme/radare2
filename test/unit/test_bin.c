@@ -23,6 +23,74 @@ bool test_r_bin(void) {
 	mu_end;
 }
 
+static bool bin_is_jni(const char *path) {
+	RBin *bin = r_bin_new ();
+	RIO *io = r_io_new ();
+	r_io_bind (io, &bin->iob);
+	RBinFileOptions opt = {0};
+	r_bin_file_options_init (&opt, -1, 0, 0, 0);
+	bool is_jni = r_bin_open (bin, path, &opt)
+		&& bin->cur && bin->cur->bo && bin->cur->bo->info
+		&& R_VPACK_HAS (bin->cur->bo->langs, R_BIN_LANG_JNI)
+		&& bin->cur->bo->info->lang
+		&& !strcmp (bin->cur->bo->info->lang, "jni");
+	r_bin_free (bin);
+	r_io_free (io);
+	return is_jni;
+}
+
+bool test_r_bin_jni_language(void) {
+	mu_assert_true (bin_is_jni ("bins/elf/analysis/libsimplejni.so"),
+		"JNI_OnLoad identifies a JNI binary");
+	mu_assert_true (bin_is_jni ("bins/elf/jni/jniO2-arm64"),
+		"Java_ exports identify a JNI binary");
+	mu_end;
+}
+
+bool test_r_bin_languages(void) {
+	RBinInfo info = { .rclass = "mach0" };
+	RBinObject bo = { .info = &info };
+	RBinFile bf = { .bo = &bo };
+	RVecRBinImport_init (&bo.imports_vec);
+	RBinSymbol c_symbol = { .attr.lang = R_BIN_LANG_C };
+	RBinSymbol rust_symbol = { .attr.lang = R_BIN_LANG_RUST };
+	r_bin_file_add_language (&bf, c_symbol.attr.lang);
+	char *demangled = r_bin_demangle (&bf, NULL, "_RNvNtCs1234_7mycrate3foo3bar", 0, false);
+	mu_assert_notnull (demangled, "valid Rust symbol is demangled");
+	free (demangled);
+
+	mu_assert_true (R_VPACK_HAS (bo.langs, R_BIN_LANG_C), "binary contains C");
+	mu_assert_true (R_VPACK_HAS (bo.langs, R_BIN_LANG_RUST), "binary contains Rust");
+	mu_assert_eq (c_symbol.attr.lang, R_BIN_LANG_C, "C symbol has one language");
+	mu_assert_eq (rust_symbol.attr.lang, R_BIN_LANG_RUST, "Rust symbol has one language");
+	bo.langs = r_bin_load_languages (&bf);
+	mu_assert_streq (info.lang, "rust", "primary language is independent of pack order");
+
+	RBinImport objc_import = { .name = r_bin_name_new ("objc_msgSend") };
+	RVecRBinImport_push_back (&bo.imports_vec, &objc_import);
+	bo.langs = r_bin_load_languages (&bf);
+	mu_assert_streq (info.lang, "objc", "Objective-C is the primary binary language");
+	mu_assert_true (R_VPACK_HAS (bo.langs, R_BIN_LANG_OBJC), "binary contains Objective-C");
+	mu_assert_true (R_VPACK_HAS (bo.langs, R_BIN_LANG_C), "binary retains C symbol language");
+	mu_assert_true (R_VPACK_HAS (bo.langs, R_BIN_LANG_RUST), "binary retains Rust symbol language");
+
+	info.lang = "swift";
+	r_bin_file_add_language (&bf, R_BIN_LANG_SWIFT);
+	bo.langs = r_bin_load_languages (&bf);
+	mu_assert_streq (info.lang, "swift", "Objective-C membership does not override Swift primary");
+	mu_assert_true (R_VPACK_HAS (bo.langs, R_BIN_LANG_OBJC), "mixed Swift binary retains Objective-C");
+
+	RVecRBinImport_fini (&bo.imports_vec);
+	mu_end;
+}
+
+bool test_r_bin_function_kind_attributes(void) {
+	char *attrs = r_bin_attr_tostring (R_BIN_ATTR_ASYNC | R_BIN_ATTR_GENERATOR | R_BIN_ATTR_DESTRUCTOR, false);
+	mu_assert_streq (attrs, "async generator destructor", "function kind attributes");
+	free (attrs);
+	mu_end;
+}
+
 static RBuffer *pebble_resource_pack(ut32 table_size) {
 	size_t content_start = 12 + table_size * 16;
 	const ut8 content[] = "ICONfont-data";
@@ -436,6 +504,9 @@ bool test_r_bin_elf_pn_xnum_phdr(void) {
 
 bool all_tests(void) {
 	mu_run_test(test_r_bin);
+	mu_run_test(test_r_bin_jni_language);
+	mu_run_test(test_r_bin_languages);
+	mu_run_test(test_r_bin_function_kind_attributes);
 	mu_run_test(test_r_bin_pebble_resources);
 	mu_run_test(test_r_bin_le_resources);
 	mu_run_test(test_r_bin_external_resource_data);

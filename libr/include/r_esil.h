@@ -235,13 +235,11 @@ typedef enum {
 
 typedef struct r_esil_t {
 	struct r_anal_t *anal; // required for io, reg, and call esil_init/fini of the selected arch plugin
-	// Heapless stack: entries are RStrs slices into `stack_buf`, an append-only
-	// arena that is reset on r_esil_stack_free. Within one expression, popped
-	// slices stay valid across subsequent pushes — the arena never moves.
+	// Fixed-size NUL-terminated ESIL string history.
 	RStrs *stack;
-	char *stack_buf;
-	ut32 stack_buf_cap;
-	ut32 stack_buf_len;
+	char *ring;
+	ut32 ring_size;
+	ut32 ring_head;
 	ut64 addrmask;
 	int stacksize;
 	int stackptr;
@@ -370,6 +368,12 @@ typedef struct r_esil_operation_t {
 	// const char* (string literal) and is NUL-terminated for compat with
 	// callbacks that take `const char *`. Also used as the HT key.
 	RStrs name;
+	// Defined op: when `code` is NULL the op runs `tokens` instead —
+	// slices into `body`, a caller-owned string that must outlive esil,
+	// exactly like `name`. Only `tokens` is owned by the op (freed with it).
+	const char *body;
+	RStrs *tokens;
+	ut32 ntokens;
 } REsilOp;
 
 // esil2c
@@ -386,6 +390,7 @@ R_API char *r_esil_toc(REsilC *esil, const char *expr);
 R_API char*r_esil_opstr(REsil*, int mode);
 
 R_API bool r_esil_set_op(REsil *esil, const char *op, REsilOpCb code, ut32 push, ut32 pop, ut32 type, const char *info);
+R_API bool r_esil_define(REsil *esil, const char *op, const char *body, ut32 push, ut32 pop, ut32 type);
 R_API REsilOp *r_esil_get_op(REsil *esil, RStrs w);
 R_API void r_esil_del_op(REsil *esil, const char *op);
 R_API void r_esil_stack_free(REsil *esil);

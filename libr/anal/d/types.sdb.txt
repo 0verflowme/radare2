@@ -271,6 +271,55 @@ func.setlocale.arg.0=int,category
 func.setlocale.arg.1=const char *,locale
 func.setlocale.ret=char *
 
+
+dcgettext=func
+func.dcgettext.args=3
+func.dcgettext.arg.0=const char *,domainname
+func.dcgettext.arg.1=const char *,msgid
+func.dcgettext.arg.2=int,category
+func.dcgettext.ret=char *
+func.dcgettext.include=libintl.h
+
+dcngettext=func
+func.dcngettext.args=5
+func.dcngettext.arg.0=const char *,domainname
+func.dcngettext.arg.1=const char *,msgid1
+func.dcngettext.arg.2=const char *,msgid2
+func.dcngettext.arg.3=unsigned long int,n
+func.dcngettext.arg.4=int,category
+func.dcngettext.ret=char *
+func.dcngettext.include=libintl.h
+
+dgettext=func
+func.dgettext.args=2
+func.dgettext.arg.0=const char *,domainname
+func.dgettext.arg.1=const char *,msgid
+func.dgettext.ret=char *
+func.dgettext.include=libintl.h
+
+dngettext=func
+func.dngettext.args=4
+func.dngettext.arg.0=const char *,domainname
+func.dngettext.arg.1=const char *,msgid1
+func.dngettext.arg.2=const char *,msgid2
+func.dngettext.arg.3=unsigned long int,n
+func.dngettext.ret=char *
+func.dngettext.include=libintl.h
+
+gettext=func
+func.gettext.args=1
+func.gettext.arg.0=const char *,msgid
+func.gettext.ret=char *
+func.gettext.include=libintl.h
+
+ngettext=func
+func.ngettext.args=3
+func.ngettext.arg.0=const char *,msgid1
+func.ngettext.arg.1=const char *,msgid2
+func.ngettext.arg.2=unsigned long int,n
+func.ngettext.ret=char *
+func.ngettext.include=libintl.h
+
 strcpy=func
 func.strcpy.args=2
 func.strcpy.arg.0=char *,dest
@@ -2605,13 +2654,27 @@ lstat=func
 func.lstat.args=2
 func.lstat.arg.0=const char *,path
 func.lstat.arg.1=void *,buf
-func.lstat.ret=void
+func.lstat.ret=int
 
 scanf=func
 func.scanf.args=2
 func.scanf.arg.0=const char *,format
 func.scanf.arg.1=,...
 func.scanf.ret=int
+
+asprintf=func
+func.asprintf.args=3
+func.asprintf.arg.0=char **,ptr
+func.asprintf.arg.1=const char *,format
+func.asprintf.arg.2=,...
+func.asprintf.ret=int
+
+dprintf=func
+func.dprintf.args=3
+func.dprintf.arg.0=int,fd
+func.dprintf.arg.1=const char *,format
+func.dprintf.arg.2=,...
+func.dprintf.ret=int
 
 snprintf=func
 func.snprintf.args=4
@@ -2622,12 +2685,13 @@ func.snprintf.arg.3=,...
 func.snprintf.ret=int
 
 snprintf_chk=func
-func.snprintf_chk.args=5
+func.snprintf_chk.args=6
 func.snprintf_chk.arg.0=char *,s
 func.snprintf_chk.arg.1=size_t,maxlen
 func.snprintf_chk.arg.2=int,flag
 func.snprintf_chk.arg.3=size_t,slen
 func.snprintf_chk.arg.4=const char *,format
+func.snprintf_chk.arg.5=,...
 func.snprintf_chk.ret=int
 
 sprintf=func
@@ -2638,11 +2702,12 @@ func.sprintf.arg.2=,...
 func.sprintf.ret=int
 
 sprintf_chk=func
-func.sprintf_chk.args=4
+func.sprintf_chk.args=5
 func.sprintf_chk.arg.0=char *,s
 func.sprintf_chk.arg.1=int,flag
 func.sprintf_chk.arg.2=size_t,slen
 func.sprintf_chk.arg.3=const char *,format
+func.sprintf_chk.arg.4=,...
 func.sprintf_chk.ret=int
 
 sscanf=func
@@ -2677,6 +2742,20 @@ func.vscanf.args=2
 func.vscanf.arg.0=const char *,format
 func.vscanf.arg.1=va_list,ap
 func.vscanf.ret=int
+
+vasprintf=func
+func.vasprintf.args=3
+func.vasprintf.arg.0=char **,ptr
+func.vasprintf.arg.1=const char *,format
+func.vasprintf.arg.2=va_list,ap
+func.vasprintf.ret=int
+
+vdprintf=func
+func.vdprintf.args=3
+func.vdprintf.arg.0=int,fd
+func.vdprintf.arg.1=const char *,format
+func.vdprintf.arg.2=va_list,ap
+func.vdprintf.ret=int
 
 vsnprintf=func
 func.vsnprintf.args=4
@@ -3219,3 +3298,53 @@ func.fflush_unlocked.ret=int
 func=type
 type.func=p
 type.func.size=8
+
+lseek=func
+func.lseek.args=3
+func.lseek.arg.0=int,fd
+func.lseek.arg.1=off_t,offset
+func.lseek.arg.2=int,whence
+func.lseek.ret=off_t
+
+fseeko=func
+func.fseeko.args=3
+func.fseeko.arg.0=FILE *,stream
+func.fseeko.arg.1=off_t,offset
+func.fseeko.arg.2=int,whence
+func.fseeko.ret=int
+
+ftello=func
+func.ftello.args=1
+func.ftello.arg.0=FILE *,stream
+func.ftello.ret=off_t
+
+stat=func
+func.stat.args=2
+func.stat.arg.0=const char *,path
+func.stat.arg.1=void *,buf
+func.stat.ret=int
+
+fdopen=func
+func.fdopen.args=2
+func.fdopen.arg.0=int,fd
+func.fdopen.arg.1=const char *,mode
+func.fdopen.ret=file*
+
+fchown=func
+func.fchown.args=3
+func.fchown.arg.0=int,fd
+func.fchown.arg.1=uid_t,owner
+func.fchown.arg.2=gid_t,group
+func.fchown.ret=int
+
+utime=func
+func.utime.args=2
+func.utime.arg.0=const char *,filename
+func.utime.arg.1=const void *,times
+func.utime.ret=int
+
+utimes=func
+func.utimes.args=2
+func.utimes.arg.0=const char *,filename
+func.utimes.arg.1=const void *,times
+func.utimes.ret=int

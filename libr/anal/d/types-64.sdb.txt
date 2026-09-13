@@ -16,3 +16,11 @@ type.uid_t.uid=64
 gid_t=type
 type.gid_t=d
 type.gid_t.uid=64
+
+off_t=type
+type.off_t=d
+type.off_t.size=64
+
+ssize_t=type
+type.ssize_t=d
+type.ssize_t.size=64

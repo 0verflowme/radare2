@@ -21,6 +21,10 @@ The measured failures that motivated each feature are in
 
 ## Use
 
+`rdbg` is a `python3` script, and it is committed without the executable bit, so
+set that once in a fresh clone.
+
+    chmod +x doc/rdbg/rdbg
     export PATH=$PWD/doc/rdbg:$PATH
     rdbg start mysession ./target
     rdbg mysession bp.set loc=mprotect caller_module=target

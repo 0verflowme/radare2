@@ -347,6 +347,9 @@ The practical consequences, in order of how they appeared:
 4. It corrupts git's remote-helper protocol. `git ls-remote` began returning the
    injected text as a ref name, and `git push` stopped working, so the rest of
    this work had to be pushed through the GitHub API.
+5. It breaks tooling that parses command output, including this repository's own
+   stop hook, whose `jq` failed on the injected lines and which then reported
+   untracked files that do not exist.
 
 Nothing in the debugger reported any of this. gdb reported a clean run with exit
 code 1. There is no stop, no warning, and no record. An agent working
@@ -394,8 +397,18 @@ Had this existed one hour earlier, lernaia would have stopped at its first
 Two of three solved. The third produced the most useful findings, which is the
 usual way with a harness: the target that defeats you tells you what to build.
 
+## Target 4
+
+A JavaScript engine is a different kind of target: large, symbol-rich, heavily
+threaded, and running code that does not exist until it is generated. Those
+findings are in [`doc/agent-debugging-v8.md`](agent-debugging-v8.md).
+
 ## Reproducing
 
-The corpus is not committed: these are other people's crackmes, and one of them
-is hostile to its host. Fetch them from crackmes.one, and run anything you did
-not write yourself under `fsmon.arm` with an allowlist and `block: true`.
+The crackme corpus is not committed: these are other people's binaries, and one
+of them is hostile to its host. Fetch them from crackmes.one, and run anything
+you did not write yourself under `fsmon.arm` with an allowlist and
+`block: true`.
+
+The V8 target is a published build and carries no such hazard; its steps are in
+[`doc/agent-debugging-v8.md`](agent-debugging-v8.md).

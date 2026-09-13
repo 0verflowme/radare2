@@ -246,17 +246,80 @@ def resolve_loc(loc):
     except gdb.error:
         return _u64(v.address), loc
 
+_SYMCACHE = {}
+
+
+def _symbolise(addr):
+    """Function name, offset and source line for an address, when known.
+
+    Real targets have symbols and the crackmes did not, so nothing used them.
+    On a V8 debug build this is the difference between @d8+0x9c346 and
+    v8::Shell::Main + 4534 at d8.cc:8420.
+    """
+    hit = _SYMCACHE.get(addr)
+    if hit is not None:
+        return hit
+    out = {}
+    try:
+        txt = _ex("info symbol %#x" % addr).strip()
+        if txt and "No symbol" not in txt:
+            name = txt.split(" in section ")[0].strip()
+            if " + " in name:
+                fn, _, delta = name.rpartition(" + ")
+                out["sym"] = fn.strip()
+                try:
+                    out["sym_offset"] = int(delta)
+                except ValueError:
+                    pass
+            else:
+                out["sym"] = name
+    except gdb.error:
+        pass
+    try:
+        sal = gdb.find_pc_line(addr)
+        if sal and sal.symtab and sal.line:
+            out["source"] = "%s:%d" % (sal.symtab.filename, sal.line)
+    except Exception:
+        pass
+    if len(_SYMCACHE) < 20000:
+        _SYMCACHE[addr] = out
+    return out
+
+
+def _anon_exec_region(addr):
+    """Bounds of the anonymous executable mapping holding addr, if any.
+
+    JIT code (V8's regexp and optimised code) lives in anonymous rwx/r-x
+    mappings with no path, so there is nothing to be module-relative to. Naming
+    the region gives the agent a stable handle and something to dump.
+    """
+    for start, end, _o, perms, path in _mappings():
+        if start <= addr < end and not path and "x" in perms:
+            return start, end, perms
+    return None
+
+
 def describe_addr(addr):
     path, off, perms = _module_for(addr)
     d = {"addr": "%#x" % addr}
+    if path:
+        d.update(_symbolise(addr))
+    else:
+        reg = _anon_exec_region(addr)
+        if reg:
+            start, end, rperms = reg
+            d["loc"] = "@anon:%#x+%#x" % (start, addr - start)
+            d["region"] = {"start": "%#x" % start, "end": "%#x" % end,
+                           "size": end - start, "perms": rperms,
+                           "kind": "jit-or-generated code (no backing file)"}
     if path:
         d["loc"] = "@%s+%#x" % (os.path.basename(path), off)
         d["module"] = os.path.basename(path)
         d["module_offset"] = "%#x" % off
     if perms:
         d["perms"] = perms
-    if not path:
-        # name anonymous regions relative to a note when we can
+    if not path and "loc" not in d:
+        # no region to name it against: fall back to the nearest note below it
         with LOCK:
             notes = dict(STATE["notes"])
         best = None
@@ -1140,9 +1203,10 @@ def _is_call_site(addr):
 def h_stack_callers(req):
     """Recover a call chain by scanning the stack for return addresses.
 
-    gdb cannot unwind a static stripped binary with no CFI: every frame past
-    the innermost comes back empty. Scanning for stack slots that point just
-    after a real call instruction recovers the chain the way a human does.
+    gdb cannot unwind a static stripped binary with no CFI, and from inside
+    generated code it returns addresses that are not frames at all. Scanning
+    for stack slots that point just after a real call instruction recovers the
+    chain the way a human does.
     """
     if not _running():
         raise gdb.error("target is not running")
@@ -1181,6 +1245,30 @@ def h_stack_callers(req):
                       "return addresses, not necessarily the live chain"}
 
 
+def h_sample_one(req):
+    """One stack sample: pc, symbol, and the recovered caller chain."""
+    if not _running():
+        raise gdb.error("target is not running")
+    f = _cur_frame()
+    pc = _u64(f.pc())
+    out = {"pc": describe_addr(pc)}
+    try:
+        callers = h_stack_callers({"bytes": req.get("bytes", 4096),
+                                   "module": req.get("module")})
+        chain = []
+        for c in callers["callers"]:
+            e = {"loc": c.get("loc"), "addr": c["addr"]}
+            if c.get("sym"):
+                e["sym"] = c["sym"]
+            if c.get("source"):
+                e["source"] = c["source"]
+            chain.append(e)
+        out["chain"] = chain
+    except gdb.error as e:
+        out["chain_error"] = str(e)
+    return out
+
+
 def h_antidebug_status(req):
     return {"enabled": SYSMASK["enabled"], "subs": SYSMASK["subs"],
             "hits": SYSMASK["hits"]}
@@ -1213,7 +1301,8 @@ HANDLERS = {
     "_raw_cont": h__raw_cont, "output": h_output,
     "protect": h_protect, "protect.status": h_protect_status, "scope": h_scope,
     "fsmon.arm": h_fsmon_arm, "fsmon.report": h_fsmon_report,
-    "stack.callers": h_stack_callers, "bp.log": h_bp_log,
+    "stack.callers": h_stack_callers, "sample.one": h_sample_one,
+    "bp.log": h_bp_log,
     "bp.clear_log": h_bp_clear_log,
 }
 

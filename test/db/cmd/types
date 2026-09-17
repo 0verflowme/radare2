@@ -2117,6 +2117,7 @@ FreeLibraryAndExitThread
 ExitProcess
 FatalExit
 RaiseException
+longjmp_chk
 errx
 ExitThread
 8
@@ -2128,6 +2129,7 @@ FreeLibraryAndExitThread
 ExitProcess
 FatalExit
 RaiseException
+longjmp_chk
 errx
 ExitThread
 EOF

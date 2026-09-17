@@ -125,11 +125,11 @@ RUN
 
 NAME=arm64 adrp ldr refers to the slot
 FILE=bins/mach0/hello-aae
-CMDS=<<EOF_CMDS
+CMDS=<<EOF
 aaa
 axf @ 0x100000498
 EOF
-EXPECT=<<EOF_EXPECT
+EXPECT=<<EOF
 DATA 0x100004000 segment.__DATA_CONST
 EOF
 RUN

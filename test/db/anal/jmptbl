@@ -674,7 +674,6 @@ EXPECT=<<EOF
 0x1000044a4      brk 1
 
 0x1000044a8      bl sym.imp.__stack_chk_fail
-
 EOF
 RUN
 

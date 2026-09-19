@@ -188,32 +188,7 @@ R_API char *r_bin_filter_name(RBinFile *bf, HtSU *db, ut64 vaddr, const char *na
 R_IPI bool r_bin_filter_sym(RBinFile *bf, HtPP *ht, ut64 vaddr, RBinSymbol *sym) {
 	R_RETURN_VAL_IF_FAIL (ht && sym && sym->name, false);
 	const char *name = r_bin_name_tostring2 (sym->name, 'o');
-	if (bf && bf->bo && bf->bo->lang) {
-		const char *lang = r_bin_lang_tostring (bf->bo->lang);
-		char *dn = r_bin_demangle (bf, lang, name, sym->vaddr, false);
-		if (R_STR_ISNOTEMPTY (dn)) {
-			r_bin_name_demangled (sym->name, dn);
-			// extract class information from demangled symbol name
-			// swift demangled names follow Module.Type.member pattern
-			char *p = strchr (dn, '.');
-			if (p) {
-				char *p2 = strchr (p + 1, '.');
-				if (p2 && isupper (*dn) && isupper (p[1])) {
-					// Module.Class.method - use Module.Class as classname
-					sym->classname = r_str_ndup (dn, p2 - dn);
-				} else if (isupper (*dn)) {
-					sym->classname = r_str_ndup (dn, p - dn);
-				} else if (isupper (p[1])) {
-					sym->classname = strdup (p + 1);
-					char *dot = strchr (sym->classname, '.');
-					if (dot) {
-						*dot = 0;
-					}
-				}
-			}
-		}
-		free (dn);
-	}
+	r_bin_register_symbol_language (bf, sym);
 	char *oname = r_str_newf ("o.0.%c.%s", sym->is_imported ? 'i' : 's', name);
 	char *uname = r_str_newf ("%" PFMT64x ".%c.%s", vaddr, sym->is_imported ? 'i' : 's', name);
 	bool res = ht_pp_insert (ht, uname, sym);
@@ -246,26 +221,6 @@ R_API void r_bin_filter_sections_vec(RBinFile *bf, RVecRBinSection *sections) {
 	}
 	RBinSection *sec;
 	R_VEC_FOREACH (sections, sec) {
-		if (!sec->name) {
-			continue;
-		}
-		char *p = filter_section_name (db, sec->vaddr, sec->name);
-		if (p) {
-			free (sec->name);
-			sec->name = p;
-		}
-	}
-	ht_pp_free (db);
-}
-
-R_API void r_bin_filter_sections(RBinFile *bf, RList *list) {
-	RBinSection *sec;
-	HtPP *db = ht_pp_new (NULL, section_name_state_free, NULL);
-	RListIter *iter;
-	if (!db) {
-		return;
-	}
-	r_list_foreach (list, iter, sec) {
 		if (!sec->name) {
 			continue;
 		}

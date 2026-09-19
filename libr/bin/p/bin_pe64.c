@@ -316,9 +316,21 @@ static char *header(RBinFile *bf, int mode) {
 
 extern struct r_bin_write_t r_bin_write_pe64;
 
+static bool read_at_checked(RIO *io, ut64 addr, ut8 *buf, int size) {
+	// r_io_read_at succeeds on unmapped areas by filling the gaps with
+	// io.Oxff, so ensure the range lives inside the binary before reading
+	if (addr > UT64_MAX - size) {
+		return false;
+	}
+	if (!r_io_is_valid_offset (io, addr, 0) || !r_io_is_valid_offset (io, addr + size - 1, 0)) {
+		return false;
+	}
+	return r_io_read_at (io, addr, buf, size);
+}
+
 static bool read_u32_at(RIO *io, ut64 addr, ut32 *out) {
 	ut8 buf[sizeof (ut32)];
-	if (!r_io_read_at (io, addr, buf, sizeof (buf))) {
+	if (!read_at_checked (io, addr, buf, sizeof (buf))) {
 		return false;
 	}
 	*out = r_read_le32 (buf);
@@ -327,7 +339,7 @@ static bool read_u32_at(RIO *io, ut64 addr, ut32 *out) {
 
 static bool read_runtime_function_at(RIO *io, ut64 addr, PE64_RUNTIME_FUNCTION *rfcn) {
 	ut8 buf[sizeof (*rfcn)];
-	if (!r_io_read_at (io, addr, buf, sizeof (buf))) {
+	if (!read_at_checked (io, addr, buf, sizeof (buf))) {
 		return false;
 	}
 	rfcn->BeginAddress = r_read_le32 (buf);
@@ -338,7 +350,7 @@ static bool read_runtime_function_at(RIO *io, ut64 addr, PE64_RUNTIME_FUNCTION *
 
 static bool read_unwind_info_at(RIO *io, ut64 addr, PE64_UNWIND_INFO *info) {
 	ut8 buf[offsetof (PE64_UNWIND_INFO, UnwindCode)];
-	if (!r_io_read_at (io, addr, buf, sizeof (buf))) {
+	if (!read_at_checked (io, addr, buf, sizeof (buf))) {
 		return false;
 	}
 	info->Version = buf[0] & 7;
@@ -352,7 +364,7 @@ static bool read_unwind_info_at(RIO *io, ut64 addr, PE64_UNWIND_INFO *info) {
 
 static bool read_scope_record_at(RIO *io, ut64 addr, PE64_SCOPE_RECORD *scope) {
 	ut8 buf[sizeof (*scope)];
-	if (!r_io_read_at (io, addr, buf, sizeof (buf))) {
+	if (!read_at_checked (io, addr, buf, sizeof (buf))) {
 		return false;
 	}
 	scope->BeginAddress = r_read_le32 (buf);
@@ -362,33 +374,242 @@ static bool read_scope_record_at(RIO *io, ut64 addr, PE64_SCOPE_RECORD *scope) {
 	return true;
 }
 
-static RList *trycatch(RBinFile *bf) {
+#define PE64_UNWIND_CHAIN_LIMIT 32
+#define PE64_SCOPE_LIMIT 0x10000
+// magic numbers of the MSVC FuncInfo structure used by __CxxFrameHandler3
+#define PE64_CXX_MAGIC_MIN 0x19930520
+#define PE64_CXX_MAGIC_MAX 0x19930522
+
+static inline bool is_cxx_magic(ut32 magic) {
+	return magic >= PE64_CXX_MAGIC_MIN && magic <= PE64_CXX_MAGIC_MAX;
+}
+
+// read the name of an RTTI type descriptor: `struct { void *vft; void *spare; char name[]; }`
+static char *read_type_descriptor_name(RBinFile *bf, RIO *io, ut64 addr) {
+	char name[256];
+	size_t i;
+	for (i = 0; i < sizeof (name) - 1; i++) {
+		ut8 ch;
+		if (!read_at_checked (io, addr + 16 + i, &ch, 1) || !ch) {
+			break;
+		}
+		name[i] = (char)ch;
+	}
+	if (!i) {
+		return NULL;
+	}
+	name[i] = 0;
+	// type descriptor names look like `.?AVFoo@@`, demangle them when possible
+	char *dem = r_bin_demangle (bf, "msvc", name, addr, false);
+	if (R_STR_ISEMPTY (dem)) {
+		free (dem);
+		return strdup (name);
+	}
+	char *sp = strchr (dem, ' ');
+	if (sp && R_STR_ISNOTEMPTY (sp + 1)) {
+		char *res = strdup (sp + 1);
+		free (dem);
+		return res;
+	}
+	return dem;
+}
+
+// map the [low, high] state range of a try block into an address range using
+// the ip-to-state map of the function
+static bool cxx_state_range(const ut32 *ipmap, ut32 ip_count, ut64 baseAddr,
+		st32 low, st32 high, const PE64_RUNTIME_FUNCTION *rfcn, ut64 *from, ut64 *to) {
+	ut32 i;
+	bool found = false;
+	for (i = 0; i < ip_count; i++) {
+		const st32 state = (st32)ipmap[i * 2 + 1];
+		if (state >= low && state <= high) {
+			if (!found) {
+				*from = baseAddr + ipmap[i * 2];
+				found = true;
+			}
+		} else if (found) {
+			*to = baseAddr + ipmap[i * 2];
+			return *to > *from;
+		}
+	}
+	if (found) {
+		*to = baseAddr + rfcn->EndAddress;
+	}
+	return found && *to > *from;
+}
+
+// parse the MSVC FuncInfo of a __CxxFrameHandler3 protected function
+static void cxx_trycatch(RBinFile *bf, RIO *io, RVecRBinTrycatch *trycatch, ut64 baseAddr,
+		const PE64_RUNTIME_FUNCTION *rfcn, ut32 funcinfo) {
+	const ut64 fi = baseAddr + funcinfo;
+	ut32 try_count, try_map, ip_count, ip_map;
+	if (!read_u32_at (io, fi + 12, &try_count) || !read_u32_at (io, fi + 16, &try_map)
+			|| !read_u32_at (io, fi + 20, &ip_count) || !read_u32_at (io, fi + 24, &ip_map)) {
+		return;
+	}
+	if (!try_count || !try_map || !ip_count || !ip_map
+			|| try_count > 0x1000 || ip_count > 0x10000) {
+		return;
+	}
+	// IptoStateMapEntry: ip rva, state
+	ut32 *ipmap = calloc (ip_count, sizeof (ut32) * 2);
+	if (!ipmap) {
+		return;
+	}
+	ut32 i;
+	for (i = 0; i < ip_count; i++) {
+		const ut64 at = baseAddr + ip_map + (ut64)i * 8;
+		if (!read_u32_at (io, at, &ipmap[i * 2]) || !read_u32_at (io, at + 4, &ipmap[i * 2 + 1])) {
+			free (ipmap);
+			return;
+		}
+	}
+	const ut64 source = baseAddr + rfcn->BeginAddress;
+	for (i = 0; i < try_count; i++) {
+		// TryBlockMapEntry: tryLow, tryHigh, catchHigh, nCatches, dispHandlerArray
+		const ut64 tb = baseAddr + try_map + (ut64)i * 20;
+		ut32 try_low, try_high, catch_count, handlers;
+		if (!read_u32_at (io, tb, &try_low) || !read_u32_at (io, tb + 4, &try_high)
+				|| !read_u32_at (io, tb + 12, &catch_count) || !read_u32_at (io, tb + 16, &handlers)) {
+			break;
+		}
+		if (!catch_count || !handlers || catch_count > 0x100
+				|| (st32)try_low > (st32)try_high) {
+			continue;
+		}
+		ut64 from = 0, to = 0;
+		if (!cxx_state_range (ipmap, ip_count, baseAddr,
+				(st32)try_low, (st32)try_high, rfcn, &from, &to)) {
+			continue;
+		}
+		ut32 j;
+		for (j = 0; j < catch_count; j++) {
+			// HandlerType: adjectives, dispType, dispCatchObj, addressOfHandler, dispFrame
+			const ut64 ht = baseAddr + handlers + (ut64)j * 20;
+			ut32 type_rva, handler_rva;
+			if (!read_u32_at (io, ht + 4, &type_rva) || !read_u32_at (io, ht + 12, &handler_rva)) {
+				break;
+			}
+			if (!handler_rva) {
+				continue;
+			}
+			RBinTrycatch *tc = r_bin_trycatch_add (trycatch, source, from, to, baseAddr + handler_rva, 0);
+			if (!tc) {
+				break;
+			}
+			tc->kind = R_BIN_TRYCATCH_CATCH;
+			if (type_rva) {
+				tc->type = read_type_descriptor_name (bf, io, baseAddr + type_rva);
+			} else {
+				// a null type descriptor is `catch (...)`
+				tc->catch_all = true;
+			}
+		}
+	}
+	free (ipmap);
+}
+
+// parse the scope table of a __C_specific_handler protected function
+static void seh_trycatch(RIO *io, RVecRBinTrycatch *trycatch, ut64 baseAddr,
+		const PE64_RUNTIME_FUNCTION *rfcn, ut64 scopeTableOff) {
+	ut32 scope_count;
+	if (!read_u32_at (io, scopeTableOff, &scope_count)
+			|| !scope_count || scope_count > PE64_SCOPE_LIMIT) {
+		return;
+	}
+	const ut64 source = baseAddr + rfcn->BeginAddress;
+	ut64 scopeRecOff = scopeTableOff + sizeof (ut32);
+	ut32 i;
+	for (i = 0; i < scope_count; i++, scopeRecOff += sizeof (PE64_SCOPE_RECORD)) {
+		PE64_SCOPE_RECORD scope;
+		if (!read_scope_record_at (io, scopeRecOff, &scope)) {
+			return;
+		}
+		if (scope.BeginAddress > scope.EndAddress
+			|| scope.BeginAddress == UT32_MAX || scope.EndAddress == UT32_MAX
+			|| !scope.BeginAddress || !scope.EndAddress) {
+			return;
+		}
+		if (!(scope.BeginAddress >= rfcn->BeginAddress - 1 && scope.BeginAddress < rfcn->EndAddress
+			&& scope.EndAddress <= rfcn->EndAddress + 1 && scope.EndAddress > rfcn->BeginAddress)) {
+			continue;
+		}
+		const ut64 from = baseAddr + scope.BeginAddress;
+		const ut64 to = baseAddr + scope.EndAddress;
+		RBinTrycatch *tc;
+		if (scope.JumpTarget) {
+			// __except: HandlerAddress is the filter, 1 means EXCEPTION_EXECUTE_HANDLER
+			const ut64 filter = scope.HandlerAddress > 1? baseAddr + scope.HandlerAddress: 0;
+			tc = r_bin_trycatch_add (trycatch, source, from, to, baseAddr + scope.JumpTarget, filter);
+			if (tc) {
+				tc->kind = filter? R_BIN_TRYCATCH_FILTER: R_BIN_TRYCATCH_CATCH;
+			}
+		} else {
+			// __finally: HandlerAddress is the termination handler
+			if (!scope.HandlerAddress || scope.HandlerAddress == 1) {
+				continue;
+			}
+			tc = r_bin_trycatch_add (trycatch, source, from, to, baseAddr + scope.HandlerAddress, 0);
+			if (tc) {
+				tc->kind = R_BIN_TRYCATCH_CLEANUP;
+			}
+		}
+		if (!tc) {
+			return;
+		}
+	}
+}
+
+// walk the exception directory collecting the SEH and C++ exception regions
+static RVecRBinTrycatch *trycatch(RBinFile *bf) {
 	RIO *io = bf->rbin->iob.io;
 	ut64 baseAddr = bf->bo->baddr;
-	int i;
 	ut64 offset;
 	ut32 c_handler = 0;
 
 	struct PE_(r_bin_pe_obj_t) * bin = bf->bo->bin_obj;
+	if (bin->trycatch_loaded) {
+		return &bin->trycatch;
+	}
+	// managed methods carry their own exception clauses
+	RVecRBinTrycatch *tcs = pe_trycatch (bf);
+	if (!tcs) {
+		return NULL;
+	}
+	if (!bin->nt_headers || bin->nt_headers->file_header.Machine != PE_IMAGE_FILE_MACHINE_AMD64) {
+		// The exception directory of ARM64 and other machines does not
+		// use the x86-64 RUNTIME_FUNCTION/UNWIND_INFO format parsed here
+		RVecRBinTrycatch_shrink_to_fit (tcs);
+		return tcs;
+	}
 	PE_(image_data_directory) *expdir = &bin->optional_header->DataDirectory[PE_IMAGE_DIRECTORY_ENTRY_EXCEPTION];
 	if (!expdir->Size) {
-		return NULL;
+		RVecRBinTrycatch_shrink_to_fit (tcs);
+		return tcs;
+	}
+	ut64 dirsize = expdir->Size;
+	const ut64 filesize = bin->b? r_buf_size (bin->b): 0;
+	if (dirsize > filesize) {
+		// RUNTIME_FUNCTION entries beyond the file contents can only be padding or garbage
+		dirsize = filesize;
 	}
 
-	RList *tclist = r_list_newf ((RListFree)r_bin_trycatch_free);
-	if (!tclist) {
-		return NULL;
-	}
-
-	for (offset = expdir->VirtualAddress; offset < (ut64)expdir->VirtualAddress + expdir->Size; offset += sizeof (PE64_RUNTIME_FUNCTION)) {
+	for (offset = expdir->VirtualAddress; offset < (ut64)expdir->VirtualAddress + dirsize; offset += sizeof (PE64_RUNTIME_FUNCTION)) {
 		PE64_RUNTIME_FUNCTION rfcn;
 		bool suc = read_runtime_function_at (io, offset + baseAddr, &rfcn);
-		if (!rfcn.BeginAddress) {
+		if (!suc || !rfcn.BeginAddress || rfcn.BeginAddress == UT32_MAX) {
+			// zero and ff-filled entries mark the end of the directory
 			break;
 		}
 		ut32 savedBeginOff = rfcn.BeginAddress;
 		ut32 savedEndOff = rfcn.EndAddress;
+		// Chained entries can form cycles in malformed binaries, so bound the walk
+		int chain = 0;
 		while (suc && rfcn.UnwindData & 1) {
+			if (chain++ >= PE64_UNWIND_CHAIN_LIMIT) {
+				suc = false;
+				break;
+			}
 			// XXX this ugly (int) cast is needed for MSVC for not to crash
 			int delta = (rfcn.UnwindData & (int)~1);
 			ut64 at = baseAddr + delta;
@@ -401,7 +622,11 @@ static RList *trycatch(RBinFile *bf) {
 		}
 		PE64_UNWIND_INFO info;
 		suc = read_unwind_info_at (io, rfcn.UnwindData + baseAddr, &info);
-		if (!suc || info.Version != 1 || (!(info.Flags & PE64_UNW_FLAG_EHANDLER) && !(info.Flags & PE64_UNW_FLAG_CHAININFO))) {
+		// UHANDLER shares the layout of EHANDLER, functions with a __finally
+		// and no __except only get the unwind handler flag
+		const ut8 handler_flags = PE64_UNW_FLAG_EHANDLER | PE64_UNW_FLAG_UHANDLER;
+		if (!suc || info.Version != 1
+				|| (!(info.Flags & handler_flags) && !(info.Flags & PE64_UNW_FLAG_CHAININFO))) {
 			continue;
 		}
 
@@ -412,7 +637,12 @@ static RList *trycatch(RBinFile *bf) {
 		if (info.Flags & PE64_UNW_FLAG_CHAININFO) {
 			savedBeginOff = rfcn.BeginAddress;
 			savedEndOff = rfcn.EndAddress;
+			int chains = 0;
 			do {
+				if (chains++ >= PE64_UNWIND_CHAIN_LIMIT) {
+					suc = false;
+					break;
+				}
 				if (!read_runtime_function_at (io, exceptionDataOff, &rfcn)) {
 					break;
 				}
@@ -420,7 +650,12 @@ static RList *trycatch(RBinFile *bf) {
 				if (!suc || info.Version != 1) {
 					break;
 				}
+				int chain = 0;
 				while (suc && (rfcn.UnwindData & 1)) {
+					if (chain++ >= PE64_UNWIND_CHAIN_LIMIT) {
+						suc = false;
+						break;
+					}
 					// XXX this ugly (int) cast is needed for MSVC for not to crash
 					suc = read_runtime_function_at (io, baseAddr + ((int)rfcn.UnwindData & (int)~1), &rfcn);
 				}
@@ -431,7 +666,10 @@ static RList *trycatch(RBinFile *bf) {
 				sizeOfCodeEntries *= sizeof (PE64_UNWIND_CODE);
 				exceptionDataOff = baseAddr + rfcn.UnwindData + offsetof (PE64_UNWIND_INFO, UnwindCode) + sizeOfCodeEntries;
 			} while (info.Flags & PE64_UNW_FLAG_CHAININFO);
-			if (!(info.Flags & PE64_UNW_FLAG_EHANDLER)) {
+			if (!suc) {
+				continue;
+			}
+			if (!(info.Flags & handler_flags)) {
 				continue;
 			}
 			rfcn.BeginAddress = savedBeginOff;
@@ -442,60 +680,31 @@ static RList *trycatch(RBinFile *bf) {
 		if (!read_u32_at (io, exceptionDataOff, &handler)) {
 			continue;
 		}
+		exceptionDataOff += sizeof (ut32);
+
+		if (handler != c_handler) {
+			// __CxxFrameHandler3 and __GSHandlerCheck_EH are followed by the
+			// rva of a FuncInfo structure describing the C++ try blocks
+			ut32 magic, rva_to_fcninfo;
+			if (read_u32_at (io, exceptionDataOff, &rva_to_fcninfo)
+					&& read_u32_at (io, baseAddr + rva_to_fcninfo, &magic)
+					&& is_cxx_magic (magic)) {
+				cxx_trycatch (bf, io, tcs, baseAddr, &rfcn, rva_to_fcninfo);
+				continue;
+			}
+		}
 		if (c_handler && c_handler != handler) {
 			continue;
 		}
-		exceptionDataOff += sizeof (ut32);
-
-		if (!c_handler) {
-			ut32 magic, rva_to_fcninfo;
-			if (read_u32_at (io, exceptionDataOff, &rva_to_fcninfo) &&
-				read_u32_at (io, baseAddr + rva_to_fcninfo, &magic)) {
-				if (magic >= 0x19930520 && magic <= 0x19930522) {
-					// __CxxFrameHandler3 or __GSHandlerCheck_EH
-					continue;
-				}
-			}
-		}
-
-		ut32 scope_count;
-		if (!read_u32_at (io, exceptionDataOff, &scope_count)) {
-			continue;
-		}
-
-		PE64_SCOPE_RECORD scope;
-		ut64 scopeRecOff = exceptionDataOff + sizeof (ut32);
-		for (i = 0; i < scope_count; i++) {
-			if (!read_scope_record_at (io, scopeRecOff, &scope)) {
-				break;
-			}
-			if (scope.BeginAddress > scope.EndAddress
-				|| scope.BeginAddress == UT32_MAX || scope.EndAddress == UT32_MAX
-				|| !scope.BeginAddress || !scope.EndAddress) {
-				break;
-			}
-			if (!(scope.BeginAddress >= rfcn.BeginAddress - 1 && scope.BeginAddress < rfcn.EndAddress
-				&& scope.EndAddress <= rfcn.EndAddress + 1 && scope.EndAddress > rfcn.BeginAddress)) {
-				continue;
-			}
-			if (!scope.JumpTarget) {
-				// scope.HandlerAddress == __finally block
-				continue;
-			}
-			ut64 handlerAddr = scope.HandlerAddress == 1 ? 0 : scope.HandlerAddress + baseAddr;
-			RBinTrycatch *tc = r_bin_trycatch_new (
-				rfcn.BeginAddress + baseAddr,
-				scope.BeginAddress + baseAddr,
-				scope.EndAddress + baseAddr,
-				scope.JumpTarget + baseAddr,
-				handlerAddr
-			);
+		const size_t before = RVecRBinTrycatch_length (tcs);
+		seh_trycatch (io, tcs, baseAddr, &rfcn, exceptionDataOff);
+		if (RVecRBinTrycatch_length (tcs) != before) {
+			// the language specific handler of this binary is now known
 			c_handler = handler;
-			r_list_append (tclist, tc);
-			scopeRecOff += sizeof (PE64_SCOPE_RECORD);
 		}
 	}
-	return tclist;
+	RVecRBinTrycatch_shrink_to_fit (tcs);
+	return tcs;
 }
 
 RBinPlugin r_bin_plugin_pe64 = {
@@ -506,6 +715,8 @@ RBinPlugin r_bin_plugin_pe64 = {
 		.license = "LGPL-3.0-only",
 	},
 	.get_sdb = &get_sdb,
+	.get_name = &getname,
+	.get_offset = &getoffset,
 	.get_cc = &get_cc,
 	.load = &load,
 	.destroy = &destroy,
@@ -520,6 +731,8 @@ RBinPlugin r_bin_plugin_pe64 = {
 	.header = &header,
 	.fields = &fields,
 	.classes = &classes,
+	.types = &types,
+	.strings = &strings,
 	.libs = &libs,
 	.relocs = &relocs,
 	.get_vaddr = &get_vaddr,

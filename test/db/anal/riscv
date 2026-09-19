@@ -1,11 +1,22 @@
+# merged: asm pseudo for riscv
 NAME=ret
 FILE=bins/elf/analysis/guess-number-riscv64
 CMDS=<<EOF
 af @ sym._printf_r
 afl~_printf_r
+?e --
+s 0x00010178
+e asm.pseudo = 1
+pd 5
 EOF
 EXPECT=<<EOF
 0x00010330    1     68 sym._printf_r
+--
+            0x00010178      ef00c01f       jmp ra                      ; sym.printf
+            0x0001017c      930784fe       a5 = s0 - 24
+            0x00010180      93850700       a1 = a5
+            0x00010184      b7170200       a5 = 0x21
+            0x00010188      13850751       a0 = a5 + 1296
 EOF
 RUN
 
@@ -43,22 +54,6 @@ EXPECT=<<EOF
 EOF
 RUN
 
-NAME=asm pseudo for riscv
-FILE=bins/elf/analysis/guess-number-riscv64
-CMDS=<<EOF
-s 0x00010178
-e asm.pseudo = 1
-pd 5
-EOF
-EXPECT=<<EOF
-            0x00010178      ef00c01f       jmp ra                      ; sym.printf
-            0x0001017c      930784fe       a5 = s0 - 24
-            0x00010180      93850700       a1 = a5
-            0x00010184      b7170200       a5 = 0x21
-            0x00010188      13850751       a0 = a5 + 1296
-EOF
-RUN
-
 NAME=asm fibonacci
 FILE=bins/elf/riscv-fibonacci
 CMDS=<<EOF
@@ -81,5 +76,20 @@ EOF
 EXPECT=<<EOF
 ra,t0,t1,t2,t3,t4,t5,t6,a0,a1,a2,a3,a4,a5,a6,a7,ft0,ft1,ft2,ft3,ft4,ft5,ft6,ft7,ft8,ft9,ft10,ft11,fa0,fa1,fa2,fa3,fa4,fa5,fa6,fa7
 sp,gp,tp,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,fs0,fs1,fs2,fs3,fs4,fs5,fs6,fs7,fs8,fs9,fs10,fs11
+EOF
+RUN
+
+NAME=asm pseudo for riscv branches
+FILE=malloc://64
+ARGS=-a riscv -b 64 -e asm.pseudo=true
+CMDS=<<EOF
+wx 6364b500 63f4a500 63440500 6354a000 @ 0
+pi 4
+EOF
+EXPECT=<<EOF
+if ((unsigned)a0 < a1) goto 0x8
+if ((unsigned)a0 <= a1) goto 0xc
+if (a0 < 0) goto 0x10
+if (a0 <= 0) goto 0x14
 EOF
 RUN

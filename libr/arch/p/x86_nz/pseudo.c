@@ -63,13 +63,21 @@ static char *replace(int argc, char *argv[]) {
 		{ "ja", "if (((unsigned) v) > 0) goto #", {1}},
 		{ "jb", "if (((unsigned) v) < 0) goto #", {1}},
 		{ "jbe", "if (((unsigned) v) <= 0) goto #", {1}},
+		{ "jae", "if (((unsigned) v) >= 0) goto loc_#", {1}},
 		{ "je", "if (!v) goto loc_#", {1}},
 		{ "jz", "if (!v) goto loc_#", {1}},
 		{ "jg", "if (v > 0) goto loc_#", {1}},
 		{ "jge", "if (v >= 0) goto loc_#", {1}},
+		{ "jl", "if (v < 0) goto loc_#", {1}},
 		{ "jle", "if (v <= 0) goto loc_#", {1}},
 		{ "jmp",  "goto loc_#", {1}},
 		{ "jne", "if (v) goto loc_#", {1}},
+		{ "jno", "if (!overflow) goto loc_#", {1}},
+		{ "jnp", "if (!parity) goto loc_#", {1}},
+		{ "jns", "if (v >= 0) goto loc_#", {1}},
+		{ "jo", "if (overflow) goto loc_#", {1}},
+		{ "jp", "if (parity) goto loc_#", {1}},
+		{ "js", "if (v < 0) goto loc_#", {1}},
 		{ "leav",  ";", {0}},
 		{ "lea",  "# = #", {1, 2}},
 		{ "mov",  "# = #", {1, 2}},
@@ -370,7 +378,7 @@ static void mk_reg_str(const char *regname, int delta, bool sign, bool att, char
 }
 
 static char *patch(RAsmPluginSession *aps, RAnalOp *aop, const char *op) {
-	const ut8 *b = aop->bytes; // core->block;
+	const ut8 *b = aop->bytes;
 	int i, size = aop->size;
 	char *hcmd = NULL;
 	const char *cmd = NULL;

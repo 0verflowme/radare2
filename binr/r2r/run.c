@@ -17,6 +17,9 @@
 #define R2R_ASAN 0
 #endif
 
+// valgrind makes a leak test 20-50x slower, so a native budget starves it
+#define R2R_LEAK_MIN_TIMEOUT_MS (120 * 1000)
+
 #if R2__WINDOWS__
 #include <windows.h>
 #else
@@ -1356,11 +1359,17 @@ R_API bool r2r_check_cmd_test(R2RProcessOutput *out, R2RCmdTest *test) {
 #define JQ_CMD "jq"
 
 R_API bool r2r_check_jq_available(void) {
+	char *jq_bin = r_file_path (JQ_CMD);
+	if (!jq_bin) {
+		return false;
+	}
+	free (jq_bin);
+
 	const char *args[] = { "." };
 	const char *invalid_json = "this is not json lol";
 	R2RSubprocess *proc = r2r_subprocess_start (JQ_CMD, args, 1, NULL, NULL, 0);
 	if (!proc) {
-		R_LOG_ERROR ("Cannot start subprocess");
+		R_LOG_ERROR ("Cannot start jq subprocess");
 		return false;
 	}
 	r2r_subprocess_stdin_write (proc, (const ut8 *)invalid_json, strlen (invalid_json));
@@ -1428,12 +1437,14 @@ R_API bool r2r_check_json_test(R2RProcessOutput *out, R2RJsonTest *test) {
 	bool ret = false;
 	if (r2r_empty_json_check (out)) {
 		R2RSubprocess *proc = r2r_subprocess_start (JQ_CMD, args, 1, NULL, NULL, 0);
+		if (!proc) {
+			return false;
+		}
 		r2r_subprocess_stdin_write (proc, (const ut8 *)out->out, strlen (out->out));
 		r2r_subprocess_wait (proc, UT64_MAX);
 		ret = proc->ret == 0;
 		r2r_subprocess_free (proc);
 	} else {
-		eprintf ("\n");
 		R_LOG_ERROR ("[XX] Empty json for %s", test->cmd);
 	}
 	return ret;
@@ -1759,7 +1770,8 @@ R_API R2RProcessOutput *r2r_run_leak_test(R2RRunConfig *config, R2RCmdTest *test
 		extra_env = r_str_split_duplist (test->env.value, ";", true);
 	}
 
-	const ut64 timeout_ms = test->timeout.set? test->timeout.value * 1000: config->timeout_ms;
+	const ut64 want = test->timeout.set? test->timeout.value * 1000: config->timeout_ms;
+	const ut64 timeout_ms = R_MAX (want, R2R_LEAK_MIN_TIMEOUT_MS);
 
 	// Run with valgrind wrapping
 	R2RProcessOutput *out = run_r2_test_with_valgrind (config, timeout_ms, 1, test->cmds.value, files, extra_args, extra_env, test->load_plugins, runner, user);

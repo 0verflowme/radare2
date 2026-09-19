@@ -6,6 +6,11 @@
 #include <r_lib.h>
 
 #define R2PM_GITURL "https://github.com/radareorg/radare2-pm"
+#define R2PM_INSTALL_R2 "\nR2PM_INSTALL_R2() {\n"
+#define R2PM_INSTALL_QJS "\nR2PM_INSTALL_QJS() {\n"
+#define R2PM_INSTALL_UNIX "\nR2PM_INSTALL() {\n"
+#define R2PM_INSTALL_WINDOWS "\nR2PM_INSTALL_WINDOWS() {\n"
+#define R2PM_UNINSTALL_R2 "\nR2PM_UNINSTALL_R2() {\n"
 
 #ifndef R2PM_STALE_DAYS
 #define R2PM_STALE_DAYS 14
@@ -16,6 +21,7 @@ static int r2pm_install(RList *targets, bool uninstall, bool clean, bool force, 
 static const char *helpmsg =
 	"Usage: r2pm [-flags] [pkgs...]\n"
 	"Commands:\n"
+	" -A                include unsupported packages in search results\n"
 	" -a [repository]   add or -delete external repository\n"
 	" -c <pkgname>      clear cached sources for the given package (see -cp)\n"
 	" -ci <pkgname>     clean + install\n"
@@ -44,6 +50,7 @@ static const char *helpmsg =
 
 typedef struct r_r2pm_t {
 	bool add;
+	bool all;
 	bool clean;
 	bool doc;
 	bool edit;
@@ -79,6 +86,9 @@ static int r2pm_missing_argument(const char *option, const char *what) {
 }
 
 static const char *r2pm_modifier_option(const R2Pm *r2pm) {
+	if (r2pm->all) {
+		return "-A";
+	}
 	if (r2pm->json) {
 		return "-j";
 	}
@@ -258,86 +268,57 @@ static char *r2pm_pkgpath(const char *file) {
 	return NULL;
 }
 
-static char *find_newline(char *s) {
-	char *r = strchr (s, '\r');
-	char *n = strchr (s, '\n');
-	if (r && n) {
-		return (r < n)? r: n;
+static char *r2pm_parse(char *data, const char *token, R2pmTokenType type) {
+	r_str_normalize_newlines (data);
+	const char *begin = strstr (data, token);
+	if (!begin) {
+		return NULL;
 	}
-	return r? r: n;
+	begin += strlen (token);
+	const char *end = NULL;
+	switch (type) {
+	case TT_TEXTLINE:
+	case TT_TEXTLINE_LIST:
+		end = strchr (begin, '\n');
+		end = end? end: begin + strlen (begin);
+		if (type == TT_TEXTLINE) {
+			begin = r_str_trim_head_ro (begin);
+			if (*begin == '"') {
+				begin++;
+			}
+			if (end > begin && end[-1] == '"') {
+				end--;
+			} else if (begin > end) {
+				begin = end;
+			}
+		}
+		return r_str_ndup (begin, end - begin);
+	case TT_ENDQUOTE:
+		begin = strchr (begin, '\n');
+		begin = begin? begin + 1: NULL;
+		end = "\n\"\n";
+		break;
+	case TT_CODEBLOCK:
+		end = "\n}\n";
+		break;
+	}
+	if (begin && end) {
+		const char *eoc = strstr (begin, end);
+		if (eoc) {
+			return r_str_ndup (begin, eoc - begin);
+		}
+		R_LOG_ERROR ("Cannot find end of thing");
+	}
+	return NULL;
 }
+
 static char *r2pm_get(const char *file, const char *token, R2pmTokenType type) {
-	char *res = NULL;
 	char *dbdir = r2pm_dbdir ();
 	char *path = r_str_newf ("%s/%s", dbdir, file);
 	free (dbdir);
 	char *data = r_file_slurp (path, NULL);
 	free (path);
-	if (!data) {
-		return NULL;
-	}
-	const char *needle = token; // "\nR2PM_DESC ";
-	char *descptr = strstr (data, needle);
-	if (descptr) {
-		char *nl = NULL;
-		switch (type) {
-		case TT_TEXTLINE:
-			descptr += strlen (needle);
-			nl = find_newline (descptr);
-			if (nl) {
-				*nl = 0;
-				if (nl > descptr) {
-					nl--;
-					if (*nl == '"') {
-						*nl = 0;
-					}
-				}
-			}
-			descptr = (char *)r_str_trim_head_ro (descptr);
-			if (*descptr == '"') {
-				descptr++;
-			}
-			res = strdup (descptr);
-			break;
-		case TT_TEXTLINE_LIST:
-			descptr += strlen (needle);
-			nl = find_newline (descptr);
-			if (nl) {
-				*nl = 0;
-			}
-			res = strdup (descptr);
-			break;
-		case TT_ENDQUOTE:
-			nl = find_newline (descptr + strlen (token));
-			if (nl) {
-				char *begin = nl + 1;
-				char *eoc = strstr (begin, "\n\"\n"); // windows have \r\n
-				if (eoc) {
-					res = r_str_ndup (begin, eoc - begin);
-					free (data);
-					return res;
-				}
-				R_LOG_ERROR ("Cannot find end of thing");
-				free (data);
-				return NULL;
-			}
-			break;
-		case TT_CODEBLOCK:
-			{
-				char *begin = descptr + strlen (token);
-				char *eoc = strstr (begin, "\n}\n");
-				if (eoc) {
-					char *res = r_str_ndup (begin, eoc - begin);
-					free (data);
-					return res;
-				}
-				R_LOG_ERROR ("Cannot find end of thing");
-				free (data);
-				return NULL;
-			}
-			break;
-		}
-	}
+	char *res = data? r2pm_parse (data, token, type): NULL;
 	free (data);
 	return res;
 }
@@ -368,10 +349,6 @@ static void r2pm_upgrade(bool force) {
 #else
 	R_LOG_INFO ("Auto upgrade feature is not yet supported on windows");
 #endif
-}
-
-static char *r2pm_desc(const char *file) {
-	return r2pm_get (file, "\nR2PM_DESC ", TT_TEXTLINE);
 }
 
 static char *r2pm_list(int mode) {
@@ -721,11 +698,77 @@ static bool r2pm_have_builddir(const char *pkg) {
 	return false;
 }
 
+static char *r2pm_source_dir(const char *srcdir, const char *pkg) {
+	char *pkgdir = r_file_new (srcdir, pkg, NULL);
+	char *dirname = r2pm_get (pkg, "\nR2PM_DIR ", TT_TEXTLINE);
+	if (dirname) {
+		char *dir = r_file_new (pkgdir, dirname, NULL);
+		free (pkgdir);
+		pkgdir = dir;
+	}
+	free (dirname);
+	return pkgdir;
+}
+
+static int r2pm_run_r2script(const char *script, const char *dir) {
+	char *scriptfile = NULL;
+	int fd = r_file_mkstemp ("r2pm", &scriptfile);
+	if (fd == -1) {
+		R_LOG_ERROR ("Cannot create temporary r2 script");
+		return 1;
+	}
+	size_t script_len = strlen (script);
+	bool written = script_len <= INT_MAX
+		&& r_sandbox_write (fd, (const ut8 *)script, (int)script_len) == (int)script_len;
+	r_sandbox_close (fd);
+	if (!written) {
+		R_LOG_ERROR ("Cannot write temporary r2 script");
+		r_file_rm (scriptfile);
+		free (scriptfile);
+		return 1;
+	}
+	char *r2 = r_file_path ("radare2");
+	char *er2 = r2? r_str_escape_sh (r2): NULL;
+	char *escript = r_str_escape_sh (scriptfile);
+	char *cwd = dir? r_sys_getdir (): NULL;
+	bool changed_dir = !dir || (cwd && r_sys_chdir (dir));
+	int res = 1;
+	if (!changed_dir) {
+		R_LOG_ERROR ("Cannot enter directory: %s", dir);
+	} else if (er2 && escript) {
+		res = r_sys_cmdf ("\"%s\" -NNQ -i \"%s\" --", er2, escript);
+	} else {
+		R_LOG_ERROR ("Cannot find radare2 in PATH");
+	}
+	if (cwd && !r_sys_chdir (cwd)) {
+		R_LOG_WARN ("Cannot restore directory: %s", cwd);
+	}
+	r_file_rm (scriptfile);
+	free (cwd);
+	free (escript);
+	free (er2);
+	free (r2);
+	free (scriptfile);
+	return res;
+}
+
 // looks copypaste with r2pm_install_pkg ()
 static int r2pm_uninstall_pkg(const char *pkg, bool global) {
 	R_LOG_INFO ("Uninstalling %s", pkg);
 	char *srcdir = r2pm_gitdir ();
 	const bool have_builddir = r2pm_have_builddir (pkg);
+	char *r2script = r2pm_get (pkg, R2PM_UNINSTALL_R2, TT_CODEBLOCK);
+	if (r2script) {
+		char *pkgdir = have_builddir? r2pm_source_dir (srcdir, pkg): NULL;
+		int res = r2pm_run_r2script (r2script, pkgdir);
+		if (res == 0) {
+			r2pm_unregister (pkg);
+		}
+		free (pkgdir);
+		free (r2script);
+		free (srcdir);
+		return res;
+	}
 #if R2__WINDOWS__
 	char *script = r2pm_get (pkg, "\nR2PM_UNINSTALL_WINDOWS() {\n", TT_CODEBLOCK);
 	if (!script) {
@@ -823,11 +866,14 @@ static int r2pm_clone(const char *pkg) {
 	free (pkgdir);
 
 #if R2__WINDOWS__
-	char *script = r2pm_get (pkg, "\nR2PM_INSTALL_WINDOWS() {\n", TT_CODEBLOCK);
+	char *script = r2pm_get (pkg, R2PM_INSTALL_WINDOWS, TT_CODEBLOCK);
 	if (!script) {
-		R_LOG_ERROR ("This package does not have R2PM_INSTALL_WINDOWS instructions");
-		free (srcdir);
-		return 1;
+		script = r2pm_get (pkg, R2PM_INSTALL_R2, TT_CODEBLOCK);
+		if (!script) {
+			R_LOG_ERROR ("This package does not have R2PM_INSTALL_WINDOWS or R2PM_INSTALL_R2 instructions");
+			free (srcdir);
+			return 1;
+		}
 	}
 	free (script);
 #endif
@@ -1018,10 +1064,22 @@ static int r2pm_install_pkg(const char *pkg, bool clean, bool global) {
 	}
 	char *srcdir = r2pm_gitdir ();
 	R_LOG_DEBUG ("Entering %s", srcdir);
+	char *r2script = r2pm_get (pkg, R2PM_INSTALL_R2, TT_CODEBLOCK);
+	if (r2script) {
+		char *pkgdir = have_builddir? r2pm_source_dir (srcdir, pkg): NULL;
+		int res = r2pm_run_r2script (r2script, pkgdir);
+		if (res == 0) {
+			r2pm_register (pkg, global);
+		}
+		free (pkgdir);
+		free (r2script);
+		free (srcdir);
+		return res;
+	}
 	char *qjs_script = r2pm_get (pkg, "\nR2PM_INSTALL_QJS() {\n", TT_CODEBLOCK);
+#if WANT_QJS && R2__UNIX__ && !defined(__wasi__)
 	if (qjs_script) {
 		int res = 0;
-#if R2__UNIX__ && !defined(__wasi__)
 		const char *const argv[5] = {
 			"radare2", "-j", "-e", qjs_script, NULL
 		};
@@ -1039,15 +1097,13 @@ static int r2pm_install_pkg(const char *pkg, bool clean, bool global) {
 			execv (argv[0], (char *const *)argv);
 			exit (1);
 		}
-#else
-		R_LOG_WARN ("r2pm.qjs support is experimental");
-		res = 1;
-#endif
-		// run script!
 		free (qjs_script);
 		free (srcdir);
 		return res;
 	}
+#else
+	free (qjs_script);
+#endif
 #if R2__WINDOWS__
 	char *script = r2pm_get (pkg, "\nR2PM_INSTALL_WINDOWS() {\n", TT_CODEBLOCK);
 	if (!script) {
@@ -1055,7 +1111,6 @@ static int r2pm_install_pkg(const char *pkg, bool clean, bool global) {
 		free (srcdir);
 		return 1;
 	}
-	script = r_str_replace_all (script, "\r\n", " & ");
 	script = r_str_replace_all (script, "\n", " & ");
 
 	char *dirname = r2pm_get (pkg, "\nR2PM_DIR ", TT_TEXTLINE);
@@ -1248,13 +1303,21 @@ static bool is_valid_package(const char *dbdir, const char *pkg) {
 	if (*pkg == '.') {
 		return false;
 	}
-	char *script = r2pm_get (pkg, "\nR2PM_INSTALL() {\n", TT_CODEBLOCK);
-	if (!script) {
-		R_LOG_DEBUG ("Unable to find R2PM_INSTALL script in '%s'", pkg);
-		return false;
+	char *path = r_file_new (dbdir, pkg, NULL);
+	char *data = r_file_slurp (path, NULL);
+	free (path);
+	if (data) {
+		r_str_normalize_newlines (data);
 	}
-	free (script);
-	return true;
+	bool valid = data && (strstr (data, R2PM_INSTALL_R2)
+		|| strstr (data, R2PM_INSTALL_QJS)
+		|| strstr (data, R2PM_INSTALL_UNIX)
+		|| strstr (data, R2PM_INSTALL_WINDOWS));
+	if (!valid) {
+		R_LOG_DEBUG ("Unable to find an R2PM_INSTALL script in '%s'", pkg);
+	}
+	free (data);
+	return valid;
 }
 
 static int count_available(void) {
@@ -1297,11 +1360,55 @@ static int r2pm_info(void) {
 	return 0;
 }
 
-static char *r2pm_search(const char *grep, int mode) {
+static const char *r2pm_platform(char **env) {
+	*env = r_sys_getenv ("R2PM_PLATFORM");
+	if (R_STR_ISNOTEMPTY (*env)) {
+		return *env;
+	}
+	free (*env);
+	*env = NULL;
+#if R2__WINDOWS__
+	return "r2 windows";
+#elif defined(__wasi__) || defined(__EMSCRIPTEN__)
+#if WANT_QJS
+	return "r2 qjs";
+#else
+	return "r2";
+#endif
+#elif R2__UNIX__
+#if WANT_QJS
+	return "r2 unix qjs";
+#else
+	return "r2 unix";
+#endif
+#else
+	return "r2";
+#endif
+}
+
+static bool r2pm_pkg_supported(const char *data) {
+	char *env = NULL;
+	const char *platform = r2pm_platform (&env);
+	if (!platform) {
+		return false;
+	}
+	bool supported = (r_str_cmp_list (platform, "r2", ' ') && strstr (data, R2PM_INSTALL_R2))
+		|| (r_str_cmp_list (platform, "unix", ' ') && strstr (data, R2PM_INSTALL_UNIX))
+		|| (r_str_cmp_list (platform, "windows", ' ') && strstr (data, R2PM_INSTALL_WINDOWS))
+		|| (r_str_cmp_list (platform, "qjs", ' ') && strstr (data, R2PM_INSTALL_QJS))
+		|| (r_str_cmp_list (platform, "any", ' ') && (strstr (data, R2PM_INSTALL_R2)
+			|| strstr (data, R2PM_INSTALL_UNIX)
+			|| strstr (data, R2PM_INSTALL_WINDOWS)
+			|| strstr (data, R2PM_INSTALL_QJS)));
+	free (env);
+	return supported;
+}
+
+static char *r2pm_search(const char *grep, int mode, bool all) {
 	char *path = r2pm_dbdir ();
 	RList *files = r_sys_dir (path);
-	free (path);
 	if (!files) {
+		free (path);
 		return NULL;
 	}
 	RListIter *iter;
@@ -1315,27 +1422,49 @@ static char *r2pm_search(const char *grep, int mode) {
 		sb = r_strbuf_new ("");
 	}
 	r_list_foreach (files, iter, file) {
-		if (*file != '.') {
-			bool match = R_STR_ISEMPTY (grep) || r_str_casestr (file, grep);
-			char *desc = r2pm_desc (file);
-			if (desc) {
-				if (match || r_str_casestr (desc, grep)) {
-					if (pj) {
-						pj_o (pj);
-						pj_ks (pj, "name", file);
-						pj_ks (pj, "desc", desc);
-						pj_end (pj);
-					} else {
-						r_strbuf_appendf (sb, "%s", file);
-						r_strbuf_pad (sb, ' ', 20 - strlen (file));
-						r_strbuf_appendf (sb, "%s\n", desc);
-					}
+		if (*file == '.') {
+			continue;
+		}
+		char *pkgpath = r_file_new (path, file, NULL);
+		char *data = r_file_slurp (pkgpath, NULL);
+		free (pkgpath);
+		char *desc = data? r2pm_parse (data, "\nR2PM_DESC ", TT_TEXTLINE): NULL;
+		if (!desc || (R_STR_ISNOTEMPTY (grep) && !r_str_casestr (file, grep) && !r_str_casestr (desc, grep))) {
+			free (desc);
+			free (data);
+			continue;
+		}
+		bool supported = r2pm_pkg_supported (data);
+		if (all || supported) {
+			if (pj) {
+				pj_o (pj);
+				pj_ks (pj, "name", file);
+				pj_ks (pj, "desc", desc);
+				pj_ka (pj, "platforms");
+				if (strstr (data, R2PM_INSTALL_R2)) {
+					pj_s (pj, "r2");
 				}
-				free (desc);
+				if (strstr (data, R2PM_INSTALL_WINDOWS)) {
+					pj_s (pj, "windows");
+				}
+				if (strstr (data, R2PM_INSTALL_UNIX)) {
+					pj_s (pj, "unix");
+				}
+				if (strstr (data, R2PM_INSTALL_QJS)) {
+					pj_s (pj, "qjs");
+				}
+				pj_end (pj);
+				pj_kb (pj, "supported", supported);
+				pj_end (pj);
+			} else {
+				r_strbuf_appendf (sb, "%-20s%s%s\n", file, supported? "": "[unsupported] ", desc);
 			}
 		}
+		free (desc);
+		free (data);
 	}
 	r_list_free (files);
+	free (path);
 	if (pj) {
 		pj_end (pj);
 		return pj_drain (pj);
@@ -1364,6 +1493,7 @@ static void r2pm_envhelp(void) {
 	"MAKE=make              # path to the GNU MAKE executable\n"
 	"R2PM_OFFLINE=%d         # don't git pull\n"
 	"R2PM_TIME=YYYY-MM-DD\n"
+	"R2PM_PLATFORM=          # r2, unix, windows, qjs or any (overrides the search filter)\n"
 	"R2PM_PLUGDIR=%s\n"
 	"R2PM_PLUGDIR=%s (global)\n"
 	"R2PM_PREFIX=%s\n"
@@ -1456,7 +1586,7 @@ R_API int r_main_r2pm(int argc, const char **argv) {
 		0
 	};
 	RGetopt opt;
-	r_getopt_init (&opt, argc, argv, "aqecdiIjhH:flgrRpst:uUv");
+	r_getopt_init (&opt, argc, argv, "AaqecdiIjhH:flgrRpst:uUv");
 	int i, c;
 	bool action = false;
 	// -H option without argument
@@ -1467,6 +1597,9 @@ R_API int r_main_r2pm(int argc, const char **argv) {
 	}
 	while ((c = r_getopt_next (&opt)) != -1) {
 		switch (c) {
+		case 'A':
+			r2pm.all = true;
+			break;
 		case 'a':
 			r2pm.add = true;
 			action = true;
@@ -1640,14 +1773,14 @@ R_API int r_main_r2pm(int argc, const char **argv) {
 		res = r2pm_clean (targets);
 	}
 	if (r2pm.search) {
-		char *s = r2pm_search (argv[opt.ind], r2pm.json? 'j': 0);
+		char *s = r2pm_search (argv[opt.ind], r2pm.json? 'j': 0, r2pm.all);
 		if (s) {
 			if (*s) {
 				r_cons_print (cons, s);
 				if (own_cons) {
 					r_cons_flush (cons);
 				}
-				res = 0;
+				res = r2pm.json && !strcmp (s, "[]");
 			} else {
 				res = 1;
 			}

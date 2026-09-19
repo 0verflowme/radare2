@@ -118,6 +118,80 @@ static bool test_anal_save_base_type_struct(void) {
 	mu_end;
 }
 
+static bool test_anal_base_type_struct_member_needing_sanitization_roundtrip(void) {
+	RAnal *anal = r_anal_new ();
+	mu_assert_notnull (anal, "Couldn't create new RAnal");
+
+	// A member name that sdb keys cannot hold verbatim. DWARF produces these
+	// for C++ vtable pointers, e.g. "_vptr.Bird".
+	RAnalBaseType *base = r_anal_base_type_new (R_ANAL_BASE_TYPE_KIND_STRUCT);
+	base->name = strdup ("Bird");
+
+	RAnalStructMember member = {
+		.offset = 0,
+		.type = strdup ("int (**)()"),
+		.name = strdup ("_vptr.Bird")
+	};
+	RVecAnalTypeMember_push_back (&base->struct_data.members, &member);
+
+	r_anal_save_base_type (anal, base);
+	r_anal_base_type_free (base);
+
+	// The member list has to name the member by the key that addresses it,
+	// otherwise the reader looks up a key that was never written and the whole
+	// type becomes unreadable.
+	mu_assert_streq (sdb_const_get (anal->sdb_types, "struct.Bird", 0), "_vptr_Bird",
+		"member list names the sanitized key");
+	mu_assert_notnull (sdb_const_get (anal->sdb_types, "struct.Bird._vptr_Bird", 0),
+		"member is stored under the sanitized key");
+
+	RAnalBaseType *got = r_anal_get_base_type (anal, "Bird");
+	mu_assert_notnull (got, "reload struct whose member name needed sanitization");
+	mu_assert_eq (RVecAnalTypeMember_length (&got->struct_data.members), 1,
+		"member survives the round trip");
+	RAnalStructMember *m = RVecAnalTypeMember_at (&got->struct_data.members, 0);
+	mu_assert_streq (m->name, "_vptr_Bird", "member is named by its key");
+	mu_assert_streq (m->type, "int (**)()", "member type survives");
+	r_anal_base_type_free (got);
+
+	r_anal_free (anal);
+	mu_end;
+}
+
+static bool test_anal_base_type_enum_case_needing_sanitization_roundtrip(void) {
+	RAnal *anal = r_anal_new ();
+	mu_assert_notnull (anal, "Couldn't create new RAnal");
+
+	RAnalBaseType *base = r_anal_base_type_new (R_ANAL_BASE_TYPE_KIND_ENUM);
+	base->name = strdup ("Mode");
+
+	RAnalEnumCase cas = {
+		.name = strdup ("Mode.One"),
+		.val = 1
+	};
+	RVecAnalEnumCase_push_back (&base->enum_data.cases, &cas);
+
+	r_anal_save_base_type (anal, base);
+	r_anal_base_type_free (base);
+
+	mu_assert_streq (sdb_const_get (anal->sdb_types, "enum.Mode", 0), "Mode_One",
+		"case list names the sanitized key");
+
+	// get_enum_type treats a missing case key as fatal, so a single case name
+	// needing sanitization made the whole enum unreadable.
+	RAnalBaseType *got = r_anal_get_base_type (anal, "Mode");
+	mu_assert_notnull (got, "reload enum whose case name needed sanitization");
+	mu_assert_eq (RVecAnalEnumCase_length (&got->enum_data.cases), 1,
+		"case survives the round trip");
+	RAnalEnumCase *c = RVecAnalEnumCase_at (&got->enum_data.cases, 0);
+	mu_assert_streq (c->name, "Mode_One", "case is named by its key");
+	mu_assert_eq (c->val, 1, "case value survives");
+	r_anal_base_type_free (got);
+
+	r_anal_free (anal);
+	mu_end;
+}
+
 static bool test_anal_get_base_type_union(void) {
 	RAnal *anal = r_anal_new ();
 	mu_assert_notnull (anal, "Couldn't create new RAnal");
@@ -247,6 +321,46 @@ static bool test_anal_get_base_type_typedef(void) {
 	mu_assert_eq (R_ANAL_BASE_TYPE_KIND_TYPEDEF, base->kind, "Wrong base type");
 	mu_assert_streq (base->name, "string", "type name");
 	mu_assert_streq (base->type, "char *", "typedefd type");
+	anal->config->bits = 64;
+	mu_assert_eq (r_anal_type_bitsize (anal, "string"), 64,
+		"Pointer typedef uses the current architecture width");
+	sdb_set (anal->sdb_types, "word", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.word", "unsigned long", 0);
+	sdb_num_set (anal->sdb_types, "type.word.size", 64, 0);
+	mu_assert_eq (r_anal_type_bitsize (anal, "word"), 64,
+		"Scalar typedef uses its exact declared width");
+	sdb_set (anal->sdb_types, "cycle_a", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.cycle_a", "cycle_b", 0);
+	sdb_set (anal->sdb_types, "cycle_b", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.cycle_b", "cycle_a", 0);
+	sdb_set (anal->sdb_types, "u64", "type", 0);
+	sdb_num_set (anal->sdb_types, "type.u64.size", 64, 0);
+	sdb_set (anal->sdb_types, "myword", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.myword", "u64", 0);
+	mu_assert_eq (r_type_get_bitsize (anal->sdb_types, "myword"), 64,
+		"Typedef without a declared width measures what it aliases");
+	mu_assert_eq (r_anal_type_bitsize (anal, "cycle_a"), 0,
+		"Cyclic typedefs fail closed");
+
+	sdb_set (anal->sdb_types, "word", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.word", "unsigned long", 0);
+	sdb_num_set (anal->sdb_types, "type.word.size", 64, 0);
+	mu_assert_eq (r_type_get_bitsize (anal->sdb_types, "word"), 64,
+		"Typedef with a declared width measures that width");
+
+	sdb_set (anal->sdb_types, "u64", "type", 0);
+	sdb_num_set (anal->sdb_types, "type.u64.size", 64, 0);
+	sdb_set (anal->sdb_types, "myword", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.myword", "u64", 0);
+	mu_assert_eq (r_type_get_bitsize (anal->sdb_types, "myword"), 64,
+		"Typedef without a declared width measures what it aliases");
+
+	sdb_set (anal->sdb_types, "cycle_a", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.cycle_a", "cycle_b", 0);
+	sdb_set (anal->sdb_types, "cycle_b", "typedef", 0);
+	sdb_set (anal->sdb_types, "typedef.cycle_b", "cycle_a", 0);
+	mu_assert_eq (r_type_get_bitsize (anal->sdb_types, "cycle_a"), 0,
+		"Cyclic typedefs fail closed");
 
 	r_anal_base_type_free (base);
 	r_anal_free (anal);
@@ -630,10 +744,96 @@ static bool test_anal_cparse_multiline_fnptr(void) {
 	mu_end;
 }
 
+static bool test_anal_type_bitsize_struct_recorded(void) {
+	RAnal *anal = r_anal_new ();
+	Sdb *TDB = anal->sdb_types;
+	sdb_set (TDB, "int32_t", "type", 0);
+	sdb_num_set (TDB, "type.int32_t.size", 32, 0);
+	// an importer that knows the real width, padding included, saves it with the members
+	RAnalBaseType *base = r_anal_base_type_new (R_ANAL_BASE_TYPE_KIND_STRUCT);
+	base->name = strdup ("padded");
+	base->size = 128;
+	RAnalStructMember member = {
+		.offset = 0,
+		.type = strdup ("int32_t"),
+		.name = strdup ("a")
+	};
+	RVecAnalTypeMember_push_back (&base->struct_data.members, &member);
+	member.offset = 8;
+	member.type = strdup ("int32_t");
+	member.name = strdup ("b");
+	RVecAnalTypeMember_push_back (&base->struct_data.members, &member);
+	r_anal_save_base_type (anal, base);
+	r_anal_base_type_free (base);
+	mu_assert_eq (sdb_num_get (TDB, "type.padded.size", NULL), 128, "The struct width is saved beside its members");
+	mu_assert_eq (r_type_get_bitsize (TDB, "padded"), 128, "A recorded width wins over the member sum");
+	mu_assert_eq (r_type_get_bitsize (TDB, "struct padded"), 128, "The keyword spelling reads the same record");
+	// a re-save of what was read back keeps the width
+	base = r_anal_get_base_type (anal, "padded");
+	mu_assert_notnull (base, "The saved struct reads back");
+	mu_assert_eq (base->size, 128, "The width reads back with the members");
+	r_anal_save_base_type (anal, base);
+	r_anal_base_type_free (base);
+	mu_assert_eq (r_type_get_bitsize (TDB, "padded"), 128, "A re-save keeps the recorded width");
+	// a struct that names itself still measures when the importer recorded its width
+	sdb_set (TDB, "self", "struct", 0);
+	sdb_set (TDB, "struct.self", "inner", 0);
+	sdb_set (TDB, "struct.self.inner", "self,0,0", 0);
+	sdb_num_set (TDB, "type.self.size", 8, 0);
+	mu_assert_eq (r_type_get_bitsize (TDB, "self"), 8, "A recorded width answers for a self-naming struct");
+	// a definition without a width drops a stale record and walks the members again
+	base = r_anal_base_type_new (R_ANAL_BASE_TYPE_KIND_STRUCT);
+	base->name = strdup ("padded");
+	member.offset = 0;
+	member.type = strdup ("int32_t");
+	member.name = strdup ("a");
+	RVecAnalTypeMember_push_back (&base->struct_data.members, &member);
+	r_anal_save_base_type (anal, base);
+	r_anal_base_type_free (base);
+	mu_assert_null (sdb_const_get (TDB, "type.padded.size", NULL), "A save without a width drops the stale record");
+	mu_assert_eq (r_type_get_bitsize (TDB, "padded"), 32, "Without a record the members are measured");
+	// deleting the type drops its width too
+	sdb_num_set (TDB, "type.padded.size", 64, 0);
+	r_type_del (TDB, "padded");
+	mu_assert_null (sdb_const_get (TDB, "type.padded.size", NULL), "Deleting the struct drops its width");
+	r_anal_free (anal);
+	mu_end;
+}
+
+static bool test_anal_type_bitsize_struct_cycle(void) {
+	RAnal *anal = r_anal_new ();
+	Sdb *TDB = anal->sdb_types;
+	sdb_set (TDB, "int32_t", "type", 0);
+	sdb_num_set (TDB, "type.int32_t.size", 32, 0);
+	sdb_set (TDB, "self", "struct", 0);
+	sdb_set (TDB, "struct.self", "n,inner", 0);
+	sdb_set (TDB, "struct.self.n", "int32_t,0,0", 0);
+	sdb_set (TDB, "struct.self.inner", "self,4,0", 0);
+	mu_assert_eq (r_type_get_bitsize (TDB, "self"), 0, "A struct containing itself fails closed");
+	sdb_set (TDB, "ping", "struct", 0);
+	sdb_set (TDB, "struct.ping", "pong", 0);
+	sdb_set (TDB, "struct.ping.pong", "pong_t,0,0", 0);
+	sdb_set (TDB, "pong_t", "typedef", 0);
+	sdb_set (TDB, "typedef.pong_t", "pong", 0);
+	sdb_set (TDB, "pong", "struct", 0);
+	sdb_set (TDB, "struct.pong", "ping", 0);
+	sdb_set (TDB, "struct.pong.ping", "ping,0,0", 0);
+	mu_assert_eq (r_type_get_bitsize (TDB, "ping"), 0, "A struct cycle through a typedef fails closed");
+	sdb_set (TDB, "pair", "struct", 0);
+	sdb_set (TDB, "struct.pair", "a,b", 0);
+	sdb_set (TDB, "struct.pair.a", "int32_t,0,0", 0);
+	sdb_set (TDB, "struct.pair.b", "int32_t,4,0", 0);
+	mu_assert_eq (r_type_get_bitsize (TDB, "pair"), 64, "An acyclic struct still measures its members");
+	r_anal_free (anal);
+	mu_end;
+}
+
 int all_tests(void) {
 	mu_run_test (test_anal_get_base_type_struct);
 	mu_run_test (test_anal_save_base_type_struct);
 	mu_run_test (test_anal_base_type_struct_array_roundtrip);
+	mu_run_test (test_anal_base_type_struct_member_needing_sanitization_roundtrip);
+	mu_run_test (test_anal_base_type_enum_case_needing_sanitization_roundtrip);
 	mu_run_test (test_anal_save_base_type_struct_redefine);
 	mu_run_test (test_anal_base_type_struct_comma_type_roundtrip);
 	mu_run_test (test_anal_base_type_union_comma_type_roundtrip);
@@ -646,6 +846,8 @@ int all_tests(void) {
 	mu_run_test (test_anal_get_base_type_enum);
 	mu_run_test (test_anal_save_base_type_enum);
 	mu_run_test (test_anal_get_base_type_typedef);
+	mu_run_test (test_anal_type_bitsize_struct_cycle);
+	mu_run_test (test_anal_type_bitsize_struct_recorded);
 	mu_run_test (test_anal_save_base_type_typedef);
 	mu_run_test (test_anal_get_base_type_atomic);
 	mu_run_test (test_anal_save_base_type_atomic);

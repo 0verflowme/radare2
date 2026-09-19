@@ -779,3 +779,55 @@ EXPECT=<<EOF
 0xfffffff8
 EOF
 RUN
+
+NAME=sraw takes the low count bits ppc-32
+FILE=malloc://0x100
+ARGS=-a ppc -b 32 -e cfg.bigendian=true
+CMDS=<<EOF
+wx 7c832e30
+aei
+aeim
+ar r4=0x80000005
+ar r5=64
+aepc 0
+aes
+ar r3
+ar ca
+ar r4=0x80000005
+ar r5=32
+aepc 0
+aes
+ar r3
+ar ca
+EOF
+EXPECT=<<EOF
+0x80000005
+0x00000000
+0xffffffff
+0x00000001
+EOF
+RUN
+
+NAME=cntlzw and popcntb
+FILE=malloc://32
+ARGS=-a ppc -b 32 -e cfg.bigendian=true
+CMDS=<<EOF
+aei
+wx 7c830034
+aer r4=0x00001000
+aer pc=0
+s 0
+aes
+aer r3
+wx 7c8300f4
+aer r4=0xf0f0ff01
+aer pc=0
+s 0
+aes
+aer r3
+EOF
+EXPECT=<<EOF
+0x00000013
+0x04040801
+EOF
+RUN

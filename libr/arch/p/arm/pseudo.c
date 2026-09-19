@@ -25,7 +25,6 @@ static char *replace(int argc, const char *argv[]) {
 		{ 3, "mneg ", "# = -(# * #)", { 1, 2, 3 } },
 		{ 3, "adds", "# = # + #", { 1, 2, 3 } },
 		{ 3, "addw", "# = # + #", { 1, 2, 3 } },
-		{ 3, "add.w", "# = # + #", { 1, 2, 3 } },
 		{ 0, "adf", "# = # + #", { 1, 2, 3 } },
 		{ 0, "adrp", "# = #", { 1, 2 } },
 		{ 0, "adr", "# = #", { 1, 2 } },
@@ -39,32 +38,43 @@ static char *replace(int argc, const char *argv[]) {
 		{ 0, "b", "goto #", { 1 } },
 		{ 0, "cbz", "if (!#) goto #", { 1, 2 } },
 		{ 0, "cbnz", "if (#) goto #", { 1, 2 } },
-		{ 0, "b.w", "goto #", { 1 } },
-		{ 0, "b.gt", "if (a > b) goto #", { 1 } },
-		{ 0, "b.le", "if (a <= b) goto #", { 1 } },
-		{ 0, "b.lt", "if (a < b) goto #", { 1 } },
-		{ 0, "b.ls", "if (a < b) goto #", { 1 } },
-		{ 0, "b.ge", "if (a >= b) goto #", { 1 } },
-		{ 0, "beq lr", "ifeq ret", {0} },
-		{ 0, "beq", "je #", { 1 } },
+		// compares set v and the conditional branches test it, like x86
+		{ 0, "beq", "if (!v) goto #", { 1 } },
+		{ 0, "bne", "if (v) goto #", { 1 } },
+		{ 0, "bgt", "if (v > 0) goto #", { 1 } },
+		{ 0, "bge", "if (v >= 0) goto #", { 1 } },
+		{ 0, "blt", "if (v < 0) goto #", { 1 } },
+		{ 0, "ble", "if (v <= 0) goto #", { 1 } },
+		{ 0, "bhi", "if (((unsigned) v) > 0) goto #", { 1 } },
+		{ 0, "bhs", "if (((unsigned) v) >= 0) goto #", { 1 } },
+		{ 0, "bcs", "if (((unsigned) v) >= 0) goto #", { 1 } },
+		{ 0, "blo", "if (((unsigned) v) < 0) goto #", { 1 } },
+		{ 0, "bcc", "if (((unsigned) v) < 0) goto #", { 1 } },
+		{ 0, "bls", "if (((unsigned) v) <= 0) goto #", { 1 } },
+		{ 0, "bmi", "if (v < 0) goto #", { 1 } },
+		{ 0, "bpl", "if (v >= 0) goto #", { 1 } },
+		{ 0, "bvs", "if (overflow) goto #", { 1 } },
+		{ 0, "bvc", "if (!overflow) goto #", { 1 } },
+		{ 0, "bal", "goto #", { 1 } },
+		{ 0, "bnv", "goto #", { 1 } },
 		{ 0, "call", "# ()", { 1 } },
 		{ 0, "bl", "# ()", { 1 } },
 		{ 0, "blx", "# ()", { 1 } },
 		{ 0, "bx lr", "ret", {0} },
 		{ 1, "br", "switch #", { 1 } },
-		{ 0, "bxeq", "je #", { 1 } },
-		{ 0, "b.eq", "if (eq) goto #", { 1 } },
-		{ 0, "b.ne", "if (eq) goto #", { 1 } },
-		{ 0, "b.hi", "goto ifgt #", { 1 } },
-		{ 0, "b.lo", "goto iflt #", { 1 } },
+		{ 0, "bxeq", "if (!v) goto #", { 1 } },
 		{ 0, "cmf", "if (# == #)", { 1, 2 } },
-		{ 0, "cmn", "if (# != #)", { 1, 2 } },
-		{ 0, "cmp", "(a, b) = compare (#, #)", { 1, 2 } },
-		{ 0, "fcmp", "(a, b) = compare (#, #)", { 1, 2 } },
-		{ 0, "tst", "(a, b) = compare (#, #)", { 1, 2 } },
-		// { 0, "cmp", "if (# == #)", { 1, 2 } },
-		// { 0, "fcmp", "if (# == #)", { 1, 2 } },
-		//{ 0, "tst", "if ((# & #) == 0)", { 1, 2 } },
+		// the third operand is a shift or extend of the second: keep it visible
+		{ 2, "cmn", "v = # + #", { 1, 2 } },
+		{ 3, "cmn", "v = # + (# #)", { 1, 2, 3 } },
+		{ 2, "cmp", "v = # - #", { 1, 2 } },
+		{ 3, "cmp", "v = # - (# #)", { 1, 2, 3 } },
+		{ 2, "fcmp", "v = # - #", { 1, 2 } },
+		{ 2, "fcmpe", "v = # - #", { 1, 2 } },
+		{ 2, "teq", "v = # ^ #", { 1, 2 } },
+		{ 3, "teq", "v = # ^ (# #)", { 1, 2, 3 } },
+		{ 2, "tst", "v = # & #", { 1, 2 } },
+		{ 3, "tst", "v = # & (# #)", { 1, 2, 3 } },
 		{ 4, "csel", "# = (#)? # : #", { 1, 4, 2, 3 } },
 		{ 2, "cset", "# = (#)? 1 : 0", { 1, 2 } },
 		{ 0, "dvf", "# = # / #", { 1, 2, 3 } },
@@ -89,7 +99,6 @@ static char *replace(int argc, const char *argv[]) {
 		{ 3, "ldruh", "# = (uword) # + #", { 1, 2, 3 } },
 		{ 2, "ldrb", "# = (byte) #", { 1, 2 } },
 		{ 3, "ldrb", "# = (byte) # + #", { 1, 2, 3 } },
-		{ 2, "ldr.w", "# = #", { 1, 2 } },
 		{ 4, "ldrsb", "# = (byte) # + #", { 1, 2, 3 } },
 		{ 3, "ldrsb", "# = (byte) # + #", { 1, 2, 3 } },
 		{ 2, "ldrsb", "# = (byte) #", { 1, 2 } },
@@ -98,7 +107,6 @@ static char *replace(int argc, const char *argv[]) {
 		{ 3, "ldrsw", "# = # + #", { 1, 2, 3 } },
 		{ 3, "ldr", "# = # + #", { 1, 2, 3 } },
 		{ 3, "ldrb", "# = (byte) # + #", { 1, 2, 3 } },
-		{ 3, "ldr.w", "# = # + #", { 1, 2, 3 } },
 		{ 0, "mov", "# = #", { 1, 2 } },
 		{ 0, "fmov", "# = #", { 1, 2 } },
 		{ 0, "mvn", "# = ~#", { 1, 2 } },
@@ -131,7 +139,6 @@ static char *replace(int argc, const char *argv[]) {
 		{ 0, "orr", "# = # | #", { 1, 2, 3 } },
 		{ 2, "orr", "# |= #", { 1, 2 } },
 		{ 0, "rmf", "# = # % #", { 1, 2, 3 } },
-		{ 0, "bge", "(>=) goto #", { 1 } },
 		{ 0, "sbc", "# = # - #", { 1, 2, 3 } },
 		{ 0, "sqt", "# = sqrt(#)", { 1, 2 } },
 		{ 0, "lsrs", "# = # >> #", { 1, 2, 3 } },
@@ -139,18 +146,14 @@ static char *replace(int argc, const char *argv[]) {
 		{ 1, "blr", "callreg #", { 1 } },
 		{ 0, "lsr", "# = # >> #", { 1, 2, 3 } },
 		{ 0, "lsl", "# = # << #", { 1, 2, 3 } },
-		{ 0, "lsr.w", "# = # >> #", { 1, 2, 3 } },
-		{ 0, "lsl.w", "# = # << #", { 1, 2, 3 } },
 		{ 3, "stxr", "# = #", { 3, 2 } }, // stxr w10, x9, [x8] (w10 is 0 or 1 if exclusively locked)
 		{ 3, "stlxr", "# = #", { 3, 2 } },
 		{ 2, "str", "# = #", { 2, 1 } },
 		{ 2, "strb", "# = (byte) #", { 2, 1 } },
 		{ 2, "strh", "# = (half) #", { 2, 1 } },
-		{ 2, "strh.w", "# = (half) #", { 2, 1 } },
 		{ 3, "str", "# + # = #", { 2, 3, 1 } },
 		{ 3, "strb", "# + # = (byte) #", { 2, 3, 1 } },
 		{ 3, "strh", "# + # = (half) #", { 2, 3, 1 } },
-		{ 3, "strh.w", "# + # = (half) #", { 2, 3, 1 } },
 		{ 3, "sub", "# = # - #", { 1, 2, 3 } },
 		{ 3, "subs", "# = # - #", { 1, 2, 3 } },
 		{ 3, "fsub", "# = # - #", { 1, 2, 3 } },
@@ -164,23 +167,28 @@ static char *replace(int argc, const char *argv[]) {
 		{ 0, "vmov", "# = (float) # . #", { 1, 2, 3 } },
 		{ 0, "vdiv.f64", "# = (float) # / #", { 1, 2, 3 } },
 		{ 0, "addw", "# = # + #", { 1, 2, 3 } },
-		{ 0, "sub.w", "# = # - #", { 1, 2, 3 } },
-		{ 0, "tst.w", "if ((# & #) == 0)", { 1, 2 } },
-		{ 0, "pop.w", "pop #", { 1 } },
+		{ 0, "pop", "pop #", { 1 } },
 		{ 0, "vpop", "pop #", { 1 } },
 		{ 0, "paciza", "", { 1 } },
 		{ 0, "vpush", "push #", { 1 } },
-		{ 0, "push.w", "push #", { 1 } },
+		{ 0, "push", "push #", { 1 } },
 		{ 0, NULL }
 	};
 	RStrBuf *sb = r_strbuf_new ("");
+	// thumb wide/narrow (bne.w, beq.n) and arm64 b.cond (b.ne) share the arm rows
+	char mn[32];
+	r_str_ncpy (mn, argv[0], sizeof (mn));
+	if (r_str_endswith (mn, ".w") || r_str_endswith (mn, ".n")) {
+		mn[strlen (mn) - 2] = 0;
+	}
+	if (r_str_startswith (mn, "b.")) {
+		memmove (mn + 1, mn + 2, strlen (mn + 1));
+	}
 	for (i = 0; ops[i].op; i++) {
-		if (ops[i].narg) {
-			if (argc - 1 != ops[i].narg) {
-				continue;
-			}
+		if (ops[i].narg && argc - 1 != ops[i].narg) {
+			continue;
 		}
-		if (!strcmp (ops[i].op, argv[0])) {
+		if (!strcmp (ops[i].op, mn)) {
 			d = 0;
 			j = 0;
 			ch = ops[i].str[j];
@@ -404,6 +412,40 @@ static char *mount_oldstr(RParse* p, const char *reg, st64 delta, bool ucase) {
 		}
 	}
 	return oldstr;
+}
+
+// The variable analysis records ESIL/profile register names for each access
+// (arm64 spells the frame pointer "fp"), but the disassembler prints the
+// architectural name ("x29"). They alias the same storage, so map a recorded
+// stack/frame register onto the role-alias spelling the disassembler emits so
+// the operand text matches during substitution.
+static const char *disasm_reg_spelling(RReg *rreg, const char *reg) {
+	if (!rreg || !reg) {
+		return reg;
+	}
+	RRegItem *have = r_reg_get (rreg, reg, -1);
+	if (!have) {
+		return reg;
+	}
+	const char *out = reg;
+	const int roles[] = { R_REG_ALIAS_BP, R_REG_ALIAS_SP };
+	size_t i;
+	for (i = 0; i < sizeof (roles) / sizeof (roles[0]); i++) {
+		const char *alias = rreg->alias[roles[i]];
+		if (!alias || !strcmp (alias, reg)) {
+			continue;
+		}
+		RRegItem *ai = r_reg_get (rreg, alias, -1);
+		if (ai && ai->arena == have->arena && ai->offset == have->offset && ai->size == have->size) {
+			out = alias;
+		}
+		r_unref (ai);
+		if (out != reg) {
+			break;
+		}
+	}
+	r_unref (have);
+	return out;
 }
 
 static char *r_core_hack_arm64(RAsmPluginSession *s, RAnalOp *aop, const char *op) {
@@ -678,6 +720,19 @@ static char *subvar(RAsmPluginSession *s, RAnalFunction *f, ut64 addr, int oplen
 		bool ucase = isupper (*tstr);
 		RAnalVarField *var;
 		bool is64 = f->bits == 64;
+		// On arm64 the frame pointer (x29) aliases BP. Locals recovered as
+		// stack-pointer vars are routinely addressed through it (`[x29, -N]`),
+		// so the sp-var pass must fire on frame-pointer-spelled accesses too,
+		// not just literal `[sp` text.
+		const char *bpalias = anal->reg->alias[R_REG_ALIAS_BP];
+		char bpbrk[32] = {0};
+		if (is64 && bpalias) {
+			snprintf (bpbrk, sizeof (bpbrk), "[%s", bpalias);
+		}
+		// Only a bracketed `[x29` is a memory access through the frame pointer;
+		// the bare register name also appears in its setup (`add x29, sp, #N`),
+		// which must not be var-substituted.
+		const bool fp_access = bpbrk[0] && strstr (tstr, bpbrk);
 		// NOTE: on arm32 bp is fp
 		if ((is64 && strstr (tstr, "[bp")) || !is64) {
 			r_list_foreach (bpargs, iter, var) {
@@ -696,6 +751,7 @@ static char *subvar(RAsmPluginSession *s, RAnalFunction *f, ut64 addr, int oplen
 				if (!reg) {
 					reg = anal->reg->alias[R_REG_ALIAS_BP];
 				}
+				reg = disasm_reg_spelling (anal->reg, reg);
 				oldstr = mount_oldstr (p, reg, delta, ucase);
 				if (strstr (tstr, oldstr)) {
 					tstr = subs_var_string (p, var, tstr, oldstr, reg, delta);
@@ -705,7 +761,7 @@ static char *subvar(RAsmPluginSession *s, RAnalFunction *f, ut64 addr, int oplen
 				free (oldstr);
 			}
 		}
-		if ((is64 && strstr (tstr, "[sp")) || !is64) {
+		if ((is64 && (strstr (tstr, "[sp") || fp_access)) || !is64) {
 			r_list_foreach (spargs, iter, var) {
 				st64 delta;
 				if (is64) {
@@ -738,11 +794,16 @@ static char *subvar(RAsmPluginSession *s, RAnalFunction *f, ut64 addr, int oplen
 				}
 				const char *reg = NULL;
 				if (p->get_reg_at) {
-					reg = p->get_reg_at (f, delta, addr);
+					// Look up the register recorded for this access by the
+					// var's own delta; `delta` above is the access displacement
+					// and never matches a var identity, so passing it here fell
+					// back to SP and lost frame-pointer (`x29`) accesses.
+					reg = p->get_reg_at (f, var->delta, addr);
 				}
 				if (!reg) {
 					reg = anal->reg->alias[R_REG_ALIAS_SP];
 				}
+				reg = disasm_reg_spelling (anal->reg, reg);
 				oldstr = mount_oldstr (p, reg, delta, ucase);
 				if (strstr (tstr, oldstr)) {
 					tstr = subs_var_string (p, var, tstr, oldstr, reg, delta);

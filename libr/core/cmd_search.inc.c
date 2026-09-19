@@ -102,7 +102,7 @@ static RCoreHelpMessage help_msg_slash = {
 	"/c", "[?][adr]", "search for crypto materials",
 	"/d", " 101112", "search for a deltified sequence of bytes",
 	"/e", " /E.F/i", "match regular expression",
-	"/E", " esil-expr", "address matching given esil expressions $$ = here",
+	"/E", " esil-expr", "address matching esil expression $$ = here",
 	"/f", "", "search forwards, (command modifier)",
 	"/F", " file [off] [sz]", "search contents of file with offset and size",
 	"/g", "[?RCJ] [op;op]", "search for ROP/COP/JOP gadgets matching given opstr",
@@ -214,7 +214,7 @@ static RCoreHelpMessage help_msg_slash_r = {
 	"/r", " [addr ..]", "search all references or limit them to the given addresses",
 	"/ra", " [addr ..]", "search all references or limit them to the given addresses",
 	"/rc", " [addr ..]", "search call references or limit them to the given addresses",
-	"/re", " [addr ..]", "search references using esil or limit them to the given addresses",
+	"/re", " [addr ..]", "search references using esil or limit them to given addresses",
 	"/rr", "", "find read references",
 	"/ru", "[*qj]", "search for UDS CAN database tables (binbloom)",
 	"/rw", "", "find write references",
@@ -906,20 +906,20 @@ R_API RList *r_core_get_boundaries_prot(RCore *core, R_UNUSED int perm, const ch
 		perm = R_PERM_RWX;
 	}
 	if (!strcmp (mode, "flag")) {
-		const RList *ls = r_flag_get_list (core->flags, core->addr);
+		const RVecFlagItemPtr *ls = r_flag_get_vec (core->flags, core->addr);
 		RFlagItem *fi;
-		RListIter *iter;
-		r_list_foreach (ls, iter, fi) {
+		RFlagItem **iter;
+		r_flag_item_vec_foreach (ls, iter, fi) {
 			if (fi->size > 1) {
 				append_bound (list, core->io, search_itv, fi->addr, fi->size, 7);
 			}
 		}
 	} else if (r_str_startswith (mode, "flag:")) {
 		const char *match = mode + 5;
-		const RList *ls = r_flag_get_list (core->flags, core->addr);
+		const RVecFlagItemPtr *ls = r_flag_get_vec (core->flags, core->addr);
 		RFlagItem *fi;
-		RListIter *iter;
-		r_list_foreach (ls, iter, fi) {
+		RFlagItem **iter;
+		r_flag_item_vec_foreach (ls, iter, fi) {
 			if (fi->size > 1 && r_str_glob (fi->name, match)) {
 				append_bound (list, core->io, search_itv, fi->addr, fi->size, 7);
 			}

@@ -129,12 +129,14 @@ static inline void r_bin_object_drop_strings_db(RBinObject *bo) {
 R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 baseaddr, ut64 loadaddr, ut64 offset, ut64 sz);
 R_IPI RBinObject *r_bin_object_get_cur(RBin *bin);
 R_IPI RBinObject *r_bin_object_find_by_arch_bits(RBinFile *binfile, const char *arch, int bits, const char *name);
-R_IPI RRBTree *r_bin_object_patch_relocs(RBinFile *binfile, RBinObject *o);
+R_IPI RVecRBinReloc *r_bin_object_patch_relocs(RBinFile *binfile, RBinObject *o);
 
 R_IPI bool r_bin_name_is_unnamed(const char *name);
 
-R_IPI const char *r_bin_lang_tostring(int lang);
-R_IPI int r_bin_lang_type(RBinFile *binfile, const char *def, const char *sym);
+R_IPI const char *r_bin_lang_tostring(RBinLanguage lang);
+R_IPI RBinLanguage r_bin_lang_type(RBinFile *binfile, const char *def, const char *sym);
+R_IPI RBinLanguage r_bin_lang_from_symbol_name(const char *sym);
+R_IPI void r_bin_register_symbol_language(RBinFile *binfile, RBinSymbol *symbol);
 R_IPI bool r_bin_lang_rustv0(const char *sym);
 R_IPI bool r_bin_lang_swift(RBinFile *binfile);
 
@@ -144,5 +146,10 @@ R_IPI void r_bin_class_add_field(RBinFile *binfile, const char *classname, const
 
 R_IPI RBinFile *r_bin_file_xtr_load(RBin *bin, RBinXtrPlugin *xtr, const char *filename, RBuffer *buf, ut64 baseaddr, ut64 loadaddr, int idx, int fd, int rawstr);
 R_IPI RBinFile *r_bin_file_new_from_buffer(RBin *bin, const char *file, RBuffer *buf, RBinFileOptions *opt);
+
+// parse the Itanium C++ ABI LSDA at lsda_addr filling result with RBinTrycatch entries
+R_IPI void r_bin_dwarf_parse_lsda(RBinFile *bf, RVecRBinTrycatch *result, ut64 fcn_addr, ut64 lsda_addr);
+// walk the FDEs in the eh_frame section parsing the LSDA referenced by each one
+R_IPI void r_bin_dwarf_parse_eh_frame(RBinFile *bf, RVecRBinTrycatch *result);
 
 #endif

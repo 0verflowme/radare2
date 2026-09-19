@@ -26,7 +26,7 @@ endif
 
 CFLAGS:=-I../../libr/include $(CFLAGS)
 LDFLAGS+=-L../../libr/util
-OBJS=code.o class.o ops.o
+OBJS=code.o class.o descriptor.o ops.o
 
 all: $(LIBAR)
 
@@ -46,4 +46,7 @@ out: ${OBJS} main.o
 		-lr_util ../sdb/src/libsdb.$(EXT_AR) ${LINK} -o out
 
 clean:
-	rm -f ${OBJS} main.o a.out $(LIBAR) out
+	rm -f ${OBJS} ${OBJS:.o=.d} main.o a.out $(LIBAR) out
+
+# autodetect dependencies object
+-include $(OBJS:.o=.d)

@@ -365,7 +365,7 @@ R_API const char *r_anal_optype_tostring(int t) {
 			return optypes[i].name;
 		}
 	}
-	return "undefined";
+	return (t & R_ANAL_OP_TYPE_COND)? r_anal_optype_tostring (t & ~R_ANAL_OP_TYPE_COND): "undefined";
 }
 
 R_API const char *r_anal_op_to_esil_string(RAnal *anal, RAnalOp *op) {
@@ -679,10 +679,13 @@ R_API int r_anal_op_hint(RAnalOp *op, RAnalHint *hint) {
 // imho this should not iterate, should be just a helper to get that value
 R_API int r_anal_op_reg_delta(RAnal *anal, ut64 addr, const char *name) {
 	ut8 buf[32];
-	anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf));
+	const int nread = anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf));
+	if (nread < 1) {
+		return 0;
+	}
 	RAnalOp op = {0};
 	RAnalValue *dst = NULL;
-	if (r_anal_op (anal, &op, addr, buf, sizeof (buf), R_ARCH_OP_MASK_ALL) > 0) {
+	if (r_anal_op (anal, &op, addr, buf, nread, R_ARCH_OP_MASK_ALL) > 0) {
 		dst = RVecRArchValue_at (&op.dsts, 0);
 		if (dst && dst->reg && (!name || !strcmp (dst->reg, name))) {
 			if (RVecRArchValue_length (&op.srcs) > 0) {

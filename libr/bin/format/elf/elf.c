@@ -2104,14 +2104,16 @@ ut64 Elf_(get_fini_offset)(ELFOBJ *eo) {
 	return UT64_MAX;
 }
 
+// with no e_entry, guess the start of the code; an empty section holds none, and its
+// offset may be another section's (a zero-sized .text sharing .dynamic's offset)
 static ut64 get_entry_offset_from_shdr(ELFOBJ *eo) {
-	ut64 sectionOffset = Elf_(get_section_offset)(eo, ".init.text");
-	if (sectionOffset != UT64_MAX) {
-		return sectionOffset;
-	}
-	sectionOffset = Elf_(get_section_offset)(eo, ".text");
-	if (sectionOffset != UT64_MAX) {
-		return sectionOffset;
+	const char *names[] = { ".init.text", ".text" };
+	size_t i;
+	for (i = 0; i < R_ARRAY_SIZE (names); i++) {
+		RBinElfSection *section = get_section_by_name (eo, names[i]);
+		if (section && section->size > 0) {
+			return section->offset;
+		}
 	}
 	return UT64_MAX;
 }

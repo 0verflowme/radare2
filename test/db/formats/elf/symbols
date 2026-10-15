@@ -360,3 +360,14 @@ EXPECT=<<EOF
 0x00401010    1      4 sym.absfn
 EOF
 RUN
+
+NAME=ELF: no entry is guessed at an empty .text
+FILE=bins/elf/x86_64-abs-sym.so
+CMDS=<<EOF
+ie~?0x
+EOF
+EXPECT=<<EOF
+0
+EOF
+RUN
+
